@@ -150,7 +150,7 @@ class GraphODEFunc(nn.Module):
         h     = self.act(self.gc1(x, A))      # activate gc1
         h     = self.act(self.gc2(h, A))      # activate gc2 (BUG 3 fix)
         delta = self.norm(h)                  # norm the delta, not (h+x)
-        return x + delta                      # residual
+        return delta                          # return derivative only; residual added in _euler_step
 
 
 class AssimilationUpdate(nn.Module):
