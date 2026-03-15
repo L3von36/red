@@ -79,15 +79,31 @@ data_tensor = torch.tensor(
 
 obs_data = data_tensor * node_mask   # blind nodes → 0
 
-# Honest global context: mean of OBSERVED nodes only
+# Feature 1 — Honest global context: mean of OBSERVED nodes only
 num_obs         = node_mask.sum(dim=1, keepdim=True)          # [1,1,1,1]
 network_context = obs_data.sum(dim=1, keepdim=True) / (num_obs + 1e-6)
 network_context = torch.nan_to_num(network_context, 0.0)      # [1,1,T,1]
 
-# 3-feature input: [obs_speed (0 if blind), global_context, is_observed_flag]
+# Feature 2 — Neighbourhood context: mean observed speed within 1 hop.
+# For each node i this is  Σ_j A[i,j]*obs_j / Σ_j A[i,j]*mask_j.
+# Gives blind nodes a LOCAL congestion signal — a node whose observed
+# neighbours are all slowing down will see a low neighbourhood context
+# even if the global average is still high.  No GT leakage: only observed
+# (mask=1) speeds enter the average.
+A_t      = torch.tensor(adj_norm, dtype=torch.float32).to(device)   # [N, N]
+obs_2d   = obs_data[0, :, :, 0]                                     # [N, T]
+mask_1d  = node_mask[0, :, 0, 0]                                    # [N]
+mask_2d  = mask_1d.unsqueeze(1).expand_as(obs_2d)                   # [N, T]
+nbr_sum  = torch.mm(A_t, obs_2d)                                    # [N, T]
+nbr_cnt  = torch.mm(A_t, mask_2d)                                   # [N, T]
+nbr_ctx  = (nbr_sum / (nbr_cnt + 1e-6)).unsqueeze(0).unsqueeze(-1)  # [1,N,T,1]
+
+# 4-feature input: [obs_speed, global_context, nbr_context, is_observed_flag]
 obs_flag       = node_mask.expand_as(data_tensor)              # [1,N,T,1]
 context_feat   = network_context.expand_as(data_tensor)        # [1,N,T,1]
-input_features = torch.cat([obs_data, context_feat, obs_flag], dim=-1)  # [1,N,T,3]
+input_features = torch.cat(
+    [obs_data, context_feat, nbr_ctx, obs_flag], dim=-1
+)  # [1,N,T,4]
 
 print(f"✅ Input features: {input_features.shape}")
 print(f"   Observed: {node_mask.mean()*100:.0f}%  |  Blind: {(1-node_mask.mean())*100:.0f}%")
@@ -95,7 +111,7 @@ print(f"   Observed: {node_mask.mean()*100:.0f}%  |  Blind: {(1-node_mask.mean()
 # Leakage checks — will crash immediately if GT sneaks through
 assert (input_features[0, node_mask[0,:,0,0]==0, :, 0] == 0).all(), \
     "Leakage: blind nodes have non-zero speed."
-assert (input_features[0, node_mask[0,:,0,0]==0, :, 2] == 0).all(), \
+assert (input_features[0, node_mask[0,:,0,0]==0, :, 3] == 0).all(), \
     "Leakage: blind nodes flagged as observed."
 print("✅ Leakage checks passed.")
 
@@ -236,7 +252,7 @@ class ObservedMSELoss(nn.Module):
 # =============================================================================
 # CELL 5 — Training with curriculum masking
 # =============================================================================
-model     = GraphCTH_NODE(input_dim=3, hidden_dim=64, A_road=A_road).to(device)
+model     = GraphCTH_NODE(input_dim=4, hidden_dim=64, A_road=A_road).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=5e-4, weight_decay=1e-4)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=500)
 
@@ -270,7 +286,8 @@ for epoch in range(500):
 
     x_aug = x_window.clone()
     x_aug[0, drop_idx, :, 0] = 0.0   # zero observed speed
-    x_aug[0, drop_idx, :, 2] = 0.0   # zero is_observed flag
+    x_aug[0, drop_idx, :, 2] = 0.0   # zero neighbourhood context (treat as unobserved)
+    x_aug[0, drop_idx, :, 3] = 0.0   # zero is_observed flag
 
     cur_mask = mask_4d.clone()
     cur_mask[0, drop_idx, :, :] = 0.0   # exclude from assimilation
