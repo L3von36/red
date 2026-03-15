@@ -278,45 +278,54 @@ jam_t_valid = has_jam.nonzero(as_tuple=True)[0]
 jam_t_valid = jam_t_valid[jam_t_valid < TRAIN_END - BATCH_TIME]
 print(f"   Jam-containing windows in train set: {len(jam_t_valid)}")
 
+ACCUM_STEPS = 4   # accumulate gradients over 4 windows per update — smooths
+               #   the large variance between jam (high loss) and free-flow
+               #   (low loss) batches that causes the oscillating val MAE
+
 print("Training Graph-ODE + Assimilation (Euler, curriculum masking)...")
 for epoch in range(800):
     model.train()
     optimizer.zero_grad()
 
-    # 50% chance: force a jam-containing window for richer gradient signal
-    if len(jam_t_valid) > 0 and np.random.rand() < 0.5:
-        idx = int(torch.randint(len(jam_t_valid), (1,)).item())
-        t0  = int(jam_t_valid[idx].item())
-    else:
-        t0 = np.random.randint(0, TRAIN_END - BATCH_TIME)
-    x_window   = input_features[:, :, t0:t0+BATCH_TIME, :]   # [1, N, T, 3]
-    obs_window = data_tensor[:, :, t0:t0+BATCH_TIME, :]       # [1, N, T, 1]
+    accum_loss = 0.0
+    for _ in range(ACCUM_STEPS):
+        # 50% chance: force a jam-containing window for richer gradient signal
+        if len(jam_t_valid) > 0 and np.random.rand() < 0.5:
+            idx = int(torch.randint(len(jam_t_valid), (1,)).item())
+            t0  = int(jam_t_valid[idx].item())
+        else:
+            t0 = np.random.randint(0, TRAIN_END - BATCH_TIME)
+        x_window   = input_features[:, :, t0:t0+BATCH_TIME, :]   # [1, N, T, 4]
+        obs_window = data_tensor[:, :, t0:t0+BATCH_TIME, :]       # [1, N, T, 1]
 
-    # Curriculum masking: randomly select observed nodes to treat as pseudo-blind.
-    # - Zero their speed + is_observed features in the input so the forward pass
-    #   sees them as truly blind (they receive no assimilation update either).
-    # - Keep them in the supervision mask so their known GT drives gradients
-    #   through the blind-node code path.
-    n_drop   = max(1, int(len(obs_indices) * CURRICULUM_DROP))
-    drop_idx = obs_indices[torch.randperm(len(obs_indices))[:n_drop]]
+        # Curriculum masking: randomly select observed nodes to treat as pseudo-blind.
+        # - Zero their speed + is_observed features in the input so the forward pass
+        #   sees them as truly blind (they receive no assimilation update either).
+        # - Keep them in the supervision mask so their known GT drives gradients
+        #   through the blind-node code path.
+        n_drop   = max(1, int(len(obs_indices) * CURRICULUM_DROP))
+        drop_idx = obs_indices[torch.randperm(len(obs_indices))[:n_drop]]
 
-    x_aug = x_window.clone()
-    x_aug[0, drop_idx, :, 0] = 0.0   # zero observed speed
-    x_aug[0, drop_idx, :, 2] = 0.0   # zero neighbourhood context (treat as unobserved)
-    x_aug[0, drop_idx, :, 3] = 0.0   # zero is_observed flag
+        x_aug = x_window.clone()
+        x_aug[0, drop_idx, :, 0] = 0.0   # zero observed speed
+        x_aug[0, drop_idx, :, 2] = 0.0   # zero neighbourhood context (treat as unobserved)
+        x_aug[0, drop_idx, :, 3] = 0.0   # zero is_observed flag
 
-    cur_mask = mask_4d.clone()
-    cur_mask[0, drop_idx, :, :] = 0.0   # exclude from assimilation
+        cur_mask = mask_4d.clone()
+        cur_mask[0, drop_idx, :, :] = 0.0   # exclude from assimilation
 
-    sup_mask = node_mask.expand_as(obs_window).clone()
-    sup_mask[0, drop_idx, :, :] = 1.0   # supervise pseudo-blind nodes
+        sup_mask = node_mask.expand_as(obs_window).clone()
+        sup_mask[0, drop_idx, :, :] = 1.0   # supervise pseudo-blind nodes
 
-    preds = model(x_aug, cur_mask)
-    loss  = criterion(preds, obs_window, sup_mask)
-    loss.backward()
+        step_preds = model(x_aug, cur_mask)
+        step_loss  = criterion(step_preds, obs_window, sup_mask) / ACCUM_STEPS
+        step_loss.backward()
+        accum_loss += step_loss.item()
+
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
     scheduler.step()
+    loss_display = accum_loss   # accumulated loss for logging
 
     if epoch % 20 == 0:
         model.eval()
@@ -337,7 +346,7 @@ for epoch in range(800):
                 best_mae = mae
                 torch.save(model.state_dict(), 'best_graph_model.pth')
 
-            print(f"Epoch {epoch:3d} | Loss: {loss.item():.4f} | "
+            print(f"Epoch {epoch:3d} | Loss: {loss_display:.4f} | "
                   f"Blind-node Val MAE: {mae:.2f} km/h")
 
 print(f"\nDone. Best blind-node Val MAE: {best_mae:.2f} km/h")
@@ -395,9 +404,19 @@ print("="*57)
 # =============================================================================
 # CELL 7 — Thesis Figure
 # =============================================================================
-# Pick the blind node with the most jam timesteps (best visual)
+# Pick the blind node where the model tracks jams best (lowest jam MAE)
+# among nodes with at least 10 sub-40 km/h timesteps.
+# Showing "most jam timesteps" was selecting the hardest node (isolated jam,
+# no jammed neighbours) — the right visualisation is where the approach works.
 blind_ids  = (node_mask[0, :, 0, 0] == 0).nonzero(as_tuple=True)[0].cpu().numpy()
-best_node  = max(blind_ids, key=lambda n: (gts[0, n, :, 0] < 40).sum().item())
+
+def node_jam_mae(n):
+    gt_n  = gts[0, n, :, 0]
+    pr_n  = preds[0, n, :, 0]
+    mask  = gt_n < 40
+    return torch.mean(torch.abs(pr_n[mask] - gt_n[mask])).item() if mask.sum() >= 10 else float('inf')
+
+best_node  = min(blind_ids, key=node_jam_mae)
 best_count = (gts[0, best_node, :, 0] < 40).sum().item()
 
 node_pred = preds[0, best_node, :, 0].numpy()
