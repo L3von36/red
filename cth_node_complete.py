@@ -225,17 +225,18 @@ class ObservedMSELoss(nn.Module):
 # =============================================================================
 model     = GraphCTH_NODE(input_dim=3, hidden_dim=64, A_road=A_road).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=5e-4, weight_decay=1e-4)
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=60, gamma=0.5)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=500)
 criterion = ObservedMSELoss()
 
 VAL_START       = 4500
-BATCH_TIME      = 24
-CURRICULUM_DROP = 0.10   # drop 10% of observed nodes from supervision per batch
+BATCH_TIME      = 48
+CURRICULUM_DROP = 0.15   # hide 15% of observed nodes as pseudo-blind per batch
 best_mae        = 9999
 mask_4d         = node_mask   # [1, N, 1, 1]
+obs_indices     = (node_mask[0, :, 0, 0] == 1).nonzero(as_tuple=True)[0]
 
 print("Training Graph-ODE + Assimilation (Euler, curriculum masking)...")
-for epoch in range(300):
+for epoch in range(500):
     model.train()
     optimizer.zero_grad()
 
@@ -243,15 +244,25 @@ for epoch in range(300):
     x_window   = input_features[:, :, t0:t0+BATCH_TIME, :]   # [1, N, T, 3]
     obs_window = data_tensor[:, :, t0:t0+BATCH_TIME, :]       # [1, N, T, 1]
 
-    # Curriculum mask: start from real sensor mask, then randomly drop
-    # some observed nodes so blind-node code path gets gradients (BUG 2 fix)
-    sup_mask = node_mask.expand_as(obs_window).clone()   # [1, N, T, 1]
-    obs_indices = (node_mask[0, :, 0, 0] == 1).nonzero(as_tuple=True)[0]
-    n_drop = max(1, int(len(obs_indices) * CURRICULUM_DROP))
+    # Curriculum masking: randomly select observed nodes to treat as pseudo-blind.
+    # - Zero their speed + is_observed features in the input so the forward pass
+    #   sees them as truly blind (they receive no assimilation update either).
+    # - Keep them in the supervision mask so their known GT drives gradients
+    #   through the blind-node code path.
+    n_drop   = max(1, int(len(obs_indices) * CURRICULUM_DROP))
     drop_idx = obs_indices[torch.randperm(len(obs_indices))[:n_drop]]
-    sup_mask[0, drop_idx, :, :] = 0   # hide from loss, not from forward pass
 
-    preds = model(x_window, mask_4d)
+    x_aug = x_window.clone()
+    x_aug[0, drop_idx, :, 0] = 0.0   # zero observed speed
+    x_aug[0, drop_idx, :, 2] = 0.0   # zero is_observed flag
+
+    cur_mask = mask_4d.clone()
+    cur_mask[0, drop_idx, :, :] = 0.0   # exclude from assimilation
+
+    sup_mask = node_mask.expand_as(obs_window).clone()
+    sup_mask[0, drop_idx, :, :] = 1.0   # supervise pseudo-blind nodes
+
+    preds = model(x_aug, cur_mask)
     loss  = criterion(preds, obs_window, sup_mask)
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
