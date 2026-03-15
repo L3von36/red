@@ -59,6 +59,14 @@ d_inv    = np.where(deg > 0, deg**(-0.5), 0.0)
 adj_norm = (adj * d_inv[:, None]) * d_inv[None, :]   # [N, N]
 
 A_road = torch.tensor(adj_norm, dtype=torch.float32).unsqueeze(0).to(device)
+
+# Symmetric normalised graph Laplacian: L_sym = I − D^{-1/2} A D^{-1/2}
+# Used as a physics-informed spatial regulariser: penalises predicted speeds
+# that deviate from the road-network mean of their neighbours, enforcing
+# soft flow continuity across the sensor graph.
+L_sym_np = np.eye(NUM_NODES, dtype=np.float32) - adj_norm
+L_graph  = torch.tensor(L_sym_np, dtype=torch.float32).to(device)   # [N, N]
+
 print(f"✅ Adjacency ready. Shape: {A_road.shape}  "
       f"mean degree ≈ {(adj > 0).sum(1).mean():.1f}")
 
@@ -98,12 +106,25 @@ nbr_sum  = torch.mm(A_t, obs_2d)                                    # [N, T]
 nbr_cnt  = torch.mm(A_t, mask_2d)                                   # [N, T]
 nbr_ctx  = (nbr_sum / (nbr_cnt + 1e-6)).unsqueeze(0).unsqueeze(-1)  # [1,N,T,1]
 
-# 4-feature input: [obs_speed, global_context, nbr_context, is_observed_flag]
+# Feature 4 & 5 — Temporal encoding: cyclic time-of-day (sin / cos).
+# PEMS04 records one sample per 5 minutes → 288 steps per day.
+# These features give every node (observed and blind) a continuous
+# periodic signal for rush-hour / off-peak, capturing the strong daily
+# periodicity of traffic without leaking any speed ground truth.
+STEPS_PER_DAY = 288
+T_full  = data_norm.shape[0]
+t_idx   = torch.arange(T_full, dtype=torch.float32).to(device)
+t_sin   = torch.sin(2 * np.pi * (t_idx % STEPS_PER_DAY) / STEPS_PER_DAY)
+t_cos   = torch.cos(2 * np.pi * (t_idx % STEPS_PER_DAY) / STEPS_PER_DAY)
+time_sin = t_sin.view(1, 1, -1, 1).expand(1, NUM_NODES, -1, 1)  # [1,N,T,1]
+time_cos = t_cos.view(1, 1, -1, 1).expand(1, NUM_NODES, -1, 1)  # [1,N,T,1]
+
+# 6-feature input: [obs_speed, global_ctx, nbr_ctx, is_observed, t_sin, t_cos]
 obs_flag       = node_mask.expand_as(data_tensor)              # [1,N,T,1]
 context_feat   = network_context.expand_as(data_tensor)        # [1,N,T,1]
 input_features = torch.cat(
-    [obs_data, context_feat, nbr_ctx, obs_flag], dim=-1
-)  # [1,N,T,4]
+    [obs_data, context_feat, nbr_ctx, obs_flag, time_sin, time_cos], dim=-1
+)  # [1,N,T,6]
 
 print(f"✅ Input features: {input_features.shape}")
 print(f"   Observed: {node_mask.mean()*100:.0f}%  |  Blind: {(1-node_mask.mean())*100:.0f}%")
@@ -142,29 +163,51 @@ print("✅ Leakage checks passed.")
 #   suppressing the skip signal. gc2 also had no activation.
 #   FIX: Tanh on both GCN layers, LayerNorm on delta only before add.
 
-class GraphConv(nn.Module):
+class GraphAttention(nn.Module):
+    """Single-head Graph Attention (GAT) masked to road topology.
+
+    Replaces the fixed normalised-adjacency GraphConv.  Instead of using
+    pre-computed distance-weighted edges, the model learns how strongly
+    each neighbour should influence a node's hidden state.  Edges that
+    exist in the road graph are kept; all others are masked to −∞ before
+    softmax so non-adjacent nodes cannot interact.
+
+    Attention score: e[i,j] = LeakyReLU( a_src(Wh_i) + a_dst(Wh_j) )
+    This additive decomposition avoids the O(N²·H) matmul of the full
+    concatenation form while preserving asymmetric attention.
+    """
     def __init__(self, in_dim, out_dim):
         super().__init__()
-        self.W = nn.Linear(in_dim, out_dim, bias=False)
+        self.W     = nn.Linear(in_dim, out_dim, bias=False)
+        self.a_src = nn.Linear(out_dim, 1, bias=False)
+        self.a_dst = nn.Linear(out_dim, 1, bias=False)
+        self.leaky = nn.LeakyReLU(0.2)
 
     def forward(self, x, A):
-        # x: [B, N, H]   A: [B, N, N]  →  [B, N, H]
-        return self.W(torch.bmm(A, x))
+        # x: [B, N, in_dim]   A: [B, N, N] (road adjacency, 0 = no edge)
+        Wx    = self.W(x)                                    # [B, N, out_dim]
+        e_src = self.a_src(Wx)                               # [B, N, 1]
+        e_dst = self.a_dst(Wx)                               # [B, N, 1]
+        e     = self.leaky(e_src + e_dst.transpose(1, 2))   # [B, N, N]
+        e     = e.masked_fill(A < 1e-9, float('-inf'))       # mask non-edges
+        alpha = torch.softmax(e, dim=-1)                     # [B, N, N]
+        alpha = torch.nan_to_num(alpha, 0.0)                 # isolated-node safety
+        return torch.bmm(alpha, Wx)                          # [B, N, out_dim]
 
 
 class GraphODEFunc(nn.Module):
     def __init__(self, hidden_dim, A_road):
         super().__init__()
         self.register_buffer('A', A_road)   # [1, N, N], non-trainable
-        self.gc1  = GraphConv(hidden_dim, hidden_dim)
-        self.gc2  = GraphConv(hidden_dim, hidden_dim)
+        self.gat1 = GraphAttention(hidden_dim, hidden_dim)
+        self.gat2 = GraphAttention(hidden_dim, hidden_dim)
         self.act  = nn.Tanh()
-        self.norm = nn.LayerNorm(hidden_dim)   # applied to delta only (BUG 3 fix)
+        self.norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, t, x):
         A     = self.A.expand(x.size(0), -1, -1)
-        h     = self.act(self.gc1(x, A))      # activate gc1
-        h     = self.act(self.gc2(h, A))      # activate gc2 (BUG 3 fix)
+        h     = self.act(self.gat1(x, A))    # attention-weighted neighbourhood
+        h     = self.act(self.gat2(h, A))    # second attention layer
         delta = self.norm(h)                  # norm the delta, not (h+x)
         return delta                          # return derivative only; residual added in _euler_step
 
@@ -230,36 +273,70 @@ class GraphCTH_NODE(nn.Module):
 
 
 class ObservedMSELoss(nn.Module):
-    def __init__(self, jam_thresh_norm, jam_weight=4.0):
-        """
-        jam_thresh_norm : normalised speed threshold for congestion (e.g. 40 km/h)
-        jam_weight      : loss multiplier for samples below the threshold
-        Upweighting jam samples prevents the MSE from being dominated by the
-        majority free-flow regime, giving the model a real gradient signal to
-        track low-speed events at blind nodes.
-        """
+    """Three-term loss:
+
+    1. Jam-weighted observation MSE
+       Rare congestion samples receive jam_weight× more gradient so the
+       model is not free to ignore them in favour of free-flow accuracy.
+
+    2. Temporal smoothness
+       Penalises large step-to-step prediction jumps — suppresses the
+       post-jam oscillation artefact.
+
+    3. Physics: graph-Laplacian spatial regularisation
+       For each predicted time slice v ∈ R^N:
+           L_phys = ||L_sym · v||²  =  Σ_i (v_i − mean_nbr(v_i))²
+       Enforces soft flow continuity: a blind node should not be predicted
+       as severely congested if all its road-neighbours are free-flowing
+       (and vice-versa), unless the sensor data says otherwise.
+       Based on the kinematic-wave conservation principle that speed
+       gradients must propagate continuously along a road.
+    """
+    def __init__(self, jam_thresh_norm, jam_weight=4.0,
+                 L_graph=None, lambda_physics=0.02):
         super().__init__()
-        self.jam_thresh = jam_thresh_norm
-        self.jam_weight = jam_weight
+        self.jam_thresh      = jam_thresh_norm
+        self.jam_weight      = jam_weight
+        self.lambda_physics  = lambda_physics
+        if L_graph is not None:
+            self.register_buffer('L', L_graph)   # [N, N]
+        else:
+            self.L = None
 
     def forward(self, pred, obs, sup_mask, lambda_smooth=0.15):
-        w           = torch.where(obs < self.jam_thresh,
-                                  torch.full_like(obs, self.jam_weight),
-                                  torch.ones_like(obs))
-        loss_obs    = torch.mean(((pred - obs) * sup_mask) ** 2 * w)
+        # 1 — jam-weighted observation loss
+        w        = torch.where(obs < self.jam_thresh,
+                               torch.full_like(obs, self.jam_weight),
+                               torch.ones_like(obs))
+        loss_obs = torch.mean(((pred - obs) * sup_mask) ** 2 * w)
+
+        # 2 — temporal smoothness
         loss_smooth = torch.mean((pred[:, :, 1:] - pred[:, :, :-1]) ** 2)
-        return loss_obs + lambda_smooth * loss_smooth
+
+        # 3 — physics: Laplacian spatial regularisation
+        if self.L is not None:
+            v        = pred[0, :, :, 0]               # [N, T]
+            loss_phy = torch.mean(torch.mm(self.L, v) ** 2)
+        else:
+            loss_phy = 0.0
+
+        return loss_obs + lambda_smooth * loss_smooth + self.lambda_physics * loss_phy
 
 
 # =============================================================================
 # CELL 5 — Training with curriculum masking
 # =============================================================================
-model     = GraphCTH_NODE(input_dim=4, hidden_dim=64, A_road=A_road).to(device)
+model     = GraphCTH_NODE(input_dim=6, hidden_dim=64, A_road=A_road).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=5e-4, weight_decay=1e-4)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=800)
 
 jam_thresh_norm = (40.0 - mean) / (std + 1e-8)   # 40 km/h in normalised space
-criterion       = ObservedMSELoss(jam_thresh_norm=jam_thresh_norm, jam_weight=8.0)
+criterion       = ObservedMSELoss(
+    jam_thresh_norm=jam_thresh_norm,
+    jam_weight=8.0,
+    L_graph=L_graph,          # physics Laplacian regulariser
+    lambda_physics=0.02,
+)
 
 TRAIN_END       = 4000   # hard cutoff — no overlap with val/eval
 VAL_START       = 4000
