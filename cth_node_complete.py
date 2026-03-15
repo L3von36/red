@@ -1,8 +1,6 @@
 # =============================================================================
-# CELL 1 — Install & Imports
+# CELL 1 — Imports
 # =============================================================================
-# !pip install torchdiffeq
-
 import torch
 import torch.nn as nn
 import numpy as np
@@ -231,7 +229,7 @@ criterion = ObservedMSELoss()
 VAL_START       = 4500
 BATCH_TIME      = 48
 CURRICULUM_DROP = 0.15   # hide 15% of observed nodes as pseudo-blind per batch
-best_mae        = 9999
+best_mae        = float('inf')
 mask_4d         = node_mask   # [1, N, 1, 1]
 obs_indices     = (node_mask[0, :, 0, 0] == 1).nonzero(as_tuple=True)[0]
 
