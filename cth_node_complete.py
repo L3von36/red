@@ -303,7 +303,7 @@ class ObservedMSELoss(nn.Module):
         else:
             self.L = None
 
-    def forward(self, pred, obs, sup_mask, lambda_smooth=0.15):
+    def forward(self, pred, obs, sup_mask, lambda_smooth=0.40):
         # 1 — jam-weighted observation loss
         w        = torch.where(obs < self.jam_thresh,
                                torch.full_like(obs, self.jam_weight),
@@ -327,13 +327,13 @@ class ObservedMSELoss(nn.Module):
 # CELL 5 — Training with curriculum masking
 # =============================================================================
 model     = GraphCTH_NODE(input_dim=6, hidden_dim=64, A_road=A_road).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=5e-4, weight_decay=1e-4)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=800)
+optimizer = torch.optim.Adam(model.parameters(), lr=3e-4, weight_decay=1e-4)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=400)
 
 jam_thresh_norm = (40.0 - mean) / (std + 1e-8)   # 40 km/h in normalised space
 criterion       = ObservedMSELoss(
     jam_thresh_norm=jam_thresh_norm,
-    jam_weight=8.0,
+    jam_weight=5.0,           # 8× was too aggressive → over-predicted jams at false positives
     L_graph=L_graph,          # physics Laplacian regulariser
     lambda_physics=0.02,
 )
