@@ -212,8 +212,23 @@ class GraphCTH_NODE(nn.Module):
 
 
 class ObservedMSELoss(nn.Module):
+    def __init__(self, jam_thresh_norm, jam_weight=4.0):
+        """
+        jam_thresh_norm : normalised speed threshold for congestion (e.g. 40 km/h)
+        jam_weight      : loss multiplier for samples below the threshold
+        Upweighting jam samples prevents the MSE from being dominated by the
+        majority free-flow regime, giving the model a real gradient signal to
+        track low-speed events at blind nodes.
+        """
+        super().__init__()
+        self.jam_thresh = jam_thresh_norm
+        self.jam_weight = jam_weight
+
     def forward(self, pred, obs, sup_mask, lambda_smooth=0.05):
-        loss_obs    = torch.mean(((pred - obs) * sup_mask) ** 2)
+        w           = torch.where(obs < self.jam_thresh,
+                                  torch.full_like(obs, self.jam_weight),
+                                  torch.ones_like(obs))
+        loss_obs    = torch.mean(((pred - obs) * sup_mask) ** 2 * w)
         loss_smooth = torch.mean((pred[:, :, 1:] - pred[:, :, :-1]) ** 2)
         return loss_obs + lambda_smooth * loss_smooth
 
@@ -224,9 +239,12 @@ class ObservedMSELoss(nn.Module):
 model     = GraphCTH_NODE(input_dim=3, hidden_dim=64, A_road=A_road).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=5e-4, weight_decay=1e-4)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=500)
-criterion = ObservedMSELoss()
 
-VAL_START       = 4500
+jam_thresh_norm = (40.0 - mean) / (std + 1e-8)   # 40 km/h in normalised space
+criterion       = ObservedMSELoss(jam_thresh_norm=jam_thresh_norm, jam_weight=4.0)
+
+VAL_START       = 4200   # start val 300 steps earlier so it covers more jam events
+VAL_WIN         = 240    # 240-step val window — 5× larger, stable MAE estimate
 BATCH_TIME      = 48
 CURRICULUM_DROP = 0.15   # hide 15% of observed nodes as pseudo-blind per batch
 best_mae        = float('inf')
@@ -270,10 +288,15 @@ for epoch in range(500):
     if epoch % 20 == 0:
         model.eval()
         with torch.no_grad():
-            x_val  = input_features[:, :, VAL_START:VAL_START+50, :]
-            p_val  = model(x_val, mask_4d)
-            p_real = p_val.cpu() * std + mean
-            g_real = data_tensor[:, :, VAL_START:VAL_START+50, :].cpu() * std + mean
+            # Windowed validation — same window size as training, averaged over
+            # VAL_WIN steps for a stable MAE estimate (avoids single-window noise).
+            p_chunks, g_chunks = [], []
+            for vs in range(VAL_START, VAL_START + VAL_WIN, BATCH_TIME):
+                xv = input_features[:, :, vs:vs+BATCH_TIME, :]
+                p_chunks.append(model(xv, mask_4d).cpu() * std + mean)
+                g_chunks.append(data_tensor[:, :, vs:vs+BATCH_TIME, :].cpu() * std + mean)
+            p_real = torch.cat(p_chunks, dim=2)
+            g_real = torch.cat(g_chunks, dim=2)
             hid    = (node_mask.expand_as(g_real).cpu() == 0)
             mae    = torch.mean(torch.abs(p_real[hid] - g_real[hid])).item()
 
