@@ -5,12 +5,11 @@
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
 import os
+import urllib.request
 import pandas as pd
 import matplotlib.pyplot as plt
-from torchdiffeq import odeint
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
@@ -25,9 +24,11 @@ filename_npz = "PEMS04.npz"
 filename_csv = "PEMS04.csv"
 
 if not os.path.exists(filename_npz):
-    os.system(f'wget -O {filename_npz} "{url_npz}"')
+    print(f"Downloading {filename_npz}...")
+    urllib.request.urlretrieve(url_npz, filename_npz)
 if not os.path.exists(filename_csv):
-    os.system(f'wget -O {filename_csv} "{url_csv}"')
+    print(f"Downloading {filename_csv}...")
+    urllib.request.urlretrieve(url_csv, filename_csv)
 
 # --- Speed data ---
 data     = np.load(filename_npz)
@@ -280,7 +281,7 @@ print(f"\nDone. Best blind-node Val MAE: {best_mae:.2f} km/h")
 # =============================================================================
 # CELL 6 — Evaluation
 # =============================================================================
-model.load_state_dict(torch.load('best_graph_model.pth'))
+model.load_state_dict(torch.load('best_graph_model.pth', map_location=device, weights_only=True))
 model.eval()
 
 EVAL_START = 4500
