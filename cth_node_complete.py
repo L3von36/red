@@ -254,25 +254,41 @@ class ObservedMSELoss(nn.Module):
 # =============================================================================
 model     = GraphCTH_NODE(input_dim=4, hidden_dim=64, A_road=A_road).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=5e-4, weight_decay=1e-4)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=500)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=800)
 
 jam_thresh_norm = (40.0 - mean) / (std + 1e-8)   # 40 km/h in normalised space
-criterion       = ObservedMSELoss(jam_thresh_norm=jam_thresh_norm, jam_weight=4.0)
+criterion       = ObservedMSELoss(jam_thresh_norm=jam_thresh_norm, jam_weight=8.0)
 
-VAL_START       = 4200   # start val 300 steps earlier so it covers more jam events
-VAL_WIN         = 240    # 240-step val window — 5× larger, stable MAE estimate
+TRAIN_END       = 4000   # hard cutoff — no overlap with val/eval
+VAL_START       = 4000
+VAL_WIN         = 240    # 240-step val window — stable MAE estimate
 BATCH_TIME      = 48
 CURRICULUM_DROP = 0.15   # hide 15% of observed nodes as pseudo-blind per batch
 best_mae        = float('inf')
 mask_4d         = node_mask   # [1, N, 1, 1]
 obs_indices     = (node_mask[0, :, 0, 0] == 1).nonzero(as_tuple=True)[0]
 
+# Precompute jam-containing window start indices within the training set.
+# 50% of batches will be forced to start at a jam timestep so the model
+# sees enough congestion events to learn from the 8× jam weight.
+blind_ids   = (node_mask[0, :, 0, 0] == 0)
+blind_norm  = data_tensor[0, blind_ids, :TRAIN_END, 0]   # [N_blind, T_train]
+has_jam     = (blind_norm < jam_thresh_norm).any(dim=0)   # [T_train]
+jam_t_valid = has_jam.nonzero(as_tuple=True)[0]
+jam_t_valid = jam_t_valid[jam_t_valid < TRAIN_END - BATCH_TIME]
+print(f"   Jam-containing windows in train set: {len(jam_t_valid)}")
+
 print("Training Graph-ODE + Assimilation (Euler, curriculum masking)...")
-for epoch in range(500):
+for epoch in range(800):
     model.train()
     optimizer.zero_grad()
 
-    t0         = np.random.randint(0, TIME_STEPS - BATCH_TIME)
+    # 50% chance: force a jam-containing window for richer gradient signal
+    if len(jam_t_valid) > 0 and np.random.rand() < 0.5:
+        idx = int(torch.randint(len(jam_t_valid), (1,)).item())
+        t0  = int(jam_t_valid[idx].item())
+    else:
+        t0 = np.random.randint(0, TRAIN_END - BATCH_TIME)
     x_window   = input_features[:, :, t0:t0+BATCH_TIME, :]   # [1, N, T, 3]
     obs_window = data_tensor[:, :, t0:t0+BATCH_TIME, :]       # [1, N, T, 1]
 
@@ -325,6 +341,8 @@ for epoch in range(500):
                   f"Blind-node Val MAE: {mae:.2f} km/h")
 
 print(f"\nDone. Best blind-node Val MAE: {best_mae:.2f} km/h")
+print(f"   (trained with 8× jam weight, 50% jam-biased sampling, "
+      f"train/eval split at t={TRAIN_END})")
 
 
 # =============================================================================
