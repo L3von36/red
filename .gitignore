@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# Dataset files (large, downloaded automatically)
+PEMS04.npz
+PEMS04.csv
+
+# Trained model checkpoints
+*.pth
+
+# Generated figures
+*.png
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
