@@ -565,6 +565,7 @@ print(f"✅ Saved thesis_graph_ode.png  (Node {best_node}, {best_count} jam time
 # =============================================================================
 # CELL 8 — Sensor Sparsity Sweep
 # =============================================================================
+import copy
 # Trains the full model at 5 sparsity levels to show that assimilation
 # degrades gracefully compared to the fixed-weight global-mean baseline.
 # Each variant runs 300 epochs (lighter than the main 400-epoch training).
@@ -721,6 +722,7 @@ print("✅ Saved thesis_sparsity_sweep.png")
 # =============================================================================
 # CELL 9 — Ablation Study
 # =============================================================================
+import copy
 # Each variant removes exactly one component and is trained from scratch
 # for 300 epochs under identical conditions.  Results show the contribution
 # of each design choice.
