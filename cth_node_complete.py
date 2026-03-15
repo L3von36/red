@@ -568,7 +568,8 @@ print(f"✅ Saved thesis_graph_ode.png  (Node {best_node}, {best_count} jam time
 import copy
 # Trains the full model at 5 sparsity levels to show that assimilation
 # degrades gracefully compared to the fixed-weight global-mean baseline.
-# Each variant runs 300 epochs (lighter than the main 400-epoch training).
+# Each variant runs 100 epochs with a smaller model (hidden=32, accum=2)
+# for speed — we care about ranking across sparsities, not absolute MAE.
 
 def _make_features_for_sparsity(sp_ratio, seed=42):
     """Rebuild 6-feature input tensor for an arbitrary sensor sparsity."""
@@ -598,9 +599,13 @@ def _make_features_for_sparsity(sp_ratio, seed=42):
     return feats, sp_mask
 
 
-def _train_and_eval(feats_sp, mask_sp, epochs=300):
+_SP_EPOCHS = 100          # fast sweep — ranking matters, not absolute MAE
+_SP_ACCUM  = 2            # halved vs main training
+_SP_HIDDEN = 32           # smaller model for speed
+
+def _train_and_eval(feats_sp, mask_sp, epochs=_SP_EPOCHS):
     """Train a fresh model on feats_sp/mask_sp; return (overall_mae, jam_mae)."""
-    m    = GraphCTH_NODE(input_dim=6, hidden_dim=64, A_road=A_road).to(device)
+    m    = GraphCTH_NODE(input_dim=6, hidden_dim=_SP_HIDDEN, A_road=A_road).to(device)
     opt  = torch.optim.Adam(m.parameters(), lr=3e-4, weight_decay=1e-4)
     sch  = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
     crit = ObservedMSELoss(jam_thresh_norm=jam_thresh_norm,
@@ -611,10 +616,9 @@ def _train_and_eval(feats_sp, mask_sp, epochs=300):
     jt   = (data_tensor[0, bn, :TRAIN_END, 0] < jam_thresh_norm).any(dim=0).nonzero(as_tuple=True)[0]
     jt   = jt[jt < TRAIN_END - BATCH_TIME]
 
-    best_mae_v, best_state = float('inf'), None
     for ep in range(epochs):
-        m.train(); opt.zero_grad(); aloss = 0.0
-        for _ in range(ACCUM_STEPS):
+        m.train(); opt.zero_grad()
+        for _ in range(_SP_ACCUM):
             t0  = int(jt[torch.randint(len(jt),(1,))].item()) if len(jt)>0 and np.random.rand()<0.5 \
                   else np.random.randint(0, TRAIN_END - BATCH_TIME)
             xw  = feats_sp[:, :, t0:t0+BATCH_TIME, :]
@@ -625,25 +629,13 @@ def _train_and_eval(feats_sp, mask_sp, epochs=300):
             xa[0,di,:,0] = 0.; xa[0,di,:,2] = 0.; xa[0,di,:,3] = 0.
             cm  = mask_sp.clone(); cm[0,di,:,:] = 0.
             sm  = mask_sp.expand_as(ow).clone(); sm[0,di,:,:] = 1.
-            sl  = crit(m(xa, cm), ow, sm) / ACCUM_STEPS
-            sl.backward(); aloss += sl.item()
+            sl  = crit(m(xa, cm), ow, sm) / _SP_ACCUM
+            sl.backward()
         torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
         opt.step(); sch.step()
-        if ep % 50 == 0:
-            m.eval()
-            with torch.no_grad():
-                pc, gc = [], []
-                for vs in range(VAL_START, VAL_START+VAL_WIN, BATCH_TIME):
-                    pc.append(m(feats_sp[:,:,vs:vs+BATCH_TIME,:], mask_sp).cpu()*std+mean)
-                    gc.append(data_tensor[:,:,vs:vs+BATCH_TIME,:].cpu()*std+mean)
-                pr = torch.cat(pc,2); gr = torch.cat(gc,2)
-                hd = (mask_sp.expand_as(gr).cpu() == 0)
-                mv = torch.mean(torch.abs(pr[hd]-gr[hd])).item()
-            if mv < best_mae_v:
-                best_mae_v = mv
-                best_state = copy.deepcopy(m.state_dict())
+        if (ep+1) % 25 == 0:
+            print(f"  ep {ep+1}/{epochs}", end="\r", flush=True)
 
-    m.load_state_dict(best_state)
     m.eval()
     pc, gc = [], []
     with torch.no_grad():
@@ -679,7 +671,7 @@ def _idw_eval(feats_sp, mask_sp):
     return ov, jv
 
 
-print("Sensor Sparsity Sweep (300 epochs each)…")
+print(f"Sensor Sparsity Sweep ({_SP_EPOCHS} epochs, hidden={_SP_HIDDEN})…")
 print(f"\n{'Sparsity':>10} | {'Blind%':>6} | {'Base Jam':>9} | {'IDW Jam':>9} | "
       f"{'Model MAE':>9} | {'Model Jam':>9} | {'vs Base':>8} | {'vs IDW':>7}")
 print("-"*85)
@@ -688,7 +680,8 @@ sparsity_sweep_results = {}
 for sp in [0.20, 0.40, 0.60, 0.80, 0.90]:
     feats_sp, mask_sp = _make_features_for_sparsity(sp)
     idw_ov, idw_jv    = _idw_eval(feats_sp, mask_sp)
-    m_ov, m_jv        = _train_and_eval(feats_sp, mask_sp, epochs=300)
+    print(f"  sp={sp:.0%} — training…")
+    m_ov, m_jv        = _train_and_eval(feats_sp, mask_sp)
 
     # Global-mean jam baseline for this sparsity's blind nodes
     g_eval = data_tensor[0, (mask_sp[0,:,0,0]==0).cpu(),
