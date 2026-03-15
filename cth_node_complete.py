@@ -295,13 +295,26 @@ model.eval()
 
 EVAL_START = 4500
 EVAL_LEN   = 450
+EVAL_WIN   = BATCH_TIME   # same window size as training — avoids ODE drift
+
+# Slide non-overlapping windows over the eval period and concatenate predictions.
+# The model was trained on BATCH_TIME-step sequences; longer rollouts cause
+# the Euler hidden state to drift far outside the training distribution.
+pred_chunks = []
+gt_chunks   = []
 
 with torch.no_grad():
-    x_eval = input_features[:, :, EVAL_START:EVAL_START+EVAL_LEN, :]
-    preds  = model(x_eval, mask_4d)
-    preds  = preds.cpu() * std + mean
+    t = EVAL_START
+    while t + EVAL_WIN <= EVAL_START + EVAL_LEN:
+        x_win  = input_features[:, :, t:t+EVAL_WIN, :]
+        p_win  = model(x_win, mask_4d).cpu() * std + mean
+        g_win  = data_tensor[:, :, t:t+EVAL_WIN, :].cpu() * std + mean
+        pred_chunks.append(p_win)
+        gt_chunks.append(g_win)
+        t += EVAL_WIN
 
-gts = data_tensor[:, :, EVAL_START:EVAL_START+EVAL_LEN, :].cpu() * std + mean
+preds = torch.cat(pred_chunks, dim=2)   # [1, N, T_eval, 1]
+gts   = torch.cat(gt_chunks,   dim=2)
 
 hid_mask = (node_mask.cpu() == 0).expand_as(gts)
 jam_mask = (gts < 40)
