@@ -204,8 +204,10 @@ class GraphCTH_NODE(nn.Module):
         self.decoder    = nn.Linear(hidden_dim, 1)
 
     def _euler_step(self, z):
-        """Single Euler step dt=1.  FIX for BUG 1 — replaces dopri5."""
-        return z + self.ode_func(None, z)
+        """Single Euler step with dt=0.3.
+        dt<1 dampens hidden-state momentum so the model recovers from a jam
+        smoothly rather than oscillating after the congestion clears."""
+        return z + 0.3 * self.ode_func(None, z)
 
     def forward(self, x_seq, obs_mask):
         """
@@ -240,7 +242,7 @@ class ObservedMSELoss(nn.Module):
         self.jam_thresh = jam_thresh_norm
         self.jam_weight = jam_weight
 
-    def forward(self, pred, obs, sup_mask, lambda_smooth=0.05):
+    def forward(self, pred, obs, sup_mask, lambda_smooth=0.15):
         w           = torch.where(obs < self.jam_thresh,
                                   torch.full_like(obs, self.jam_weight),
                                   torch.ones_like(obs))
