@@ -120,10 +120,18 @@ time_sin = t_sin.view(1, 1, -1, 1).expand(1, NUM_NODES, -1, 1)  # [1,N,T,1]
 time_cos = t_cos.view(1, 1, -1, 1).expand(1, NUM_NODES, -1, 1)  # [1,N,T,1]
 
 # 6-feature input: [obs_speed, global_ctx, nbr_ctx, is_observed, t_sin, t_cos]
+# Temporal features are scaled to 0.25× their natural amplitude.
+# At full scale the encoder over-weighted daily rush-hour patterns: the model
+# learned to predict congestion at 7:40am / 7pm purely from time-of-day,
+# generating false jams at rush hours even for free-flowing blind nodes.
+# Scaling to 0.25 keeps the periodicity signal (helpful for observed-node
+# context) without letting it dominate over spatial / sensor evidence.
+TIME_SCALE     = 0.25
 obs_flag       = node_mask.expand_as(data_tensor)              # [1,N,T,1]
 context_feat   = network_context.expand_as(data_tensor)        # [1,N,T,1]
 input_features = torch.cat(
-    [obs_data, context_feat, nbr_ctx, obs_flag, time_sin, time_cos], dim=-1
+    [obs_data, context_feat, nbr_ctx, obs_flag,
+     TIME_SCALE * time_sin, TIME_SCALE * time_cos], dim=-1
 )  # [1,N,T,6]
 
 print(f"✅ Input features: {input_features.shape}")
@@ -175,24 +183,30 @@ class GraphAttention(nn.Module):
     Attention score: e[i,j] = LeakyReLU( a_src(Wh_i) + a_dst(Wh_j) )
     This additive decomposition avoids the O(N²·H) matmul of the full
     concatenation form while preserving asymmetric attention.
+
+    Temperature τ > 1 softens the attention distribution, preventing the
+    model from placing 100% weight on a single congested neighbour.  This
+    reduces the runaway ODE oscillations that occur when one bad neighbour
+    dominates the hidden-state update at every Euler step.
     """
-    def __init__(self, in_dim, out_dim):
+    def __init__(self, in_dim, out_dim, temperature=2.0):
         super().__init__()
-        self.W     = nn.Linear(in_dim, out_dim, bias=False)
-        self.a_src = nn.Linear(out_dim, 1, bias=False)
-        self.a_dst = nn.Linear(out_dim, 1, bias=False)
-        self.leaky = nn.LeakyReLU(0.2)
+        self.W           = nn.Linear(in_dim, out_dim, bias=False)
+        self.a_src       = nn.Linear(out_dim, 1, bias=False)
+        self.a_dst       = nn.Linear(out_dim, 1, bias=False)
+        self.leaky       = nn.LeakyReLU(0.2)
+        self.temperature = temperature
 
     def forward(self, x, A):
         # x: [B, N, in_dim]   A: [B, N, N] (road adjacency, 0 = no edge)
-        Wx    = self.W(x)                                    # [B, N, out_dim]
-        e_src = self.a_src(Wx)                               # [B, N, 1]
-        e_dst = self.a_dst(Wx)                               # [B, N, 1]
-        e     = self.leaky(e_src + e_dst.transpose(1, 2))   # [B, N, N]
-        e     = e.masked_fill(A < 1e-9, float('-inf'))       # mask non-edges
-        alpha = torch.softmax(e, dim=-1)                     # [B, N, N]
-        alpha = torch.nan_to_num(alpha, 0.0)                 # isolated-node safety
-        return torch.bmm(alpha, Wx)                          # [B, N, out_dim]
+        Wx    = self.W(x)                                             # [B, N, out_dim]
+        e_src = self.a_src(Wx)                                        # [B, N, 1]
+        e_dst = self.a_dst(Wx)                                        # [B, N, 1]
+        e     = self.leaky(e_src + e_dst.transpose(1, 2))            # [B, N, N]
+        e     = e.masked_fill(A < 1e-9, float('-inf'))                # mask non-edges
+        alpha = torch.softmax(e / self.temperature, dim=-1)           # [B, N, N]
+        alpha = torch.nan_to_num(alpha, 0.0)                          # isolated-node safety
+        return torch.bmm(alpha, Wx)                                   # [B, N, out_dim]
 
 
 class GraphODEFunc(nn.Module):
@@ -303,7 +317,7 @@ class ObservedMSELoss(nn.Module):
         else:
             self.L = None
 
-    def forward(self, pred, obs, sup_mask, lambda_smooth=0.40):
+    def forward(self, pred, obs, sup_mask, lambda_smooth=0.60):
         # 1 — jam-weighted observation loss
         w        = torch.where(obs < self.jam_thresh,
                                torch.full_like(obs, self.jam_weight),
@@ -333,7 +347,7 @@ scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=400)
 jam_thresh_norm = (40.0 - mean) / (std + 1e-8)   # 40 km/h in normalised space
 criterion       = ObservedMSELoss(
     jam_thresh_norm=jam_thresh_norm,
-    jam_weight=5.0,           # 8× was too aggressive → over-predicted jams at false positives
+    jam_weight=4.0,           # 5× still over-triggered on rush-hour temporal signal
     L_graph=L_graph,          # physics Laplacian regulariser
     lambda_physics=0.02,
 )
