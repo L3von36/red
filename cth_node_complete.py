@@ -481,9 +481,10 @@ hid_mask = (node_mask.cpu() == 0).expand_as(gts)
 jam_mask = (gts < 40)
 target   = hid_mask & jam_mask
 
-m_model   = torch.mean(torch.abs(preds[target]   - gts[target])).item()
-m_base    = torch.mean(torch.abs(torch.ones_like(gts[target]) * mean - gts[target])).item()
-m_overall = torch.mean(torch.abs(preds[hid_mask] - gts[hid_mask])).item()
+m_model    = torch.mean(torch.abs(preds[target]    - gts[target])).item()
+m_base     = torch.mean(torch.abs(torch.ones_like(gts[target]) * mean - gts[target])).item()
+m_overall  = torch.mean(torch.abs(preds[hid_mask]  - gts[hid_mask])).item()
+m_base_all = torch.mean(torch.abs(torch.ones_like(gts[hid_mask]) * mean - gts[hid_mask])).item()
 
 print("\n" + "="*57)
 print("   GRAPH-ODE + ASSIMILATION  (blind nodes only)")
@@ -678,9 +679,9 @@ def _idw_eval(feats_sp, mask_sp):
 
 
 print("Sensor Sparsity Sweep (300 epochs each)…")
-print(f"\n{'Sparsity':>10} | {'Blind %':>7} | {'IDW MAE':>9} | {'IDW Jam':>9} | "
-      f"{'Model MAE':>9} | {'Model Jam':>9} | {'Jam Δ vs baseline':>17}")
-print("-"*84)
+print(f"\n{'Sparsity':>10} | {'Blind%':>6} | {'Base Jam':>9} | {'IDW Jam':>9} | "
+      f"{'Model MAE':>9} | {'Model Jam':>9} | {'vs Base':>8} | {'vs IDW':>7}")
+print("-"*85)
 
 sparsity_sweep_results = {}
 for sp in [0.20, 0.40, 0.60, 0.80, 0.90]:
@@ -688,18 +689,17 @@ for sp in [0.20, 0.40, 0.60, 0.80, 0.90]:
     idw_ov, idw_jv    = _idw_eval(feats_sp, mask_sp)
     m_ov, m_jv        = _train_and_eval(feats_sp, mask_sp, epochs=300)
 
-    base_jv = torch.mean(torch.abs(
-        torch.ones(1) * mean -
-        data_tensor[0, (mask_sp[0,:,0,0]==0), EVAL_START:EVAL_START+EVAL_LEN, 0]
-                  [data_tensor[0, (mask_sp[0,:,0,0]==0), EVAL_START:EVAL_START+EVAL_LEN, 0]
-                   .cpu() * std + mean < 40].cpu() * std + mean
-    )).item()   # approximate; use the stored m_base from earlier for 80%
+    # Global-mean jam baseline for this sparsity's blind nodes
+    g_eval = data_tensor[0, (mask_sp[0,:,0,0]==0).cpu(),
+                         EVAL_START:EVAL_START+EVAL_LEN, 0].cpu() * std + mean
+    base_jv = torch.mean(torch.abs(g_eval[g_eval < 40] - mean)).item()
 
     delta_pct = (idw_jv - m_jv) / idw_jv * 100 if idw_jv > 0 else 0.0
-    sparsity_sweep_results[sp] = (idw_ov, idw_jv, m_ov, m_jv)
-    print(f"{sp*100:>9.0f}% | {(1-mask_sp.mean().item())*100:>6.0f}% | "
-          f"{idw_ov:>9.2f} | {idw_jv:>9.2f} | "
-          f"{m_ov:>9.2f} | {m_jv:>9.2f} | {delta_pct:>+15.1f}%")
+    vs_base = (base_jv - m_jv) / base_jv * 100 if base_jv > 0 else 0.0
+    sparsity_sweep_results[sp] = (base_jv, idw_ov, idw_jv, m_ov, m_jv)
+    print(f"{sp*100:>9.0f}% | {(1-mask_sp.mean().item())*100:>5.0f}% | "
+          f"{base_jv:>9.2f} | {idw_jv:>9.2f} | "
+          f"{m_ov:>9.2f} | {m_jv:>9.2f} | {vs_base:>+6.1f}% | {delta_pct:>+5.1f}%")
 
 # Plot sparsity curve
 sp_vals  = sorted(sparsity_sweep_results.keys())
@@ -831,8 +831,9 @@ for label, cls, feats_v, lp in ablation_configs:
 
 # Compare against global-mean and IDW baselines (no training needed)
 idw_ov_80, idw_jv_80 = _idw_eval(input_features, node_mask)
-ablation_rows.insert(0, ("IDW (spatial interp.)",  idw_ov_80, idw_jv_80))
-ablation_rows.insert(0, ("Global mean baseline",   m_overall, m_base))
+ablation_rows.insert(0, ("IDW (spatial interp.)",  idw_ov_80,   idw_jv_80))
+ablation_rows.insert(0, ("Global mean baseline",   m_base_all,  m_base))
+# m_base_all = global-mean MAE on ALL blind samples; m_base = jam samples only
 
 full_ov = ablation_rows[2][1]   # Full model overall MAE
 full_jv = ablation_rows[2][2]   # Full model jam MAE
