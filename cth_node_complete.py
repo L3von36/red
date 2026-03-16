@@ -68,8 +68,34 @@ A_road = torch.tensor(adj_norm, dtype=torch.float32).unsqueeze(0).to(device)
 L_sym_np = np.eye(NUM_NODES, dtype=np.float32) - adj_norm
 L_graph  = torch.tensor(L_sym_np, dtype=torch.float32).to(device)   # [N, N]
 
+# --- Hypergraph incidence matrix ---
+# Each node i generates one hyperedge containing i and all its 2-hop
+# neighbours, capturing corridor/intersection groups that pairwise edges miss.
+# H: [N, E]  where E = N (one hyperedge per node).
+adj_binary = (adj > 1e-6).astype(np.float32)
+np.fill_diagonal(adj_binary, 0.0)
+adj2 = adj_binary @ adj_binary          # 2-hop reachability
+adj2 = (adj2 > 0).astype(np.float32)   # binarise
+adj2 = np.clip(adj2 + adj_binary, 0, 1) # union of 1-hop and 2-hop
+np.fill_diagonal(adj2, 1.0)             # include self
+
+H_np   = adj2.T                         # [N, N] — column e = nodes in hyperedge e
+# Degree matrices for HGNN: D_v = diag(H 1_E), D_e = diag(H^T 1_N)
+d_v = H_np.sum(axis=1)                  # node degree: how many hyperedges contain i
+d_e = H_np.sum(axis=0)                  # hyperedge degree: how many nodes in edge e
+d_v_inv_sqrt = np.where(d_v > 0, d_v ** (-0.5), 0.0)
+d_e_inv      = np.where(d_e > 0, d_e ** (-1.0), 0.0)
+
+# Pre-compute  D_v^{-1/2} H W_e D_e^{-1} H^T D_v^{-1/2}  (without learnable W_e)
+# so the convolution at runtime is just  H_conv @ X @ Theta
+H_conv_np = (d_v_inv_sqrt[:, None] * H_np) * d_e_inv[None, :]
+H_conv_np = H_conv_np @ (H_np.T * d_v_inv_sqrt[None, :])   # [N, N]
+H_conv = torch.tensor(H_conv_np, dtype=torch.float32).to(device)  # [N, N]
+
 print(f"✅ Adjacency ready. Shape: {A_road.shape}  "
       f"mean degree ≈ {(adj > 0).sum(1).mean():.1f}")
+print(f"✅ Hypergraph ready. {NUM_NODES} hyperedges, "
+      f"mean hyperedge size ≈ {d_e.mean():.1f}")
 
 
 # =============================================================================
@@ -210,21 +236,46 @@ class GraphAttention(nn.Module):
         return torch.bmm(alpha, Wx)                                   # [B, N, out_dim]
 
 
-class GraphODEFunc(nn.Module):
-    def __init__(self, hidden_dim, A_road):
+class HypergraphConv(nn.Module):
+    """HGNN-style hypergraph convolution.
+
+    Uses the pre-computed normalised operator  H_conv = D_v^{-1/2} H D_e^{-1} H^T D_v^{-1/2}
+    so forward is just a linear projection + sparse matmul, keeping it lightweight
+    inside the ODE function.
+    """
+    def __init__(self, in_dim, out_dim):
         super().__init__()
-        self.register_buffer('A', A_road)   # [1, N, N], non-trainable
-        self.gat1 = GraphAttention(hidden_dim, hidden_dim)
-        self.gat2 = GraphAttention(hidden_dim, hidden_dim)
-        self.act  = nn.Tanh()
-        self.norm = nn.LayerNorm(hidden_dim)
+        self.theta = nn.Linear(in_dim, out_dim, bias=False)
+
+    def forward(self, x, H_conv):
+        # x: [B, N, in_dim],  H_conv: [N, N]
+        h = self.theta(x)                              # [B, N, out_dim]
+        return torch.matmul(H_conv, h)                 # [B, N, out_dim]
+
+
+class GraphODEFunc(nn.Module):
+    def __init__(self, hidden_dim, A_road, H_conv=None):
+        super().__init__()
+        self.register_buffer('A', A_road)              # [1, N, N]
+        if H_conv is not None:
+            self.register_buffer('H_conv', H_conv)     # [N, N]
+        else:
+            self.H_conv = None
+        self.gat1  = GraphAttention(hidden_dim, hidden_dim)
+        self.gat2  = GraphAttention(hidden_dim, hidden_dim)
+        self.hconv = HypergraphConv(hidden_dim, hidden_dim) if H_conv is not None else None
+        self.act   = nn.Tanh()
+        self.norm  = nn.LayerNorm(hidden_dim)
 
     def forward(self, t, x):
         A     = self.A.expand(x.size(0), -1, -1)
-        h     = self.act(self.gat1(x, A))    # attention-weighted neighbourhood
-        h     = self.act(self.gat2(h, A))    # second attention layer
-        delta = self.norm(h)                  # norm the delta, not (h+x)
-        return delta                          # return derivative only; residual added in _euler_step
+        h     = self.act(self.gat1(x, A))             # pairwise attention
+        h     = self.act(self.gat2(h, A))             # second attention layer
+        if self.hconv is not None:
+            h_hyp = self.act(self.hconv(x, self.H_conv))  # group-level aggregation
+            h     = h + h_hyp                          # fuse pairwise + hypergraph
+        delta = self.norm(h)
+        return delta
 
 
 class AssimilationUpdate(nn.Module):
@@ -254,10 +305,10 @@ class AssimilationUpdate(nn.Module):
 
 
 class GraphCTH_NODE(nn.Module):
-    def __init__(self, input_dim=3, hidden_dim=64, A_road=None):
+    def __init__(self, input_dim=3, hidden_dim=64, A_road=None, H_conv=None):
         super().__init__()
         self.encoder    = nn.Linear(input_dim, hidden_dim)
-        self.ode_func   = GraphODEFunc(hidden_dim, A_road)
+        self.ode_func   = GraphODEFunc(hidden_dim, A_road, H_conv=H_conv)
         self.assimilate = AssimilationUpdate(input_dim, hidden_dim)
         self.decoder    = nn.Linear(hidden_dim, 1)
 
@@ -341,7 +392,7 @@ class ObservedMSELoss(nn.Module):
 # =============================================================================
 # CELL 5 — Training with curriculum masking
 # =============================================================================
-model     = GraphCTH_NODE(input_dim=6, hidden_dim=64, A_road=A_road).to(device)
+model     = GraphCTH_NODE(input_dim=6, hidden_dim=64, A_road=A_road, H_conv=H_conv).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=3e-4, weight_decay=1e-4)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=400)
 
@@ -605,7 +656,7 @@ _SP_HIDDEN = 32           # smaller model for speed
 
 def _train_and_eval(feats_sp, mask_sp, epochs=_SP_EPOCHS):
     """Train a fresh model on feats_sp/mask_sp; return (overall_mae, jam_mae)."""
-    m    = GraphCTH_NODE(input_dim=6, hidden_dim=_SP_HIDDEN, A_road=A_road).to(device)
+    m    = GraphCTH_NODE(input_dim=6, hidden_dim=_SP_HIDDEN, A_road=A_road, H_conv=H_conv).to(device)
     opt  = torch.optim.Adam(m.parameters(), lr=3e-4, weight_decay=1e-4)
     sch  = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
     crit = ObservedMSELoss(jam_thresh_norm=jam_thresh_norm,
@@ -744,9 +795,10 @@ class _GraphCTH_NoAssim(GraphCTH_NODE):
         return torch.stack(preds, dim=2)
 
 
-def _ablation_variant(model_cls, feats_abl, lambda_physics=0.02, epochs=300):
+def _ablation_variant(model_cls, feats_abl, lambda_physics=0.02, epochs=300, use_hyper=True):
     """Train and evaluate one ablation variant on the standard 80% mask."""
-    m    = model_cls(input_dim=6, hidden_dim=64, A_road=A_road).to(device)
+    hc   = H_conv if use_hyper else None
+    m    = model_cls(input_dim=6, hidden_dim=64, A_road=A_road, H_conv=hc).to(device)
     opt  = torch.optim.Adam(m.parameters(), lr=3e-4, weight_decay=1e-4)
     sch  = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
     crit = ObservedMSELoss(jam_thresh_norm=jam_thresh_norm,
@@ -808,19 +860,20 @@ feats_no_nbr  = input_features.clone(); feats_no_nbr[:,:,:,2]   = 0.0
 feats_no_time = input_features.clone(); feats_no_time[:,:,:,4:] = 0.0
 
 ablation_configs = [
-    # (label,                    model_cls,           feats,              λ_phys)
-    ("Full model",               GraphCTH_NODE,       input_features,     0.02),
-    ("− Assimilation",           _GraphCTH_NoAssim,   input_features,     0.02),
-    ("− Physics loss",           GraphCTH_NODE,       input_features,     0.00),
-    ("− Neighbour context",      GraphCTH_NODE,       feats_no_nbr,       0.02),
-    ("− Temporal encoding",      GraphCTH_NODE,       feats_no_time,      0.02),
+    # (label,                    model_cls,           feats,        λ_phys, use_hyper)
+    ("Full model",               GraphCTH_NODE,       input_features,  0.02, True),
+    ("− Hypergraph",             GraphCTH_NODE,       input_features,  0.02, False),
+    ("− Assimilation",           _GraphCTH_NoAssim,   input_features,  0.02, True),
+    ("− Physics loss",           GraphCTH_NODE,       input_features,  0.00, True),
+    ("− Neighbour context",      GraphCTH_NODE,       feats_no_nbr,    0.02, True),
+    ("− Temporal encoding",      GraphCTH_NODE,       feats_no_time,   0.02, True),
 ]
 
 print("\nAblation Study (300 epochs per variant)…")
 ablation_rows = []
-for label, cls, feats_v, lp in ablation_configs:
+for label, cls, feats_v, lp, uh in ablation_configs:
     print(f"  Training: {label}…", end="", flush=True)
-    ov, jv = _ablation_variant(cls, feats_v, lambda_physics=lp, epochs=300)
+    ov, jv = _ablation_variant(cls, feats_v, lambda_physics=lp, epochs=300, use_hyper=uh)
     ablation_rows.append((label, ov, jv))
     print(f"  overall={ov:.2f}  jam={jv:.2f}")
 
