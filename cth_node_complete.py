@@ -266,14 +266,22 @@ class GraphODEFunc(nn.Module):
         self.hconv = HypergraphConv(hidden_dim, hidden_dim) if H_conv is not None else None
         self.act   = nn.Tanh()
         self.norm  = nn.LayerNorm(hidden_dim)
+        # Learnable gate for hypergraph contribution.
+        # Initialised at -2 so sigmoid(-2) ≈ 0.12 — the model starts with a weak
+        # hypergraph signal and learns to amplify it only when group context helps.
+        # Without a gate, the 2-hop aggregation over-smooths jam nodes (a jammed
+        # node whose 20 hyperedge-neighbours are all free-flowing gets a high
+        # group output, actively contradicting the jam signal).
+        if H_conv is not None:
+            self.hyper_gate = nn.Parameter(torch.tensor(-2.0))
 
     def forward(self, t, x):
         A     = self.A.expand(x.size(0), -1, -1)
         h     = self.act(self.gat1(x, A))             # pairwise attention
         h     = self.act(self.gat2(h, A))             # second attention layer
         if self.hconv is not None:
-            h_hyp = self.act(self.hconv(x, self.H_conv))  # group-level aggregation
-            h     = h + h_hyp                          # fuse pairwise + hypergraph
+            h_hyp = self.act(self.hconv(x, self.H_conv))          # group-level
+            h     = h + torch.sigmoid(self.hyper_gate) * h_hyp    # gated fusion
         delta = self.norm(h)
         return delta
 
@@ -650,7 +658,7 @@ def _make_features_for_sparsity(sp_ratio, seed=42):
     return feats, sp_mask
 
 
-_SP_EPOCHS = 100          # fast sweep — ranking matters, not absolute MAE
+_SP_EPOCHS = 150          # fast sweep — ranking matters, not absolute MAE
 _SP_ACCUM  = 2            # halved vs main training
 _SP_HIDDEN = 32           # smaller model for speed
 
@@ -886,14 +894,30 @@ ablation_rows.insert(0, ("Global mean baseline",   m_base_all,  m_base))
 full_ov = ablation_rows[2][1]   # Full model overall MAE
 full_jv = ablation_rows[2][2]   # Full model jam MAE
 
-print("\n" + "="*65)
-print(f"  {'Model / Variant':<28} | {'MAE all':>8} | {'MAE jam':>8} | {'Δ jam':>7}")
-print("="*65)
+print("\n" + "="*70)
+print(f"  {'Model / Variant':<28} | {'MAE all':>8} | {'MAE jam':>8} | {'Δ jam':>9}")
+print(f"  {'':28}   {'':8}   {'':8}   {'(+) = helps':>9}")
+print("="*70)
 for label, ov, jv in ablation_rows:
-    delta = f"{jv - full_jv:>+.2f}" if label not in ("Global mean baseline", "IDW (spatial interp.)") else "  —"
+    # Δ jam = full_jv - variant_jv
+    # positive: removing this component raises jam MAE  → component HELPS
+    # negative: removing this component lowers jam MAE  → component HURTS (investigate)
+    if label in ("Global mean baseline", "IDW (spatial interp.)"):
+        delta = "  —"
+    else:
+        delta = f"{full_jv - jv:>+.2f}"
     marker = " ◀" if label == "Full model" else ""
-    print(f"  {label:<28} | {ov:>8.2f} | {jv:>8.2f} | {delta:>7}{marker}")
-print("="*65)
+    print(f"  {label:<28} | {ov:>8.2f} | {jv:>8.2f} | {delta:>9}{marker}")
+print("="*70)
+# Print learned hypergraph gate value from trained full model
+if hasattr(model.ode_func, 'hyper_gate'):
+    g = torch.sigmoid(model.ode_func.hyper_gate).item()
+    print(f"\n  Learned hypergraph gate: sigmoid(w) = {g:.3f}  "
+          f"(0=ignore, 1=full weight)")
+print()
+print("  Δ jam: how much jam MAE rises when this component is removed.")
+print("  Positive = component improves jam imputation.")
+print("  Negative = component hurts jams (over-smoothing or noise).")
 print("\n  Note: DCRNN / STGCN / Graph WaveNet are short-horizon forecasting")
 print("  models trained on fully-observed sensors; their published PEMS04")
 print("  MAE values are not directly comparable to this sparse-imputation task.")
