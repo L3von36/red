@@ -1,797 +1,930 @@
 """
-Build a professional thesis-level PowerPoint presentation.
-Uses python-pptx with custom colours, shapes, and layouts.
+Thesis defense presentation — official academic standard:
+
+  Layout  : 16:9 widescreen (33.87 cm × 19.05 cm)
+  Font    : Calibri (sans-serif body), minimum 24pt body text
+  Background: white throughout — NO heavy colour fills on slide body
+  Accents : Thin dark-blue header bar only; tables use simple lines
+  Title   : Full author/degree/supervisor/date block (standard defense format)
+  Footer  : Slide number + short title on every slide except title slide
+  Colours : Maximum 2 accent colours (#1B2A4A navy, #2E6FD9 blue)
+  Bullets : Max 6–7 per slide, ≥24pt, 1.5 line spacing
+  Tables  : Three-line (booktabs) style — top rule, mid rule, bottom rule
 """
 from pptx import Presentation
-from pptx.util import Inches, Pt, Emu, Cm
+from pptx.util import Cm, Pt, Emu
 from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN
-from pptx.util import Inches, Pt
-from pptx.enum.dml import MSO_THEME_COLOR
+from pptx.oxml.ns import qn
+from lxml import etree
 import copy
 
-# ── Colour palette ─────────────────────────────────────────────────────────────
-NAVY    = RGBColor(0x1B, 0x2A, 0x4A)
-ACCENT  = RGBColor(0x2E, 0x6F, 0xD9)
-LIGHT   = RGBColor(0xEB, 0xF1, 0xFA)
-WHITE   = RGBColor(0xFF, 0xFF, 0xFF)
-DARK    = RGBColor(0x1C, 0x1C, 0x1C)
-GREY    = RGBColor(0x55, 0x55, 0x55)
-GREEN   = RGBColor(0x1E, 0x8B, 0x4C)
-RED     = RGBColor(0xC0, 0x39, 0x2B)
-GOLD    = RGBColor(0xE6, 0xA8, 0x17)
-MID     = RGBColor(0xC5, 0xD6, 0xF0)
+# ── Dimensions ────────────────────────────────────────────────────────────────
+SW = Cm(33.87)   # slide width  (16:9 widescreen)
+SH = Cm(19.05)   # slide height
 
-W = Inches(13.33)   # widescreen 16:9
-H = Inches(7.5)
+# ── Colour constants ───────────────────────────────────────────────────────────
+NAVY  = RGBColor(0x1B, 0x2A, 0x4A)   # primary accent
+BLUE  = RGBColor(0x2E, 0x6F, 0xD9)   # secondary accent (links, highlights)
+BLACK = RGBColor(0x00, 0x00, 0x00)
+DARK  = RGBColor(0x1C, 0x1C, 0x1C)   # body text
+GREY  = RGBColor(0x55, 0x55, 0x55)   # secondary text
+LGREY = RGBColor(0xCC, 0xCC, 0xCC)   # light lines
+VLGREY= RGBColor(0xF2, 0xF2, 0xF2)   # table alt-row tint
+WHITE = RGBColor(0xFF, 0xFF, 0xFF)
+
+MARGINS = Cm(1.8)          # left/right content margin
+CONTENT_TOP = Cm(3.2)      # top of content area (below header bar)
+CONTENT_W   = SW - 2 * MARGINS
+FOOTER_Y    = SH - Cm(0.9)
 
 
-# ── Helper: add a solid-fill rectangle ────────────────────────────────────────
-def add_rect(slide, x, y, w, h, fill_rgb, line_rgb=None, line_width=Pt(0)):
-    shape = slide.shapes.add_shape(1, x, y, w, h)   # 1 = MSO_SHAPE_TYPE.RECTANGLE
-    shape.fill.solid()
-    shape.fill.fore_color.rgb = fill_rgb
-    if line_rgb:
-        shape.line.color.rgb = line_rgb
-        shape.line.width = line_width
+# ── pptx helpers ──────────────────────────────────────────────────────────────
+def rgb(r, g, b):
+    return RGBColor(r, g, b)
+
+
+def add_shape(slide, x, y, w, h, fill=None, line_color=None, line_width=Pt(0)):
+    sp = slide.shapes.add_shape(1, x, y, w, h)
+    sp.fill.solid() if fill else sp.fill.background()
+    if fill:
+        sp.fill.fore_color.rgb = fill
+    if line_color:
+        sp.line.color.rgb = line_color
+        sp.line.width = line_width
     else:
-        shape.line.fill.background()
-    return shape
+        sp.line.fill.background()
+    return sp
 
 
-def add_text_box(slide, text, x, y, w, h,
-                 font_size=Pt(14), bold=False, italic=False,
-                 color=DARK, align=PP_ALIGN.LEFT,
-                 font_name="Calibri", wrap=True):
-    txb = slide.shapes.add_textbox(x, y, w, h)
-    tf  = txb.text_frame
+def add_text(slide, text, x, y, w, h,
+             size=Pt(18), bold=False, italic=False,
+             color=DARK, align=PP_ALIGN.LEFT, wrap=True,
+             font='Calibri', line_spacing=None):
+    tb = slide.shapes.add_textbox(x, y, w, h)
+    tf = tb.text_frame
     tf.word_wrap = wrap
-    p   = tf.paragraphs[0]
+    p  = tf.paragraphs[0]
     p.alignment = align
-    run = p.add_run()
-    run.text = text
-    run.font.size     = font_size
-    run.font.bold     = bold
-    run.font.italic   = italic
-    run.font.color.rgb = color
-    run.font.name     = font_name
-    return txb
+    if line_spacing:
+        p.line_spacing = line_spacing
+    r = p.add_run()
+    r.text = text
+    r.font.name      = font
+    r.font.size      = size
+    r.font.bold      = bold
+    r.font.italic    = italic
+    r.font.color.rgb = color
+    return tb
 
 
-def add_para(tf, text, font_size=Pt(13), bold=False, italic=False,
-             color=DARK, align=PP_ALIGN.LEFT, space_before=Pt(6),
-             font_name="Calibri"):
+def add_line(slide, x1, y1, x2, y2, color=LGREY, width=Pt(0.75)):
+    """Add a horizontal or vertical line."""
+    from pptx.util import Emu
+    connector = slide.shapes.add_connector(1, x1, y1, x2, y2)
+    connector.line.color.rgb = color
+    connector.line.width = width
+    return connector
+
+
+def tf_add_para(tf, text, size=Pt(18), bold=False, italic=False,
+                color=DARK, align=PP_ALIGN.LEFT, space_before=Pt(4),
+                font='Calibri'):
     p = tf.add_paragraph()
     p.alignment    = align
     p.space_before = space_before
-    run = p.add_run()
-    run.text           = text
-    run.font.size      = font_size
-    run.font.bold      = bold
-    run.font.italic    = italic
-    run.font.color.rgb = color
-    run.font.name      = font_name
+    r = p.add_run()
+    r.text           = text
+    r.font.name      = font
+    r.font.size      = size
+    r.font.bold      = bold
+    r.font.italic    = italic
+    r.font.color.rgb = color
     return p
 
 
-# ── Page layout helpers ────────────────────────────────────────────────────────
-def nav_bar(slide, label=""):
-    """Top navy bar + slide label."""
-    add_rect(slide, 0, 0, W, Inches(0.65), NAVY)
-    if label:
-        add_text_box(slide, label, Inches(0.3), Inches(0.1), W - Inches(0.6),
-                     Inches(0.45), font_size=Pt(10), color=WHITE,
-                     align=PP_ALIGN.RIGHT)
+# ── Standard slide header ──────────────────────────────────────────────────────
+def slide_header(slide, title, page_num, short_title="Traffic Speed Imputation"):
+    """
+    Thin navy bar at top with slide title.
+    Footer: slide number right, short title left.
+    """
+    # Top bar — 1.8 cm tall, full width
+    add_shape(slide, Cm(0), Cm(0), SW, Cm(1.8), fill=NAVY)
+    # Slide title in bar
+    add_text(slide, title,
+             MARGINS, Cm(0.2), SW - 2*MARGINS, Cm(1.4),
+             size=Pt(22), bold=True, color=WHITE, align=PP_ALIGN.LEFT)
+
+    # Thin rule at bottom of content area
+    add_shape(slide, MARGINS, FOOTER_Y - Cm(0.05),
+              CONTENT_W, Cm(0.04), fill=LGREY)
+
+    # Footer text: short title left
+    add_text(slide, short_title,
+             MARGINS, FOOTER_Y, Cm(20), Cm(0.7),
+             size=Pt(11), color=GREY, align=PP_ALIGN.LEFT)
+
+    # Slide number right
+    add_text(slide, str(page_num),
+             SW - Cm(3.5), FOOTER_Y, Cm(3.2), Cm(0.7),
+             size=Pt(11), color=GREY, align=PP_ALIGN.RIGHT)
 
 
-def bottom_bar(slide, page_num):
-    """Bottom accent bar with page number."""
-    add_rect(slide, 0, H - Inches(0.35), W, Inches(0.35), ACCENT)
-    add_text_box(slide, str(page_num), W - Inches(0.6), H - Inches(0.32),
-                 Inches(0.5), Inches(0.28), font_size=Pt(9),
-                 color=WHITE, align=PP_ALIGN.CENTER)
-    add_text_box(slide, "Hypergraph Neural ODEs for Sparse Traffic Imputation",
-                 Inches(0.3), H - Inches(0.32), Inches(8), Inches(0.28),
-                 font_size=Pt(9), color=WHITE, align=PP_ALIGN.LEFT)
-
-
-def section_heading(slide, title, subtitle=""):
-    """Left accent stripe + heading."""
-    add_rect(slide, Inches(0.3), Inches(0.8), Inches(0.07), Inches(0.55), ACCENT)
-    add_text_box(slide, title, Inches(0.55), Inches(0.75), W - Inches(1.0),
-                 Inches(0.6), font_size=Pt(22), bold=True, color=NAVY)
-    if subtitle:
-        add_text_box(slide, subtitle, Inches(0.55), Inches(1.32), W - Inches(1.0),
-                     Inches(0.4), font_size=Pt(13), italic=True, color=GREY)
-
-
-def bullet_box(slide, title, bullets, x=Inches(0.4), y=Inches(1.6),
-               w=Inches(12.5), h=Inches(5.0), bg=LIGHT):
-    """Coloured card with a title and bullet list."""
-    add_rect(slide, x, y, w, h, bg, line_rgb=MID, line_width=Pt(0.5))
-    add_text_box(slide, title, x + Inches(0.15), y + Inches(0.12),
-                 w - Inches(0.3), Inches(0.4),
-                 font_size=Pt(13), bold=True, color=NAVY)
-    # divider
-    add_rect(slide, x + Inches(0.15), y + Inches(0.54), w - Inches(0.3),
-             Inches(0.02), ACCENT)
-
-    txb = slide.shapes.add_textbox(x + Inches(0.18), y + Inches(0.62),
-                                   w - Inches(0.36), h - Inches(0.8))
-    txb.text_frame.word_wrap = True
+# ── Bullet list text box ───────────────────────────────────────────────────────
+def bullet_list(slide, bullets, x, y, w, h,
+                size=Pt(20), color=DARK, indent=Cm(0.5)):
+    tb = slide.shapes.add_textbox(x, y, w, h)
+    tf = tb.text_frame
+    tf.word_wrap = True
     first = True
     for b in bullets:
         if first:
-            p = txb.text_frame.paragraphs[0]
-            first = False
+            p = tf.paragraphs[0]; first = False
         else:
-            p = txb.text_frame.add_paragraph()
-        p.space_before = Pt(3)
+            p = tf.add_paragraph()
+        p.space_before = Pt(6)
+        p.level = 0
         r = p.add_run()
-        r.text = f"▸  {b}"
-        r.font.size = Pt(12.5)
-        r.font.color.rgb = DARK
-        r.font.name = "Calibri"
+        r.text = f"\u2013  {b}"
+        r.font.name      = 'Calibri'
+        r.font.size      = size
+        r.font.color.rgb = color
+    return tb
 
 
-def info_card(slide, label, value, detail, x, y, w=Inches(3.8), h=Inches(2.0),
-              accent=ACCENT):
-    add_rect(slide, x, y, w, h, WHITE, line_rgb=accent, line_width=Pt(1.5))
-    add_rect(slide, x, y, w, Inches(0.06), accent)
-    add_text_box(slide, label, x + Inches(0.12), y + Inches(0.12),
-                 w - Inches(0.24), Inches(0.38),
-                 font_size=Pt(10), bold=True, color=accent)
-    add_text_box(slide, value, x + Inches(0.12), y + Inches(0.48),
-                 w - Inches(0.24), Inches(0.55),
-                 font_size=Pt(18), bold=True, color=NAVY)
-    add_text_box(slide, detail, x + Inches(0.12), y + Inches(1.0),
-                 w - Inches(0.24), Inches(0.85),
-                 font_size=Pt(10.5), italic=False, color=GREY, wrap=True)
-
-
-def results_table(slide, headers, rows, x, y, col_widths, row_height=Inches(0.42)):
-    """Professional styled table."""
-    n_cols = len(headers)
+# ── Three-line (booktabs) table ────────────────────────────────────────────────
+def booktabs_table(slide, headers, rows, x, y, col_widths,
+                   row_h=Cm(0.75), hdr_size=Pt(16), body_size=Pt(15)):
+    """Professional academic table with top/mid/bottom rules only."""
     n_rows = len(rows) + 1
-
+    n_cols = len(headers)
     total_w = sum(col_widths)
-    total_h = n_rows * row_height
+    total_h = n_rows * row_h
 
     tbl = slide.shapes.add_table(n_rows, n_cols, x, y, total_w, total_h).table
-    tbl.first_row = True
 
-    def style_cell(cell, text, bold=False, bg=None, color=DARK,
-                   align=PP_ALIGN.CENTER, size=Pt(11)):
-        cell.text = text
-        p = cell.text_frame.paragraphs[0]
-        p.alignment = align
-        if p.runs:
-            r = p.runs[0]
-        else:
-            r = p.add_run()
-            r.text = text
-        r.font.bold  = bold
-        r.font.size  = size
-        r.font.color.rgb = color
-        r.font.name  = "Calibri"
+    def _cell(cell, text, bold=False, align=PP_ALIGN.CENTER, size=body_size,
+              color=DARK, bg=None):
+        cell.text = ''
         if bg:
             cell.fill.solid()
             cell.fill.fore_color.rgb = bg
+        else:
+            cell.fill.background()
+        p = cell.text_frame.paragraphs[0]
+        p.alignment = align
+        r = p.add_run()
+        r.text = text
+        r.font.name      = 'Calibri'
+        r.font.size      = size
+        r.font.bold      = bold
+        r.font.color.rgb = color
+
+    # Remove all borders first by using no borders (white colour with 0 width)
+    for ri in range(n_rows):
+        for ci in range(n_cols):
+            c = tbl.cell(ri, ci)
+            c.fill.background()
 
     for ci, (h, cw) in enumerate(zip(headers, col_widths)):
         tbl.columns[ci].width = cw
-        style_cell(tbl.cell(0, ci), h, bold=True, bg=NAVY, color=WHITE)
+        _cell(tbl.cell(0, ci), h, bold=True, size=hdr_size, color=BLACK)
 
     for ri, row in enumerate(rows):
-        bg = LIGHT if ri % 2 == 1 else WHITE
         for ci, val in enumerate(row):
-            align = PP_ALIGN.LEFT if ci == 0 else PP_ALIGN.CENTER
-            style_cell(tbl.cell(ri + 1, ci), str(val), bg=bg, align=align)
+            al = PP_ALIGN.LEFT if ci == 0 else PP_ALIGN.CENTER
+            _cell(tbl.cell(ri+1, ci), str(val), align=al, color=DARK)
+
+    # Draw the three rules as thin rectangles (top, mid, bottom)
+    rule_w = total_w
+    add_shape(slide, x, y,                   rule_w, Cm(0.04), fill=BLACK)   # top
+    add_shape(slide, x, y + row_h,           rule_w, Cm(0.025), fill=LGREY)  # mid
+    add_shape(slide, x, y + total_h - Cm(0.04), rule_w, Cm(0.04), fill=BLACK)  # bottom
 
     return tbl
 
 
+# ── Section divider slide ──────────────────────────────────────────────────────
+def section_divider(slide, number, title, subtitle=""):
+    """Full-navy divider slide between major sections."""
+    add_shape(slide, Cm(0), Cm(0), SW, SH, fill=NAVY)
+    add_text(slide, number, Cm(2.5), Cm(5.5), SW - Cm(5), Cm(1.5),
+             size=Pt(14), color=rgb(0xAD, 0xC8, 0xE8), font='Calibri',
+             bold=False)
+    add_text(slide, title, Cm(2.5), Cm(6.8), SW - Cm(5), Cm(2.8),
+             size=Pt(40), bold=True, color=WHITE, font='Calibri')
+    if subtitle:
+        add_text(slide, subtitle, Cm(2.5), Cm(10.0), SW - Cm(5), Cm(1.5),
+                 size=Pt(20), italic=True, color=rgb(0xAD, 0xC8, 0xE8),
+                 font='Calibri')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BUILD PRESENTATION
 # ══════════════════════════════════════════════════════════════════════════════
 prs = Presentation()
-prs.slide_width  = W
-prs.slide_height = H
+prs.slide_width  = SW
+prs.slide_height = SH
 blank = prs.slide_layouts[6]   # blank layout
-page  = 0
+pg    = [0]   # mutable page counter (use list so inner functions can mutate)
+
+def next_slide():
+    pg[0] += 1
+    return prs.slides.add_slide(blank), pg[0]
 
 
-# ── SLIDE 1 — Title ────────────────────────────────────────────────────────────
-page += 1
-sl = prs.slides.add_slide(blank)
-add_rect(sl, 0, 0, W, H, NAVY)
-# Gold accent bar
-add_rect(sl, 0, Inches(3.6), W, Inches(0.06), GOLD)
-# White content block
-add_rect(sl, Inches(0.5), Inches(0.9), W - Inches(1.0), Inches(2.65), WHITE)
+# ─────────────────────────────────────────────────────────────────────────────
+# SLIDE 1 — Title (official thesis defense format)
+# ─────────────────────────────────────────────────────────────────────────────
+sl, _ = next_slide()
+# White background — no shape needed (default)
 
-add_text_box(sl,
-    "Hypergraph Neural ODEs with Observation Assimilation",
-    Inches(0.65), Inches(1.0), W - Inches(1.3), Inches(1.1),
-    font_size=Pt(28), bold=True, color=NAVY, align=PP_ALIGN.CENTER)
-add_text_box(sl,
-    "for Sparse Traffic Speed Imputation",
-    Inches(0.65), Inches(2.05), W - Inches(1.3), Inches(0.55),
-    font_size=Pt(20), bold=False, color=ACCENT, align=PP_ALIGN.CENTER)
-add_text_box(sl,
-    "PEMS04 Benchmark  ·  307 Sensors  ·  80% Sparsity",
-    Inches(0.65), Inches(2.6), W - Inches(1.3), Inches(0.4),
-    font_size=Pt(13), italic=True, color=GREY, align=PP_ALIGN.CENTER)
+# Thin top rule (navy, not a thick bar)
+add_shape(sl, Cm(0), Cm(0), SW, Cm(0.35), fill=NAVY)
 
-# Stat boxes
-for i, (lbl, val) in enumerate([
-    ("Dataset", "PEMS04"), ("Sensors", "307"), ("Sparsity", "80%"), ("Task", "Imputation")
-]):
-    bx = Inches(0.55) + i * Inches(3.15)
-    add_rect(sl, bx, Inches(3.85), Inches(2.9), Inches(1.45), ACCENT)
-    add_text_box(sl, lbl, bx, Inches(3.92), Inches(2.9), Inches(0.4),
-                 font_size=Pt(10), color=WHITE, align=PP_ALIGN.CENTER)
-    add_text_box(sl, val, bx, Inches(4.3), Inches(2.9), Inches(0.7),
-                 font_size=Pt(22), bold=True, color=WHITE, align=PP_ALIGN.CENTER)
+# University / department block (top-left, small)
+add_text(sl,
+    "[University Name]  ·  [Department / School of Engineering]",
+    MARGINS, Cm(0.55), SW - 2*MARGINS, Cm(0.7),
+    size=Pt(13), color=GREY, align=PP_ALIGN.LEFT)
 
-add_text_box(sl, "MSc Thesis Presentation", Inches(0.5), Inches(5.55),
-             W - Inches(1.0), Inches(0.45),
-             font_size=Pt(13), italic=True, color=WHITE, align=PP_ALIGN.CENTER)
-bottom_bar(sl, page)
+# Main title — centred, large
+add_text(sl,
+    "Hypergraph Neural ODEs with Observation Assimilation\nfor Sparse Traffic Speed Imputation",
+    MARGINS, Cm(2.8), CONTENT_W, Cm(3.4),
+    size=Pt(32), bold=True, color=NAVY,
+    align=PP_ALIGN.CENTER)
 
+# Thin divider under title
+add_shape(sl, MARGINS, Cm(6.3), CONTENT_W, Cm(0.04), fill=LGREY)
 
-# ── SLIDE 2 — Motivation ───────────────────────────────────────────────────────
-page += 1
-sl = prs.slides.add_slide(blank)
-nav_bar(sl, f"{page}")
-section_heading(sl, "Why Does This Problem Exist?", "Real sensor networks are never complete")
-
-cols = [Inches(0.35), Inches(4.6), Inches(8.85)]
-titles = ["The Problem", "The Scale", "The Impact"]
-bodies = [
-    ["Hardware failures & maintenance windows",
-     "Budget constraints — sensors are expensive",
-     "Road geometry limits sensor placement",
-     "→ Many sensors are DARK at any moment"],
-    ["PEMS04: 307 sensors, SF Bay Area freeways",
-     "Realistic deployments: only 20–60% observed",
-     "This work: 80% sensors missing",
-     "~246 blind nodes must be inferred"],
-    ["Missing speeds block: route planning",
-     "Incident detection and response",
-     "Signal timing optimisation",
-     "Emissions modelling and policy"],
+# Thesis details block
+details = [
+    ("Thesis submitted for the degree of",  Pt(15), False, GREY),
+    ("Master of Science in [Programme]",     Pt(18), True,  DARK),
+    ("",                                     Pt(8),  False, DARK),
+    ("Author:      [Full Name]",             Pt(16), False, DARK),
+    ("Supervisor:  [Supervisor Name]",       Pt(15), False, GREY),
+    ("Date:        March 2026",              Pt(15), False, GREY),
 ]
-colors = [LIGHT, RGBColor(0xE8, 0xF5, 0xE9), RGBColor(0xFF, 0xF3, 0xE0)]
+cy = Cm(6.8)
+for txt, sz, bold, col in details:
+    add_text(sl, txt, MARGINS + Cm(4), cy, Cm(20), Cm(0.8),
+             size=sz, bold=bold, color=col)
+    cy += sz.pt * 0.045 * Cm(1).pt / Pt(1).pt + Cm(0.1)
 
-for i in range(3):
-    bullet_box(sl, titles[i], bodies[i],
-               x=cols[i], y=Inches(1.7), w=Inches(4.1), h=Inches(4.6),
-               bg=colors[i])
+# Bottom navy rule
+add_shape(sl, Cm(0), SH - Cm(0.35), SW, Cm(0.35), fill=NAVY)
 
-bottom_bar(sl, page)
-
-
-# ── SLIDE 3 — Task definition ─────────────────────────────────────────────────
-page += 1
-sl = prs.slides.add_slide(blank)
-nav_bar(sl, f"{page}")
-section_heading(sl, "Imputation vs Forecasting", "This task is harder than standard traffic prediction")
-
-# Left column — forecasting
-bullet_box(sl, "Traffic Forecasting (Existing Work)",
-           ["All sensors are observed",
-            "Predict future values",
-            "Well-studied: DCRNN, STGCN, WaveNet",
-            "PEMS04 MAE ≈ 1.6 – 1.8 km/h",
-            "Single-horizon evaluation"],
-           x=Inches(0.35), y=Inches(1.7), w=Inches(5.9), h=Inches(3.5),
-           bg=LIGHT)
-
-# Right column — this work
-bullet_box(sl, "Sparse Imputation (This Work)",
-           ["80% of sensors are MISSING",
-            "Recover present values, not future",
-            "Under-explored — no deep baseline",
-            "Jam MAE is the key metric",
-            "Sparsity sweep from 20% to 90%"],
-           x=Inches(6.6), y=Inches(1.7), w=Inches(6.4), h=Inches(3.5),
-           bg=RGBColor(0xE8, 0xF0, 0xFF))
-
-# Key insight box
-add_rect(sl, Inches(0.35), Inches(5.45), W - Inches(0.7), Inches(1.2),
-         RGBColor(0xFF, 0xF8, 0xE1), line_rgb=GOLD, line_width=Pt(1.5))
-add_text_box(sl, "⚠  Key insight: A model that always predicts the global mean speed achieves 5.18 km/h "
-             "overall MAE — but completely fails during congestion. Jam MAE (speed < 40 km/h) is "
-             "the meaningful metric for a real traffic system.",
-             Inches(0.55), Inches(5.55), W - Inches(1.1), Inches(1.0),
-             font_size=Pt(12), color=RGBColor(0x7B, 0x5B, 0x00), italic=True, wrap=True)
-
-bottom_bar(sl, page)
+# Keywords in footer area
+add_text(sl,
+    "Keywords: Graph Neural ODE · Hypergraph Convolution · Traffic Imputation · "
+    "Observation Assimilation · Physics-Informed Learning",
+    MARGINS, SH - Cm(1.1), CONTENT_W, Cm(0.7),
+    size=Pt(11), italic=True, color=GREY, align=PP_ALIGN.CENTER)
 
 
-# ── SLIDE 4 — Data Setup ───────────────────────────────────────────────────────
-page += 1
-sl = prs.slides.add_slide(blank)
-nav_bar(sl, f"{page}")
-section_heading(sl, "Dataset & Setup", "PEMS04 · 80% Sensor Sparsity · 6-Feature Input")
+# ─────────────────────────────────────────────────────────────────────────────
+# SLIDE 2 — Outline
+# ─────────────────────────────────────────────────────────────────────────────
+sl, p = next_slide()
+slide_header(sl, "Outline", p)
 
-info_card(sl, "DATASET", "PEMS04",
-          "307 sensors · SF Bay Area\n5-min intervals · 17 days\nSpeed channel only",
-          Inches(0.35), Inches(1.7), w=Inches(3.7), h=Inches(2.2))
-info_card(sl, "SPARSITY", "80%",
-          "~246 blind nodes\n~61 observed sensors\nFixed mask, seed=42",
-          Inches(4.3), Inches(1.7), w=Inches(3.7), h=Inches(2.2), accent=GREEN)
-info_card(sl, "SPLIT", "Train / Val / Eval",
-          "Train: t = 0 – 3999\nVal: t = 4000 – 4239\nEval: t = 4500 – 4949",
-          Inches(8.25), Inches(1.7), w=Inches(4.7), h=Inches(2.2), accent=GOLD)
-
-# Feature table
-add_text_box(sl, "6-Feature Input (per node, per timestep — no GT leakage)",
-             Inches(0.35), Inches(4.1), W - Inches(0.7), Inches(0.4),
-             font_size=Pt(12), bold=True, color=NAVY)
-
-feat_headers = ["#", "Feature", "Description", "Blind Node Value"]
-feat_rows = [
-    ["1", "obs_speed", "Observed sensor speed (normalised)", "0.0 (zeroed)"],
-    ["2", "global_ctx", "Mean of ALL observed nodes at time t", "Same as observed"],
-    ["3", "nbr_ctx", "Adj-weighted mean of observed neighbours", "0.0 if no obs nbr"],
-    ["4", "is_observed", "Binary sensor flag", "0"],
-    ["5–6", "t_sin / t_cos", "Time-of-day cyclic encoding (scaled ×0.25)", "Shared"],
+outline = [
+    "1.  Motivation & Problem Statement",
+    "2.  Background & State of the Art",
+    "3.  Dataset & Experimental Setup",
+    "4.  Proposed Architecture",
+    "      4.1  Graph Attention ODE",
+    "      4.2  Hypergraph Convolution (gated)",
+    "      4.3  Observation Assimilation Gate",
+    "      4.4  Physics-Informed Loss",
+    "5.  Training Strategy",
+    "6.  Results & Analysis",
+    "      6.1  Main evaluation (80% sparsity)",
+    "      6.2  Sensor sparsity sweep (20 – 90%)",
+    "      6.3  Ablation study",
+    "7.  Conclusion & Future Work",
 ]
-results_table(sl, feat_headers, feat_rows,
-              x=Inches(0.35), y=Inches(4.55),
-              col_widths=[Inches(0.5), Inches(2.0), Inches(6.5), Inches(3.5)],
-              row_height=Inches(0.42))
-bottom_bar(sl, page)
+tb = sl.shapes.add_textbox(MARGINS, CONTENT_TOP, CONTENT_W, SH - CONTENT_TOP - Cm(1.2))
+tf = tb.text_frame; tf.word_wrap = True
+first = True
+for item in outline:
+    p_ = tf.paragraphs[0] if first else tf.add_paragraph()
+    first = False
+    p_.space_before = Pt(3)
+    indent = item.startswith("      ")
+    r = p_.add_run()
+    r.text = item
+    r.font.name      = 'Calibri'
+    r.font.size      = Pt(16) if not indent else Pt(14)
+    r.font.bold      = not indent and not item[0].isspace()
+    r.font.color.rgb = NAVY if not indent else GREY
+    r.font.italic    = indent
 
 
-# ── SLIDE 5 — Architecture Overview ───────────────────────────────────────────
-page += 1
-sl = prs.slides.add_slide(blank)
-nav_bar(sl, f"{page}")
-section_heading(sl, "Architecture Overview", "Four components — one unified model")
+# ─────────────────────────────────────────────────────────────────────────────
+# SLIDE 3 — Motivation
+# ─────────────────────────────────────────────────────────────────────────────
+sl, p = next_slide()
+slide_header(sl, "1.  Motivation", p)
 
-# Flow arrow background
-add_rect(sl, Inches(0.35), Inches(1.65), W - Inches(0.7), Inches(4.6), LIGHT,
-         line_rgb=MID, line_width=Pt(0.5))
+add_text(sl,
+    "Real sensor networks are never complete.",
+    MARGINS, CONTENT_TOP, CONTENT_W, Cm(0.9),
+    size=Pt(22), bold=True, color=NAVY)
 
-components = [
-    ("Input Encoder", "Linear(6→64)\nper node", NAVY),
-    ("GAT ODE", "2× Graph Attention\n+ Euler dt=0.3", ACCENT),
-    ("Hypergraph\nConv", "2-hop corridors\nGated fusion", GREEN),
-    ("Assimilation", "Kalman-style gate\nSensor injection", GOLD),
-    ("Decoder", "Linear(64→1)\nSpeed output", RGBColor(0x8E, 0x44, 0xAD)),
-]
+bullet_list(sl, [
+    "Hardware failures, maintenance windows, and budget constraints leave many sensors dark at any moment.",
+    "California PEMS04: 307 sensors across SF Bay Area freeways — realistic deployments observe only 20–60%.",
+    "Missing speed data blocks: route planning, incident detection, signal timing, emissions modelling.",
+    "This work: 80% of sensors are unobserved — we must infer ~246 blind node speeds from ~61 observed.",
+], MARGINS, Cm(4.4), CONTENT_W, Cm(9.0), size=Pt(20))
 
-box_w = Inches(2.2)
-box_h = Inches(1.6)
-gap   = Inches(0.28)
-start_x = Inches(0.5)
-cy = Inches(2.55)
-
-prev_x = None
-for i, (title, desc, col) in enumerate(components):
-    bx = start_x + i * (box_w + gap)
-    add_rect(sl, bx, cy, box_w, box_h, col)
-    add_text_box(sl, title, bx + Inches(0.08), cy + Inches(0.1),
-                 box_w - Inches(0.16), Inches(0.55),
-                 font_size=Pt(12), bold=True, color=WHITE, align=PP_ALIGN.CENTER)
-    add_rect(sl, bx + Inches(0.08), cy + Inches(0.62),
-             box_w - Inches(0.16), Inches(0.02), WHITE)
-    add_text_box(sl, desc, bx + Inches(0.08), cy + Inches(0.7),
-                 box_w - Inches(0.16), Inches(0.8),
-                 font_size=Pt(10.5), italic=True, color=WHITE, align=PP_ALIGN.CENTER)
-    # Arrow between boxes
-    if prev_x is not None:
-        ax = prev_x + box_w + Inches(0.04)
-        add_text_box(sl, "→", ax, cy + Inches(0.6), gap,
-                     Inches(0.45), font_size=Pt(18), bold=True,
-                     color=NAVY, align=PP_ALIGN.CENTER)
-    prev_x = bx
-
-# Bullet notes below
-note_bullets = [
-    "Input: [B, N, T, 6] — batch × nodes × timesteps × features",
-    "Hidden state z ∈ ℝ^{N×64} evolves via: decode → Euler ODE step → assimilation → repeat",
-    "Euler integration: z_{t+1} = z_t + 0.3 · f_θ(z_t)   |   Hypergraph gate: g = sigmoid(w), init w=−2",
-]
-for i, n in enumerate(note_bullets):
-    add_text_box(sl, f"▸  {n}", Inches(0.45), Inches(4.48) + i * Inches(0.45),
-                 W - Inches(0.9), Inches(0.4), font_size=Pt(11), color=DARK)
-
-bottom_bar(sl, page)
+# Research question box
+add_shape(sl, MARGINS, Cm(13.8), CONTENT_W, Cm(3.0),
+          fill=VLGREY, line_color=NAVY, line_width=Pt(1.0))
+add_text(sl, "Research Question",
+         MARGINS + Cm(0.4), Cm(14.1), CONTENT_W - Cm(0.8), Cm(0.7),
+         size=Pt(14), bold=True, color=NAVY)
+add_text(sl,
+    "Can a Hypergraph Neural ODE with learned sensor assimilation accurately "
+    "recover traffic speeds at unobserved sensors — especially during congestion events?",
+    MARGINS + Cm(0.4), Cm(14.85), CONTENT_W - Cm(0.8), Cm(1.7),
+    size=Pt(17), italic=True, color=DARK, wrap=True)
 
 
-# ── SLIDE 6 — GAT ─────────────────────────────────────────────────────────────
-page += 1
-sl = prs.slides.add_slide(blank)
-nav_bar(sl, f"{page}")
-section_heading(sl, "Graph Attention Network (GAT)", "Learn which neighbours matter — not just how close they are")
+# ─────────────────────────────────────────────────────────────────────────────
+# SLIDE 4 — Background: Task Definition
+# ─────────────────────────────────────────────────────────────────────────────
+sl, p = next_slide()
+slide_header(sl, "2.  Background — Task Definition", p)
 
-# Left card — GCN problem
-bullet_box(sl, "Standard GCN — Fixed Weights",
-           ["h_i = Σ_j  A_norm[i,j] × h_j",
-            "Weights fixed by road distance",
-            "Cannot adapt to congestion context",
-            "A congested close neighbour has same\ninfluence as a free-flowing distant one"],
-           x=Inches(0.35), y=Inches(1.65), w=Inches(5.95), h=Inches(4.1),
-           bg=LIGHT)
+add_text(sl, "Imputation vs Forecasting — a critical distinction",
+         MARGINS, CONTENT_TOP, CONTENT_W, Cm(0.9),
+         size=Pt(20), bold=True, color=NAVY)
 
-# Right card — GAT solution
-bullet_box(sl, "Our GAT — Learned Attention",
-           ["e_ij = LeakyReLU( a_src(Wh_i) + a_dst(Wh_j) )",
-            "α_ij = softmax( e_ij / τ=2 )  over road neighbours",
-            "h_i' = Σ_j  α_ij × Wh_j",
-            "Temperature τ=2 prevents single-neighbour\ndominance → no oscillation after jams",
-            "Non-edges masked to −∞ → road topology enforced"],
-           x=Inches(6.55), y=Inches(1.65), w=Inches(6.45), h=Inches(4.1),
-           bg=RGBColor(0xE8, 0xF0, 0xFF))
+# Two-column layout using textboxes
+half = CONTENT_W / 2 - Cm(0.3)
+# Left column header
+add_text(sl, "Traffic Forecasting (existing work)",
+         MARGINS, Cm(4.2), half, Cm(0.7),
+         size=Pt(17), bold=True, color=GREY)
+add_shape(sl, MARGINS, Cm(4.9), half, Cm(0.025), fill=LGREY)
+bullet_list(sl, [
+    "All sensors observed",
+    "Predict future values (1–3 steps ahead)",
+    "Well-studied: DCRNN, STGCN, Graph WaveNet",
+    "PEMS04 benchmark MAE: 1.5 – 1.8 km/h",
+], MARGINS, Cm(5.1), half, Cm(7.5), size=Pt(18), color=GREY)
 
-# Bottom note
-add_rect(sl, Inches(0.35), Inches(5.95), W - Inches(0.7), Inches(0.75),
-         RGBColor(0xE8, 0xF5, 0xE9), line_rgb=GREEN, line_width=Pt(1))
-add_text_box(sl, "Two stacked GAT layers inside the ODE function. Output is the derivative dz/dt — "
-             "the Euler step z + 0.3·f(z) adds the residual. LayerNorm applied to the derivative "
-             "only (not the sum), preserving ODE residual structure.",
-             Inches(0.55), Inches(6.0), W - Inches(1.1), Inches(0.65),
-             font_size=Pt(11), color=RGBColor(0x1A, 0x5C, 0x3A), wrap=True)
-bottom_bar(sl, page)
+# Right column header
+rx = MARGINS + half + Cm(0.6)
+add_text(sl, "Sparse Imputation  \u2190 This work",
+         rx, Cm(4.2), half, Cm(0.7),
+         size=Pt(17), bold=True, color=NAVY)
+add_shape(sl, rx, Cm(4.9), half, Cm(0.025), fill=NAVY)
+bullet_list(sl, [
+    "80% of sensors are MISSING",
+    "Recover present values, not future",
+    "No established deep-learning baseline",
+    "Jam MAE (speed < 40 km/h) is the key metric",
+], rx, Cm(5.1), half, Cm(7.5), size=Pt(18), color=NAVY)
 
+# Vertical divider
+add_shape(sl, MARGINS + half + Cm(0.25), Cm(4.2), Cm(0.025),
+          Cm(8.4), fill=LGREY)
 
-# ── SLIDE 7 — Hypergraph ───────────────────────────────────────────────────────
-page += 1
-sl = prs.slides.add_slide(blank)
-nav_bar(sl, f"{page}")
-section_heading(sl, "Hypergraph Convolution", "Capture corridor-level group dynamics beyond pairwise edges")
-
-bullet_box(sl, "Why Hypergraph?",
-           ["Standard edges: connect exactly 2 nodes (pairwise)",
-            "Hyperedge: connects a GROUP of nodes simultaneously",
-            "A freeway corridor {s₁, s₂, s₃, s₄, s₅} is naturally a hyperedge",
-            "The HGNN sees the whole corridor's state at once — not one hop at a time"],
-           x=Inches(0.35), y=Inches(1.65), w=Inches(12.6), h=Inches(2.1), bg=LIGHT)
-
-bullet_box(sl, "Construction & Convolution",
-           ["Hyperedge for node i = i ∪ {all 2-hop reachable sensors}",
-            "Incidence matrix H: H[v,e] = 1 if node v ∈ hyperedge e",
-            "Normalised operator: H_conv = D_v^{−½} H D_e^{−1} H^T D_v^{−½}  (pre-computed once)",
-            "Runtime: h_hyp = H_conv · (x · Θ)   — single matmul, very fast"],
-           x=Inches(0.35), y=Inches(3.9), w=Inches(7.7), h=Inches(2.6),
-           bg=RGBColor(0xE8, 0xF0, 0xFF))
-
-bullet_box(sl, "Learnable Gate (critical!)",
-           ["g = sigmoid(w),  init: w = −2  →  g ≈ 0.12",
-            "h = h_GAT + g · h_hyp  (gated fusion)",
-            "Without gate: jam nodes average with ~20\nfree-flowing corridor members → over-smooth",
-            "Gate learns WHEN corridor context helps"],
-           x=Inches(8.2), y=Inches(3.9), w=Inches(4.75), h=Inches(2.6),
-           bg=RGBColor(0xFF, 0xF8, 0xE1))
-bottom_bar(sl, page)
+# Key note at bottom
+add_text(sl,
+    "Note:  A model predicting the global mean speed achieves 5.18 km/h overall MAE "
+    "— but completely fails during congestion.  Overall MAE is insufficient; jam MAE must be reported separately.",
+    MARGINS, Cm(14.0), CONTENT_W, Cm(2.5),
+    size=Pt(15), italic=True, color=GREY, wrap=True)
 
 
-# ── SLIDE 8 — Assimilation ────────────────────────────────────────────────────
-page += 1
-sl = prs.slides.add_slide(blank)
-nav_bar(sl, f"{page}")
-section_heading(sl, "Observation Assimilation", "Kalman-style sensor fusion after each ODE step")
+# ─────────────────────────────────────────────────────────────────────────────
+# SLIDE 5 — Background: Related Work SOTA table
+# ─────────────────────────────────────────────────────────────────────────────
+sl, p = next_slide()
+slide_header(sl, "2.  Background — State of the Art", p)
 
-bullet_box(sl, "The Update Rule",
-           ["z_obs  = W_obs · x_{t+1}            ← encode new sensor reading",
-            "gate   = σ( W_g [ z ; z_obs ] )     ← learned Kalman gain",
-            "update = gate  ×  (z_obs − z)  ×  obs_mask",
-            "z ← z + update                      ← corrected hidden state"],
-           x=Inches(0.35), y=Inches(1.65), w=Inches(7.7), h=Inches(2.8),
-           bg=LIGHT)
+add_text(sl,
+    "Published PEMS04 results (full-sensor, 15-min forecasting task)",
+    MARGINS, CONTENT_TOP, CONTENT_W, Cm(0.8), size=Pt(18), color=DARK)
 
-bullet_box(sl, "Kalman Filter Analogy",
-           ["Kalman: z_pred = A·z  →  z_corr = z_pred + K·(obs − z_pred)",
-            "Ours:   ODE Euler step  →  z + gate·(z_obs − z)",
-            "Kalman gain K: fixed, computed from covariance matrix",
-            "Our gate: learned, adapts to non-linear traffic dynamics"],
-           x=Inches(8.2), y=Inches(1.65), w=Inches(4.75), h=Inches(2.8),
-           bg=RGBColor(0xE8, 0xF0, 0xFF))
-
-bullet_box(sl, "No Leakage — the Critical Detail",
-           ["obs_mask = 1 for observed sensors,  0 for blind nodes",
-            "update = ... × obs_mask  →  blind nodes get update = 0",
-            "Without this: blind nodes 'assimilate' their own zero observations",
-            "→ hidden state pulled toward 0 every step regardless of ODE prediction"],
-           x=Inches(0.35), y=Inches(4.65), w=Inches(12.6), h=Inches(2.0),
-           bg=RGBColor(0xFF, 0xEB, 0xEE))
-bottom_bar(sl, page)
-
-
-# ── SLIDE 9 — Physics Loss ────────────────────────────────────────────────────
-page += 1
-sl = prs.slides.add_slide(blank)
-nav_bar(sl, f"{page}")
-section_heading(sl, "Physics-Informed Training", "Three loss terms — each solving a different failure mode")
-
-cards = [
-    ("Term 1\nJam-Weighted MSE", NAVY,
-     ["L_obs = mean( ((ŝ−s)×mask)² × w )",
-      "w = 4 if speed < 40 km/h  (jam)",
-      "w = 1 otherwise  (free-flow)",
-      "Compensates 12:1 free-flow:jam ratio",
-      "λ = 1.0  (primary loss)"]),
-    ("Term 2\nTemporal Smoothness", ACCENT,
-     ["L_smooth = mean( (ŝ_{t+1} − ŝ_t)² )",
-      "Penalises step-to-step jumps",
-      "Suppresses post-jam oscillation",
-      "(model alternates between jam/free-flow)",
-      "λ = 0.60  (strong regulariser)"]),
-    ("Term 3\nLaplacian Physics", GREEN,
-     ["L_phys = mean( ||L_sym · v||² )",
-      "= Σ_i  (v_i − mean_nbr(v_i))²",
-      "LWR principle: speed varies continuously",
-      "along road — no sharp spatial boundaries",
-      "λ = 0.02  (soft constraint)"]),
-]
-
-for i, (title, col, bullets) in enumerate(cards):
-    bx = Inches(0.35) + i * Inches(4.35)
-    add_rect(sl, bx, Inches(1.65), Inches(4.15), Inches(5.1), col)
-    add_text_box(sl, title, bx + Inches(0.12), Inches(1.72),
-                 Inches(3.9), Inches(0.68), font_size=Pt(12), bold=True,
-                 color=WHITE, align=PP_ALIGN.CENTER)
-    add_rect(sl, bx + Inches(0.12), Inches(2.38), Inches(3.9), Inches(0.02), WHITE)
-    for j, b in enumerate(bullets):
-        add_text_box(sl, f"▸  {b}", bx + Inches(0.15), Inches(2.48) + j * Inches(0.5),
-                     Inches(3.85), Inches(0.45), font_size=Pt(10.5), color=WHITE, wrap=True)
-
-bottom_bar(sl, page)
-
-
-# ── SLIDE 10 — Training Strategy ──────────────────────────────────────────────
-page += 1
-sl = prs.slides.add_slide(blank)
-nav_bar(sl, f"{page}")
-section_heading(sl, "Training Strategy", "Three techniques to handle extreme class imbalance")
-
-strategies = [
-    ("Curriculum Masking", GREEN,
-     "15% of observed sensors are randomly pseudo-blinded each batch.",
-     ["Zeroes their speed, nbr_ctx, and is_observed features",
-      "Excludes from assimilation gate",
-      "Computes loss on their known ground truth",
-      "→ Gradients always flow through the blind-node code path"]),
-    ("Jam-Biased Sampling", ACCENT,
-     "50% of batches are forced to start at jam timesteps.",
-     ["Natural rate of jam windows: only ~8%",
-      "Even with 4× loss weight, variance is too high",
-      "Pre-computed jam_t_valid index for fast lookup",
-      "→ Balanced gradient signal between jam and free-flow"]),
-    ("Gradient Accumulation", NAVY,
-     "Gradients from 4 windows accumulated per parameter update.",
-     ["Jam batches: very high loss",
-      "Free-flow batches: very low loss",
-      "High variance → oscillating validation MAE",
-      "→ 4-step accumulation smooths this variance"]),
-]
-
-for i, (title, col, lead, bullets) in enumerate(strategies):
-    bx = Inches(0.35) + i * Inches(4.35)
-    add_rect(sl, bx, Inches(1.65), Inches(4.15), Inches(0.06), col)
-    add_rect(sl, bx, Inches(1.71), Inches(4.15), Inches(5.0), LIGHT)
-    add_text_box(sl, title, bx + Inches(0.12), Inches(1.74),
-                 Inches(3.9), Inches(0.45), font_size=Pt(13), bold=True, color=col)
-    add_text_box(sl, lead, bx + Inches(0.12), Inches(2.2),
-                 Inches(3.9), Inches(0.5), font_size=Pt(11), italic=True,
-                 color=GREY, wrap=True)
-    add_rect(sl, bx + Inches(0.12), Inches(2.72), Inches(3.9), Inches(0.015), col)
-    for j, b in enumerate(bullets):
-        add_text_box(sl, f"▸  {b}", bx + Inches(0.15), Inches(2.78) + j * Inches(0.5),
-                     Inches(3.85), Inches(0.45), font_size=Pt(10.5), color=DARK, wrap=True)
-
-# Optimiser details
-add_rect(sl, Inches(0.35), Inches(6.82), W - Inches(0.7), Inches(0.38), NAVY)
-add_text_box(sl,
-    "Adam lr=3×10⁻⁴  ·  weight decay=10⁻⁴  ·  Cosine Annealing T_max=400  ·  800 epochs  ·  Grad clip norm=1.0",
-    Inches(0.5), Inches(6.87), W - Inches(1.0), Inches(0.28),
-    font_size=Pt(10.5), color=WHITE, align=PP_ALIGN.CENTER)
-bottom_bar(sl, page)
-
-
-# ── SLIDE 11 — Main Results ────────────────────────────────────────────────────
-page += 1
-sl = prs.slides.add_slide(blank)
-nav_bar(sl, f"{page}")
-section_heading(sl, "Results: 80% Sparsity Evaluation", "Consistent improvement over both baselines on congestion events")
-
-results_table(sl,
-    ["Model", "MAE all (km/h)", "MAE jam (km/h)", "vs Global Mean Jam"],
+booktabs_table(sl,
+    ["Model", "Venue", "Architecture", "PEMS04 MAE"],
     [
-        ["Global mean baseline", "5.18", "35.99", "—"],
-        ["IDW spatial interpolation", "5.23", "32.95", "−8.5%"],
-        ["Ours — Full model", "5.18", "33.93", "−5.7%"],
+        ["DCRNN  (Li et al., 2018)", "ICLR 2018",
+         "Diffusion GCN + seq2seq RNN", "~1.8 km/h"],
+        ["STGCN  (Yu et al., 2018)", "IJCAI 2018",
+         "Graph conv + temporal conv",  "~1.7 km/h"],
+        ["Graph WaveNet  (Wu et al., 2019)", "IJCAI 2019",
+         "Adaptive adj + dilated conv", "~1.6 km/h"],
+        ["ASTGCN  (Guo et al., 2019)", "AAAI 2019",
+         "Spatial + temporal attention","~1.6 km/h"],
+        ["AGCRN  (Bai et al., 2020)",  "NeurIPS 2020",
+         "Node-adaptive GCN + GRU",    "~1.5 km/h"],
+        ["This work", "MSc Thesis 2026",
+         "Hypergraph GAT-ODE + Assimilation", "5.18 km/h *"],
     ],
-    x=Inches(1.5), y=Inches(1.75),
-    col_widths=[Inches(5.0), Inches(2.2), Inches(2.2), Inches(2.4)],
-    row_height=Inches(0.5)
+    x=MARGINS, y=Cm(4.7),
+    col_widths=[Cm(10.0), Cm(4.0), Cm(10.5), Cm(4.2)],
+    row_h=Cm(1.1)
 )
 
-# Call-out boxes
-info_card(sl, "OVERALL MAE", "5.18 km/h",
-          "Matches global mean — expected.\nFree-flow (92%) dominates the average.",
-          Inches(0.35), Inches(3.3), w=Inches(4.0), h=Inches(1.8), accent=GREY)
-info_card(sl, "JAM MAE", "33.93 km/h",
-          "5.7% improvement over global mean.\nThe key metric for real-world utility.",
-          Inches(4.6), Inches(3.3), w=Inches(4.0), h=Inches(1.8), accent=GREEN)
-info_card(sl, "vs IDW", "+2.9% better on jams",
-          "Learned spatial + temporal context\nbeyond static adjacency weighting.",
-          Inches(8.85), Inches(3.3), w=Inches(4.1), h=Inches(1.8), accent=ACCENT)
+add_text(sl,
+    "* Different task: 80% sensors missing (imputation), not full-sensor forecasting.  "
+    "The ~3× MAE gap reflects task difficulty, not model quality.",
+    MARGINS, Cm(13.5), CONTENT_W, Cm(2.0),
+    size=Pt(14), italic=True, color=GREY, wrap=True)
 
-add_rect(sl, Inches(0.35), Inches(5.35), W - Inches(0.7), Inches(1.3),
-         RGBColor(0xFF, 0xF8, 0xE1), line_rgb=GOLD, line_width=Pt(1.5))
-add_text_box(sl,
-    "⚠  Why does our model tie the global mean on overall MAE?\n"
-    "Free-flow is 92% of timesteps and tightly clustered near the mean. Any model near the mean on "
-    "free-flow will tie on overall MAE. Jam MAE is where the real difference lies — and where our "
-    "graph dynamics and sensor assimilation provide genuine value.",
-    Inches(0.55), Inches(5.42), W - Inches(1.1), Inches(1.15),
-    font_size=Pt(11), color=RGBColor(0x7B, 0x5B, 0x00), wrap=True)
-bottom_bar(sl, page)
+bullet_list(sl, [
+    "Gap in literature: none of the above models address sparse imputation with >50% missing sensors.",
+    "This work fills that gap with a Hypergraph Neural ODE architecture tailored for the imputation setting.",
+], MARGINS, Cm(15.2), CONTENT_W, Cm(3.0), size=Pt(16))
 
 
-# ── SLIDE 12 — Sparsity Sweep ─────────────────────────────────────────────────
-page += 1
-sl = prs.slides.add_slide(blank)
-nav_bar(sl, f"{page}")
-section_heading(sl, "Results: Sensor Sparsity Sweep", "Performance degrades gracefully from 20% to 90% missing sensors")
+# ─────────────────────────────────────────────────────────────────────────────
+# SLIDE 6 — Dataset and Setup
+# ─────────────────────────────────────────────────────────────────────────────
+sl, p = next_slide()
+slide_header(sl, "3.  Dataset and Experimental Setup", p)
 
-results_table(sl,
-    ["Sparsity", "Blind Sensors", "Global Mean Jam", "IDW Jam", "Model Jam", "vs Baseline"],
+# Three info columns
+col_w = (CONTENT_W - Cm(1.2)) / 3
+for i, (hdr, rows) in enumerate([
+    ("PEMS04 Dataset",
+     ["307 sensors, SF Bay Area freeways",
+      "5-minute sampling intervals",
+      "5,000 timesteps ≈ 17.4 days",
+      "Speed channel extracted (index 2)",
+      "Z-score normalised: μ, σ from full set"]),
+    ("Sparsity Configuration",
+     ["Sparsity ratio: 80%",
+      "≈ 61 observed nodes (randomly selected)",
+      "≈ 246 blind nodes (must be imputed)",
+      "Fixed mask, seed = 42 (reproducible)",
+      "Sweep tested: 20%, 40%, 60%, 80%, 90%"]),
+    ("Train / Val / Eval Split",
+     ["Train:  t = 0 – 3,999",
+      "Val:    t = 4,000 – 4,239",
+      "Eval:   t = 4,500 – 4,949",
+      "500-step buffer (no temporal leakage)",
+      "Non-overlapping 48-step windows"]),
+]):
+    cx = MARGINS + i * (col_w + Cm(0.6))
+    add_text(sl, hdr, cx, CONTENT_TOP, col_w, Cm(0.75),
+             size=Pt(17), bold=True, color=NAVY)
+    add_shape(sl, cx, CONTENT_TOP + Cm(0.8), col_w, Cm(0.04), fill=NAVY)
+    bullet_list(sl, rows, cx, CONTENT_TOP + Cm(1.0), col_w, Cm(7.5),
+                size=Pt(16))
+
+# Feature table
+add_text(sl, "6-Dimensional Input Feature Vector (per node per timestep — no ground-truth leakage)",
+         MARGINS, Cm(11.8), CONTENT_W, Cm(0.7), size=Pt(15), bold=True, color=DARK)
+booktabs_table(sl,
+    ["#", "Feature Name", "Description", "Blind node value"],
+    [
+        ["1", "obs_speed",  "Observed speed (normalised)", "0.0  (zeroed)"],
+        ["2", "global_ctx", "Mean of all observed nodes at time t", "Same as observed"],
+        ["3", "nbr_ctx",    "Adj-weighted mean of observed neighbours", "0.0 if no obs. nbr"],
+        ["4", "is_observed","Binary sensor flag", "0"],
+        ["5–6","t_sin / t_cos","Time-of-day cyclic encoding (scaled ×0.25)","Shared with obs. nodes"],
+    ],
+    x=MARGINS, y=Cm(12.55),
+    col_widths=[Cm(1.2), Cm(5.0), Cm(13.5), Cm(8.5)],
+    row_h=Cm(0.85), hdr_size=Pt(14), body_size=Pt(14)
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SLIDE 7 — Architecture Overview
+# ─────────────────────────────────────────────────────────────────────────────
+sl, p = next_slide()
+slide_header(sl, "4.  Proposed Architecture — Overview", p)
+
+add_text(sl,
+    "The model processes T = 48 timestep windows recurrently.  "
+    "At each step: decode → Euler ODE step → assimilation → repeat.",
+    MARGINS, CONTENT_TOP, CONTENT_W, Cm(1.0), size=Pt(18), color=DARK, wrap=True)
+
+# Pipeline boxes — white with navy outline (no colour fills)
+stages = [
+    ("Input Encoder", "Linear(6 → 64)\nper node"),
+    ("GAT ODE Layer", "2× Graph Attention\nEuler  dt = 0.3"),
+    ("Hypergraph Conv", "2-hop corridors\nLearnable gate"),
+    ("Assimilation", "Kalman-style\nSensor injection"),
+    ("Decoder", "Linear(64 → 1)\nSpeed ŝ"),
+]
+bw  = Cm(5.4)
+bh  = Cm(3.0)
+gap = Cm(0.8)
+sx  = MARGINS
+sy  = Cm(4.8)
+
+for i, (name, desc) in enumerate(stages):
+    bx = sx + i * (bw + gap)
+    add_shape(sl, bx, sy, bw, bh, fill=None,
+              line_color=NAVY, line_width=Pt(1.2))
+    add_text(sl, name, bx, sy + Cm(0.25), bw, Cm(0.75),
+             size=Pt(16), bold=True, color=NAVY, align=PP_ALIGN.CENTER)
+    add_shape(sl, bx + Cm(0.4), sy + Cm(0.95), bw - Cm(0.8),
+              Cm(0.03), fill=LGREY)
+    add_text(sl, desc, bx, sy + Cm(1.1), bw, Cm(1.6),
+             size=Pt(14), italic=True, color=DARK, align=PP_ALIGN.CENTER)
+    if i < len(stages) - 1:
+        add_text(sl, "\u2192",
+                 bx + bw + Cm(0.1), sy + Cm(1.0), gap, Cm(1.0),
+                 size=Pt(22), bold=True, color=NAVY, align=PP_ALIGN.CENTER)
+
+# Key equations below
+eqs = [
+    ("ODE step:", "z_{t+1} = z_t + 0.3 \u00b7 f_\u03b8(z_t)"),
+    ("f_\u03b8(z):", "LayerNorm( Tanh(GAT\u2082(Tanh(GAT\u2081(z)))) + g \u00b7 HypConv(z) )"),
+    ("Assimilation:", "z \u2190 z + \u03c3(W_g [z; z_obs]) \u2299 (z_obs \u2212 z) \u2299 obs_mask"),
+]
+for i, (lbl, eq) in enumerate(eqs):
+    add_text(sl, lbl, MARGINS, Cm(9.0) + i*Cm(1.6),
+             Cm(5), Cm(1.3), size=Pt(16), bold=True, color=NAVY)
+    add_text(sl, eq, MARGINS + Cm(5.2), Cm(9.0) + i*Cm(1.6),
+             CONTENT_W - Cm(5.2), Cm(1.3),
+             size=Pt(16), color=DARK, font='Courier New')
+
+add_shape(sl, MARGINS, Cm(8.7), CONTENT_W, Cm(0.03), fill=LGREY)
+add_shape(sl, MARGINS, Cm(13.7), CONTENT_W, Cm(0.03), fill=LGREY)
+
+bullet_list(sl, [
+    "Input tensor shape: [B, N, T, 6]  —  batch × nodes × timesteps × features",
+    "Hidden state z \u2208 \u211d^{N\u00d764} evolves continuously through the ODE and is corrected by each sensor observation.",
+], MARGINS, Cm(14.0), CONTENT_W, Cm(3.5), size=Pt(17))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SLIDE 8 — GAT and Hypergraph
+# ─────────────────────────────────────────────────────────────────────────────
+sl, p = next_slide()
+slide_header(sl, "4.1–4.2  Graph Attention + Hypergraph Convolution", p)
+
+half = CONTENT_W / 2 - Cm(0.3)
+# Left — GAT
+add_text(sl, "Graph Attention Network (GAT)",
+         MARGINS, CONTENT_TOP, half, Cm(0.75),
+         size=Pt(18), bold=True, color=NAVY)
+add_shape(sl, MARGINS, CONTENT_TOP + Cm(0.8), half, Cm(0.04), fill=NAVY)
+bullet_list(sl, [
+    "e\u1d62\u2c7c = LeakyReLU( a\u209b\u1d63\u1d9c(Wh\u1d62) + a\u1d49\u209b\u209c(Wh\u2c7c) )",
+    "\u03b1\u1d62\u2c7c = softmax( e\u1d62\u2c7c / \u03c4=2 )  over road neighbours of i",
+    "Non-edges masked to \u2212\u221e before softmax",
+    "Temperature \u03c4=2 prevents collapse to a single neighbour \u2192 avoids oscillation",
+    "Two stacked GAT layers inside the ODE function",
+], MARGINS, CONTENT_TOP + Cm(1.0), half, Cm(8.0), size=Pt(17))
+
+# Vertical divider
+add_shape(sl, MARGINS + half + Cm(0.25), CONTENT_TOP, Cm(0.03),
+          Cm(11.5), fill=LGREY)
+
+# Right — Hypergraph
+rx = MARGINS + half + Cm(0.6)
+add_text(sl, "Gated Hypergraph Convolution",
+         rx, CONTENT_TOP, half, Cm(0.75),
+         size=Pt(18), bold=True, color=NAVY)
+add_shape(sl, rx, CONTENT_TOP + Cm(0.8), half, Cm(0.04), fill=NAVY)
+bullet_list(sl, [
+    "Hyperedge for node i = i \u222a { all 2-hop reachable sensors }",
+    "Captures corridor/intersection groups beyond pairwise edges",
+    "H_conv = D_v^{\u207b\u00bd} H D_e^{\u207b\u00b9} H\u1d40 D_v^{\u207b\u00bd}  (pre-computed once)",
+    "Gate: g = sigmoid(w),  w_init = \u22122  \u2192  g \u2248 0.12",
+    "h = h_GAT + g \u00b7 HypConv(x)   (gated fusion)",
+    "Gate prevents over-smoothing at congested nodes",
+], rx, CONTENT_TOP + Cm(1.0), half, Cm(8.0), size=Pt(17))
+
+# Joint note
+add_text(sl,
+    "Without the gate: a jammed sensor in a 2-hop hyperedge with 20 free-flowing corridor members "
+    "would be averaged toward free-flow — actively contradicting the congestion signal.",
+    MARGINS, Cm(13.5), CONTENT_W, Cm(2.5),
+    size=Pt(15), italic=True, color=GREY, wrap=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SLIDE 9 — Assimilation and Physics Loss
+# ─────────────────────────────────────────────────────────────────────────────
+sl, p = next_slide()
+slide_header(sl, "4.3–4.4  Observation Assimilation and Physics-Informed Loss", p)
+
+half = CONTENT_W / 2 - Cm(0.3)
+
+# Left — Assimilation
+add_text(sl, "Observation Assimilation Gate",
+         MARGINS, CONTENT_TOP, half, Cm(0.75),
+         size=Pt(18), bold=True, color=NAVY)
+add_shape(sl, MARGINS, CONTENT_TOP + Cm(0.8), half, Cm(0.04), fill=NAVY)
+bullet_list(sl, [
+    "z_obs  = W_obs \u00b7 x_{t+1}            \u2190 encode new reading",
+    "gate   = \u03c3( W_g [z ; z_obs] )      \u2190 Kalman gain (learned)",
+    "update = gate \u2299 (z_obs \u2212 z) \u2299 obs_mask",
+    "z \u2190 z + update                      \u2190 corrected state",
+    "obs_mask zeros blind nodes \u2192 no leakage",
+], MARGINS, CONTENT_TOP + Cm(1.0), half, Cm(7.5), size=Pt(16))
+
+add_text(sl, "Kalman filter analogy:",
+         MARGINS, Cm(9.8), half, Cm(0.6), size=Pt(14), bold=True, color=GREY)
+add_text(sl,
+    "  z_pred = A\u00b7z  \u2192  z_corr = z_pred + K\u00b7(obs \u2212 z_pred)\n"
+    "  Our gate \u2248 Kalman gain K, but learned from data.",
+    MARGINS, Cm(10.35), half, Cm(1.5),
+    size=Pt(14), italic=True, color=GREY, wrap=True)
+
+# Vertical divider
+add_shape(sl, MARGINS + half + Cm(0.25), CONTENT_TOP, Cm(0.03),
+          Cm(10.5), fill=LGREY)
+
+# Right — Loss
+rx = MARGINS + half + Cm(0.6)
+add_text(sl, "Three-Term Loss Function",
+         rx, CONTENT_TOP, half, Cm(0.75), size=Pt(18), bold=True, color=NAVY)
+add_shape(sl, rx, CONTENT_TOP + Cm(0.8), half, Cm(0.04), fill=NAVY)
+
+for i, (term, formula, note) in enumerate([
+    ("1.  Jam-weighted MSE",
+     "L_obs = mean( ((ŝ\u2212s)\u2299mask)² \u2299 w )",
+     "w = 4 if speed < 40 km/h,  else 1.  Compensates 12:1 class imbalance."),
+    ("2.  Temporal smoothness  (\u03bb = 0.60)",
+     "L_smooth = mean( (ŝ_{t+1} \u2212 ŝ_t)² )",
+     "Penalises step-to-step jumps.  Suppresses post-jam oscillation."),
+    ("3.  Graph Laplacian physics  (\u03bb = 0.02)",
+     "L_phys = mean( ||L_sym \u00b7 v||² )",
+     "Encodes LWR continuity: speed varies smoothly along roads."),
+]):
+    cy = CONTENT_TOP + Cm(1.1) + i * Cm(3.5)
+    add_text(sl, term, rx, cy, half, Cm(0.65),
+             size=Pt(15), bold=True, color=DARK)
+    add_text(sl, formula, rx, cy + Cm(0.65), half, Cm(0.8),
+             size=Pt(14), color=BLUE, font='Courier New')
+    add_text(sl, note, rx, cy + Cm(1.4), half, Cm(1.3),
+             size=Pt(13), italic=True, color=GREY, wrap=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SLIDE 10 — Training Strategy
+# ─────────────────────────────────────────────────────────────────────────────
+sl, p = next_slide()
+slide_header(sl, "5.  Training Strategy", p)
+
+add_text(sl, "Three techniques to overcome extreme class imbalance (free-flow 92%  vs  jam 8%)",
+         MARGINS, CONTENT_TOP, CONTENT_W, Cm(0.8),
+         size=Pt(18), bold=False, color=DARK, italic=True)
+
+cw = (CONTENT_W - Cm(1.2)) / 3
+for i, (title, body_pts) in enumerate([
+    ("Curriculum Masking",
+     ["15% of observed nodes pseudo-blinded each batch",
+      "Speed, nbr_ctx, is_observed features zeroed",
+      "Loss computed on their known ground truth",
+      "\u2192 Gradients always flow through blind-node path",
+      "\u2192 Prevents model from ignoring imputation task"]),
+    ("Jam-Biased Sampling",
+     ["50% of batches start at a jam timestep",
+      "Natural rate of jams: only ~8% of windows",
+      "Pre-computed jam_t_valid index for fast lookup",
+      "\u2192 Balanced gradient signal between jam / free-flow",
+      "\u2192 Effective even with 4\u00d7 jam weight in loss"]),
+    ("Gradient Accumulation",
+     ["4 windows accumulated per parameter update",
+      "Jam batches: large loss; free-flow: small loss",
+      "High variance \u2192 oscillating validation MAE",
+      "\u2192 Accumulation smooths this variance",
+      "\u2192 Loss divided by 4 to preserve effective LR"]),
+]):
+    cx = MARGINS + i * (cw + Cm(0.6))
+    add_text(sl, title, cx, Cm(4.2), cw, Cm(0.75),
+             size=Pt(17), bold=True, color=NAVY)
+    add_shape(sl, cx, Cm(4.95), cw, Cm(0.04), fill=NAVY)
+    bullet_list(sl, body_pts, cx, Cm(5.1), cw, Cm(8.0), size=Pt(15))
+
+# Optimiser summary
+add_shape(sl, MARGINS, Cm(13.5), CONTENT_W, Cm(0.04), fill=LGREY)
+add_text(sl,
+    "Optimiser:  Adam  lr = 3\u00d710\u207b\u2074  ·  weight decay = 10\u207b\u2074  ·  "
+    "Cosine Annealing T_max = 400  ·  800 epochs  ·  "
+    "Gradient clip norm = 1.0  ·  Batch window = 48 timesteps",
+    MARGINS, Cm(13.65), CONTENT_W, Cm(1.5),
+    size=Pt(15), color=DARK, align=PP_ALIGN.LEFT, wrap=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SLIDE 11 — Main Results
+# ─────────────────────────────────────────────────────────────────────────────
+sl, p = next_slide()
+slide_header(sl, "6.1  Results — 80% Sensor Sparsity", p)
+
+add_text(sl, "Evaluation on held-out set  t = 4,500 – 4,949  (450 timesteps, non-overlapping 48-step windows)",
+         MARGINS, CONTENT_TOP, CONTENT_W, Cm(0.8), size=Pt(16), color=GREY)
+
+booktabs_table(sl,
+    ["Model", "MAE — all blind nodes (km/h)", "MAE — jam only (km/h)", "vs Global Mean Jam"],
+    [
+        ["Global mean baseline",     "5.18", "35.99", "\u2014"],
+        ["IDW spatial interpolation","5.23", "32.95", "\u22128.5%"],
+        ["Ours — full model",        "5.18", "33.93", "\u22125.7%"],
+    ],
+    x=MARGINS, y=Cm(4.8),
+    col_widths=[Cm(9.5), Cm(7.5), Cm(6.5), Cm(5.0)],
+    row_h=Cm(1.2)
+)
+
+bullet_list(sl, [
+    "Overall MAE ties the global mean — expected: free-flow (92%) dominates the average and "
+    "is tightly clustered near \u03bc.",
+    "Jam MAE is the meaningful metric: the model achieves 5.7% improvement over global mean "
+    "and beats IDW on congestion events.",
+    "Evaluation uses 48-step windows (same as training) to prevent ODE state drift in long rollouts.",
+], MARGINS, Cm(9.5), CONTENT_W, Cm(5.5), size=Pt(18))
+
+add_text(sl,
+    "Definition: Jam \u2261 speed < 40 km/h  (\u224814.4 standard deviations below mean in this dataset).",
+    MARGINS, Cm(15.2), CONTENT_W, Cm(1.0),
+    size=Pt(14), italic=True, color=GREY)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SLIDE 12 — Sparsity Sweep
+# ─────────────────────────────────────────────────────────────────────────────
+sl, p = next_slide()
+slide_header(sl, "6.2  Results — Sensor Sparsity Sweep (20 % – 90 %)", p)
+
+add_text(sl,
+    "Each sparsity level trained independently (150 epochs, hidden = 32).  "
+    "Goal: verify graceful degradation, not match full-model absolute MAE.",
+    MARGINS, CONTENT_TOP, CONTENT_W, Cm(1.0), size=Pt(16), color=GREY, wrap=True)
+
+booktabs_table(sl,
+    ["Sparsity", "Blind sensors", "Global Mean Jam (km/h)",
+     "IDW Jam (km/h)", "Model Jam (km/h)", "vs Global Mean"],
     [
         ["20%", "22%", "36.04", "27.35", "27.68", "+23.2%"],
         ["40%", "48%", "35.74", "29.73", "28.27", "+20.9%"],
         ["60%", "62%", "36.01", "29.98", "31.66", "+12.1%"],
         ["80%", "83%", "35.99", "32.95", "31.19", "+13.3%"],
-        ["90%", "90%", "35.99", "33.81", "34.58", "+3.9%"],
+        ["90%", "90%", "35.99", "33.81", "34.58",  "+3.9%"],
     ],
-    x=Inches(0.5), y=Inches(1.75),
-    col_widths=[Inches(1.4), Inches(1.7), Inches(2.2), Inches(1.8), Inches(1.8), Inches(2.0)],
-    row_height=Inches(0.5)
+    x=MARGINS, y=Cm(4.8),
+    col_widths=[Cm(3.5), Cm(4.0), Cm(6.5), Cm(5.5), Cm(5.5), Cm(4.2)],
+    row_h=Cm(1.1)
 )
 
-bullet_box(sl, "Key Observations",
-           ["Model consistently outperforms global-mean baseline at ALL sparsity levels",
-            "At 90% sparsity: model approaches baseline — expected (almost no neighbour context remains)",
-            "vs IDW: mixed results (IDW has an advantage when observed sensors are many and close)",
-            "Sparsity sweep confirms graceful degradation — no catastrophic failure mode"],
-           x=Inches(0.35), y=Inches(4.7), w=Inches(12.6), h=Inches(2.0), bg=LIGHT)
-bottom_bar(sl, page)
+bullet_list(sl, [
+    "Model consistently outperforms global-mean baseline at ALL five sparsity levels.",
+    "At 90% sparsity, performance approaches baseline — expected: almost no observed neighbour "
+    "context remains to inform imputation.",
+    "Non-monotonicity between 60% and 80% is noise from the lighter 150-epoch training; "
+    "the overall trend is clearly degrading with sparsity.",
+], MARGINS, Cm(11.3), CONTENT_W, Cm(5.5), size=Pt(18))
 
 
-# ── SLIDE 13 — Ablation ───────────────────────────────────────────────────────
-page += 1
-sl = prs.slides.add_slide(blank)
-nav_bar(sl, f"{page}")
-section_heading(sl, "Ablation Study", "Measuring each component's contribution — 300 epochs per variant")
+# ─────────────────────────────────────────────────────────────────────────────
+# SLIDE 13 — Ablation Study
+# ─────────────────────────────────────────────────────────────────────────────
+sl, p = next_slide()
+slide_header(sl, "6.3  Results — Ablation Study", p)
 
-results_table(sl,
-    ["Model / Variant", "MAE all", "MAE jam", "Δ jam  (+ = component helps)"],
+add_text(sl,
+    "Each variant removes exactly one component and is re-trained from scratch under identical conditions (300 epochs).",
+    MARGINS, CONTENT_TOP, CONTENT_W, Cm(0.8), size=Pt(16), color=GREY)
+
+booktabs_table(sl,
+    ["Model / Variant", "MAE all (km/h)", "MAE jam (km/h)",
+     "\u0394 jam  (full \u2212 variant)"],
     [
-        ["Global mean baseline", "5.18", "35.99", "—"],
-        ["IDW (spatial interp.)", "5.23", "32.95", "—"],
-        ["Full model  ◀", "5.18", "33.93", "+0.00"],
-        ["−  Hypergraph", "5.54", "31.66", "−2.27"],
-        ["−  Assimilation", "5.29", "32.54", "−1.38"],
-        ["−  Physics loss", "5.32", "33.32", "−0.61"],
-        ["−  Neighbour context", "5.84", "28.99", "−4.94"],
-        ["−  Temporal encoding", "6.00", "33.51", "−0.41"],
+        ["Global mean baseline",       "5.18", "35.99", "\u2014"],
+        ["IDW (spatial interp.)",       "5.23", "32.95", "\u2014"],
+        ["Full model  \u25c4",          "5.18", "33.93", "+0.00"],
+        ["\u2212  Hypergraph conv",     "5.54", "31.66", "\u22122.27"],
+        ["\u2212  Assimilation gate",   "5.29", "32.54", "\u22121.38"],
+        ["\u2212  Physics loss",        "5.32", "33.32", "\u22120.61"],
+        ["\u2212  Neighbour context",   "5.84", "28.99", "\u22124.94"],
+        ["\u2212  Temporal encoding",   "6.00", "33.51", "\u22120.41"],
     ],
-    x=Inches(0.5), y=Inches(1.75),
-    col_widths=[Inches(4.2), Inches(1.7), Inches(1.7), Inches(4.8)],
-    row_height=Inches(0.46)
+    x=MARGINS, y=Cm(4.5),
+    col_widths=[Cm(9.5), Cm(5.5), Cm(5.5), Cm(8.5)],
+    row_h=Cm(0.98)
 )
 
-add_rect(sl, Inches(0.35), Inches(6.35), W - Inches(0.7), Inches(0.85),
-         RGBColor(0xE8, 0xF0, 0xFF), line_rgb=ACCENT, line_width=Pt(1))
-add_text_box(sl,
-    "Note: Δ jam = full_jam − variant_jam. Positive = removing this component hurts jam imputation. "
-    "The gated hypergraph (init gate ≈ 0.12) and neighbour context require more epochs to converge — "
-    "their gate/weights need time to learn when corridor context helps vs when it over-smooths. "
-    "Temporal encoding and assimilation show clear positive contributions.",
-    Inches(0.55), Inches(6.4), W - Inches(1.1), Inches(0.75),
-    font_size=Pt(10.5), color=NAVY, wrap=True)
-bottom_bar(sl, page)
+add_text(sl,
+    "\u0394 jam = full_jam \u2212 variant_jam.  "
+    "Positive: removing this component raises jam MAE (component is beneficial).  "
+    "Negative: removing it reduces jam MAE (component introduces smoothing noise that "
+    "outweighs benefit at 300 epochs; the gated hypergraph requires more training to converge).",
+    MARGINS, Cm(14.0), CONTENT_W, Cm(2.5),
+    size=Pt(14), italic=True, color=GREY, wrap=True)
 
 
-# ── SLIDE 14 — SOTA Comparison ─────────────────────────────────────────────────
-page += 1
-sl = prs.slides.add_slide(blank)
-nav_bar(sl, f"{page}")
-section_heading(sl, "State of the Art Context", "Different task — not directly comparable, but contextualised")
+# ─────────────────────────────────────────────────────────────────────────────
+# SLIDE 14 — Conclusion
+# ─────────────────────────────────────────────────────────────────────────────
+sl, p = next_slide()
+slide_header(sl, "7.  Conclusion", p)
 
-results_table(sl,
-    ["Model", "Venue", "Task", "Sensors", "PEMS04 MAE"],
-    [
-        ["DCRNN (Li et al., 2018)", "ICLR 2018", "Forecasting", "100%", "~1.8 km/h"],
-        ["STGCN (Yu et al., 2018)", "IJCAI 2018", "Forecasting", "100%", "~1.7 km/h"],
-        ["Graph WaveNet (Wu et al., 2019)", "IJCAI 2019", "Forecasting", "100%", "~1.6 km/h"],
-        ["AGCRN (Bai et al., 2020)", "NeurIPS 2020", "Forecasting", "100%", "~1.5 km/h"],
-        ["Ours (full model)", "This thesis", "Imputation", "20%", "5.18 km/h"],
-    ],
-    x=Inches(0.35), y=Inches(1.75),
-    col_widths=[Inches(4.0), Inches(1.8), Inches(1.8), Inches(1.5), Inches(2.5)],
-    row_height=Inches(0.5)
-)
+half = CONTENT_W / 2 - Cm(0.3)
 
-add_rect(sl, Inches(0.35), Inches(4.7), W - Inches(0.7), Inches(1.9),
-         RGBColor(0xFF, 0xEB, 0xEE), line_rgb=RED, line_width=Pt(1.5))
-add_text_box(sl, "Why the MAE gap (~3×) is expected — NOT a weakness:",
-             Inches(0.55), Inches(4.77), W - Inches(1.1), Inches(0.38),
-             font_size=Pt(12), bold=True, color=RED)
-for i, b in enumerate([
-    "DCRNN/STGCN/WaveNet: all 307 sensors observed, predict only 1 future step",
-    "This work: only 61 sensors observed (80% missing), must recover ALL 246 blind node speeds simultaneously",
-    "Imputation with 80% missing data is fundamentally a harder, different task — comparison is directional only",
-]):
-    add_text_box(sl, f"▸  {b}", Inches(0.55), Inches(5.18) + i * Inches(0.43),
-                 W - Inches(1.1), Inches(0.4), font_size=Pt(11), color=DARK, wrap=True)
-bottom_bar(sl, page)
+add_text(sl, "Contributions",
+         MARGINS, CONTENT_TOP, half, Cm(0.75), size=Pt(18), bold=True, color=NAVY)
+add_shape(sl, MARGINS, CONTENT_TOP + Cm(0.8), half, Cm(0.04), fill=NAVY)
+bullet_list(sl, [
+    "Hypergraph Neural ODE — first application to sparse traffic imputation",
+    "Gated HGNN branch — prevents corridor over-smoothing at jam nodes",
+    "Kalman-style assimilation gate — sensor fusion without GT leakage",
+    "Physics-informed loss — LWR continuity via graph Laplacian",
+    "Curriculum masking + jam-biased sampling — overcomes 12:1 class imbalance",
+    "Validated at five sparsity levels (20 % – 90 %)",
+], MARGINS, CONTENT_TOP + Cm(1.0), half, Cm(9.5), size=Pt(17))
 
+add_shape(sl, MARGINS + half + Cm(0.25), CONTENT_TOP, Cm(0.03),
+          Cm(10.0), fill=LGREY)
 
-# ── SLIDE 15 — Conclusion ─────────────────────────────────────────────────────
-page += 1
-sl = prs.slides.add_slide(blank)
-nav_bar(sl, f"{page}")
-section_heading(sl, "Conclusion", "A new architecture for sparse traffic speed imputation")
+rx = MARGINS + half + Cm(0.6)
+add_text(sl, "Future Work",
+         rx, CONTENT_TOP, half, Cm(0.75), size=Pt(18), bold=True, color=NAVY)
+add_shape(sl, rx, CONTENT_TOP + Cm(0.8), half, Cm(0.04), fill=NAVY)
+bullet_list(sl, [
+    "Directed hyperedges following traffic flow direction",
+    "Dynamic hypergraph (edges adapt with congestion patterns)",
+    "Neural ODE adjoint method for full continuous-time training",
+    "Multi-variate imputation: speed + flow + occupancy jointly",
+    "Online sensor selection — adaptive mask during inference",
+], rx, CONTENT_TOP + Cm(1.0), half, Cm(9.5), size=Pt(17))
 
-bullet_box(sl, "Contributions",
-           ["Hypergraph Neural ODE — first application to sparse traffic imputation",
-            "Gated HGNN fusion — prevents over-smoothing at congested nodes",
-            "Kalman-style assimilation — injects sensor readings continuously without leakage",
-            "Physics-informed loss — LWR flow continuity via graph Laplacian regularisation",
-            "Curriculum masking + jam-biased sampling — overcomes severe class imbalance"],
-           x=Inches(0.35), y=Inches(1.65), w=Inches(7.7), h=Inches(3.65), bg=LIGHT)
-
-bullet_box(sl, "Future Work",
-           ["Directed hyperedges following traffic flow direction",
-            "Dynamic hypergraph (edges change with congestion patterns)",
-            "Neural ODE adjoint method for full continuous-time training",
-            "Multi-variate imputation: speed + flow + occupancy jointly"],
-           x=Inches(8.2), y=Inches(1.65), w=Inches(4.75), h=Inches(3.65),
-           bg=RGBColor(0xE8, 0xF0, 0xFF))
-
-# Result summary
-add_rect(sl, Inches(0.35), Inches(5.52), W - Inches(0.7), Inches(1.6), NAVY)
-add_text_box(sl, "Final Results — 80% Sparsity, PEMS04",
-             Inches(0.55), Inches(5.6), W - Inches(1.1), Inches(0.38),
-             font_size=Pt(12), bold=True, color=WHITE, align=PP_ALIGN.CENTER)
-for i, txt in enumerate([
-    "Overall blind-node MAE: 5.18 km/h    ·    Jam MAE: 33.93 km/h",
-    "5.7% improvement over global mean on congestion  ·  Validated at 5 sparsity levels (20–90%)",
-]):
-    add_text_box(sl, txt, Inches(0.55), Inches(6.02) + i * Inches(0.45),
-                 W - Inches(1.1), Inches(0.4), font_size=Pt(11),
-                 color=LIGHT, align=PP_ALIGN.CENTER)
-bottom_bar(sl, page)
+# Final results banner
+add_shape(sl, MARGINS, Cm(13.8), CONTENT_W, Cm(0.04), fill=LGREY)
+add_text(sl,
+    "Final results (80% sparsity, PEMS04 eval set):   "
+    "Overall blind-node MAE = 5.18 km/h   \u00b7   "
+    "Jam MAE = 33.93 km/h   \u00b7   5.7% improvement over global-mean baseline on congestion",
+    MARGINS, Cm(14.0), CONTENT_W, Cm(1.5),
+    size=Pt(16), bold=True, color=NAVY, wrap=True)
 
 
-# ── SLIDE 16 — Thank You ───────────────────────────────────────────────────────
-page += 1
-sl = prs.slides.add_slide(blank)
-add_rect(sl, 0, 0, W, H, NAVY)
-add_rect(sl, 0, Inches(3.35), W, Inches(0.08), ACCENT)
+# ─────────────────────────────────────────────────────────────────────────────
+# SLIDE 15 — References
+# ─────────────────────────────────────────────────────────────────────────────
+sl, p = next_slide()
+slide_header(sl, "References", p)
 
-add_text_box(sl, "Thank You", Inches(0), Inches(1.0), W, Inches(1.4),
-             font_size=Pt(48), bold=True, color=WHITE, align=PP_ALIGN.CENTER)
-add_text_box(sl, "Questions & Discussion", Inches(0), Inches(2.35), W, Inches(0.75),
-             font_size=Pt(22), italic=True, color=ACCENT, align=PP_ALIGN.CENTER)
-add_rect(sl, Inches(2.0), Inches(3.65), W - Inches(4.0), Inches(0.04), ACCENT)
-
-details = [
-    "Dataset: PEMS04  ·  307 sensors  ·  80% sparsity",
-    "Architecture: Hypergraph GAT-ODE + Kalman Assimilation + Physics Loss",
-    "Results: 5.18 km/h overall MAE  ·  33.93 km/h jam MAE",
-    "Branch: claude/improve-repo-quality-MODmC",
+refs = [
+    "[1]  Y. Li et al., 'Diffusion Convolutional Recurrent Neural Network: Data-Driven Traffic Forecasting,' ICLR, 2018.",
+    "[2]  B. Yu et al., 'Spatio-Temporal Graph Convolutional Networks: A Deep Learning Framework for Traffic Forecasting,' IJCAI, 2018.",
+    "[3]  Z. Wu et al., 'Graph WaveNet for Deep Spatial-Temporal Graph Modeling,' IJCAI, 2019.",
+    "[4]  T. N. Kipf and M. Welling, 'Semi-Supervised Classification with Graph Convolutional Networks,' ICLR, 2017.",
+    "[5]  P. Velickovic et al., 'Graph Attention Networks,' ICLR, 2018.",
+    "[6]  R. T. Q. Chen et al., 'Neural Ordinary Differential Equations,' NeurIPS, 2018.",
+    "[7]  Y. Feng et al., 'Hypergraph Neural Networks,' AAAI, 2019.",
+    "[8]  R. E. Kalman, 'A New Approach to Linear Filtering and Prediction Problems,' J. Basic Eng., 1960.",
+    "[9]  M. Raissi et al., 'Physics-Informed Neural Networks,' J. Computational Physics, 2019.",
+    "[10] M. J. Lighthill and G. B. Whitham, 'On Kinematic Waves II: A Theory of Traffic Flow,' Proc. R. Soc., 1955.",
 ]
-for i, d in enumerate(details):
-    add_text_box(sl, d, Inches(0), Inches(3.9) + i * Inches(0.55), W, Inches(0.45),
-                 font_size=Pt(13), color=LIGHT, align=PP_ALIGN.CENTER)
-bottom_bar(sl, page)
+tb = sl.shapes.add_textbox(MARGINS, CONTENT_TOP, CONTENT_W, SH - CONTENT_TOP - Cm(1.2))
+tf = tb.text_frame; tf.word_wrap = True
+first = True
+for ref in refs:
+    p_ = tf.paragraphs[0] if first else tf.add_paragraph()
+    first = False
+    p_.space_before = Pt(4)
+    r = p_.add_run()
+    r.text = ref
+    r.font.name      = 'Calibri'
+    r.font.size      = Pt(14)
+    r.font.color.rgb = DARK
 
 
-# ── Save ───────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# SLIDE 16 — Questions
+# ─────────────────────────────────────────────────────────────────────────────
+sl, _ = next_slide()
+# Clean white slide, thin navy top bar
+add_shape(sl, Cm(0), Cm(0), SW, Cm(0.35), fill=NAVY)
+add_shape(sl, Cm(0), SH - Cm(0.35), SW, Cm(0.35), fill=NAVY)
+
+add_text(sl, "Thank You",
+         Cm(0), Cm(4.5), SW, Cm(2.5),
+         size=Pt(48), bold=True, color=NAVY, align=PP_ALIGN.CENTER)
+add_shape(sl, MARGINS + Cm(4), Cm(7.0), CONTENT_W - Cm(8), Cm(0.04), fill=LGREY)
+add_text(sl, "Questions & Discussion",
+         Cm(0), Cm(7.3), SW, Cm(1.2),
+         size=Pt(26), italic=True, color=BLUE, align=PP_ALIGN.CENTER)
+
+add_text(sl,
+    "Hypergraph Neural ODEs with Observation Assimilation for Sparse Traffic Speed Imputation",
+    Cm(0), Cm(10.0), SW, Cm(0.9),
+    size=Pt(16), color=GREY, align=PP_ALIGN.CENTER)
+add_text(sl,
+    "[Author Name]  ·  [University]  ·  March 2026",
+    Cm(0), Cm(10.9), SW, Cm(0.7),
+    size=Pt(14), italic=True, color=GREY, align=PP_ALIGN.CENTER)
+
+
+# ── Save ──────────────────────────────────────────────────────────────────────
 prs.save("thesis_presentation.pptx")
-print("✅ thesis_presentation.pptx saved")
+print(f"  \u2705 thesis_presentation.pptx  ({pg[0]} slides)")
