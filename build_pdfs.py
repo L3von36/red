@@ -17,7 +17,7 @@ from reportlab.lib.units import cm, mm
 from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
     HRFlowable, PageBreak, Preformatted, KeepTogether, Frame,
-    NextPageTemplate
+    NextPageTemplate, Flowable
 )
 from reportlab.platypus.doctemplate import BaseDocTemplate, PageTemplate
 from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_JUSTIFY, TA_RIGHT
@@ -36,6 +36,124 @@ MGREY  = HexColor("#666666")
 LGREY  = HexColor("#CCCCCC")
 VLGREY = HexColor("#F5F5F5")
 WHITE_C= HexColor("#FFFFFF")
+_IBLUE = HexColor("#EBF2FF")   # light blue — middle pipeline boxes
+_IGRN  = HexColor("#E8F5E9")   # light green — input / output boxes
+_IAMB  = HexColor("#FFF8E1")   # light amber — loss box
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ARCHITECTURE FIGURE  (Flowable — works in any column width)
+# ─────────────────────────────────────────────────────────────────────────────
+class ArchitectureFigure(Flowable):
+    """
+    Draws the CTH-NODE pipeline as a compact vertical flowchart.
+    Six rounded boxes (input → HGNN → GAT ODE → ODE solver →
+    assimilation gate → output) connected by downward arrows, with a
+    dashed line to the loss box below.  Fits inside one IEEE column (~88 mm).
+    """
+    _BOXES = [
+        ("Partial Observations  X_t",
+         "20% sensors observed  |  80% masked"),
+        ("Hypergraph Conv  (HGNN)",
+         "2-hop corridor hyperedges  H\u209c\u02b3\u1d49\u207f\u02b3"),
+        ("GAT ODE Function",
+         "GAT\u2081 \u2192 GAT\u2082  +  learnable hyper-gate  (\u03c3\u2248 0.12)"),
+        ("Neural ODE Solver",
+         "Euler integration  \u0394t = 0.3  over T steps"),
+        ("Observation Assimilation Gate",
+         "GRU-style gate  fuses  h_t  with  seen sensors"),
+        ("Imputed Speeds  X\u0302_t",
+         "full reconstruction  \u2014  all 307 nodes"),
+    ]
+    _LOSS = (
+        "\u2112 = \u03bb\u2081\u00b7JAM-MSE  +  "
+        "\u03bb\u2082\u00b7Temporal Smooth  +  "
+        "\u03bb\u2083\u00b7Graph Laplacian"
+    )
+    _FILLS = [_IGRN, _IBLUE, _IBLUE, _IBLUE, _IBLUE, _IGRN]
+
+    # geometry (all in points via mm)
+    _BH  = 8.5*mm    # box height
+    _AH  = 3.2*mm    # arrow gap
+    _LH  = 7.5*mm    # loss box height
+    _PAD = 1.5*mm    # horizontal inset each side
+
+    def __init__(self, col_w):
+        Flowable.__init__(self)
+        self.width  = col_w
+        n = len(self._BOXES)
+        # total = top-pad + n*BH + (n-1)*AH + loss-gap + LH + caption-gap
+        self.height = (2*mm + n*self._BH + (n-1)*self._AH
+                       + self._AH + self._LH + 4*mm)
+
+    def draw(self):
+        c   = self.canv
+        W   = self.width
+        bw  = W - 2*self._PAD          # box width
+        bx  = self._PAD                 # box left x
+        cx  = bx + bw / 2              # centre x
+        r   = 1.5*mm                    # corner radius
+
+        y = self.height - 2*mm         # cursor — moves downward
+
+        for i, (label, sub) in enumerate(self._BOXES):
+            y -= self._BH
+            # box fill
+            c.setFillColor(self._FILLS[i])
+            c.setStrokeColor(NAVY)
+            c.setLineWidth(0.5)
+            c.roundRect(bx, y, bw, self._BH, r, fill=1, stroke=1)
+            # primary label
+            c.setFillColor(BLACK)
+            c.setFont("Times-Bold", 7.5)
+            c.drawCentredString(cx, y + self._BH - 3.6*mm, label)
+            # sub-label
+            c.setFont("Times-Roman", 6.3)
+            c.setFillColor(MGREY)
+            c.drawCentredString(cx, y + 1.6*mm, sub)
+
+            # downward arrow to next box (except after last)
+            if i < len(self._BOXES) - 1:
+                ay_top = y
+                ay_bot = y - self._AH
+                c.setStrokeColor(NAVY)
+                c.setLineWidth(0.7)
+                c.line(cx, ay_top, cx, ay_bot + 1.5*mm)
+                # arrowhead
+                c.setFillColor(NAVY)
+                p = c.beginPath()
+                p.moveTo(cx,           ay_bot)
+                p.lineTo(cx - 1.3*mm,  ay_bot + 2*mm)
+                p.lineTo(cx + 1.3*mm,  ay_bot + 2*mm)
+                p.close()
+                c.drawPath(p, fill=1, stroke=0)
+                y -= self._AH
+
+        # dashed line to loss box
+        loss_y = y - self._AH - self._LH
+        c.setStrokeColor(MGREY)
+        c.setLineWidth(0.5)
+        c.setDash([2, 2])
+        c.line(cx, y, cx, loss_y + self._LH)
+        c.setDash([])
+
+        # loss box
+        c.setFillColor(_IAMB)
+        c.setStrokeColor(NAVY)
+        c.setLineWidth(0.5)
+        c.roundRect(bx, loss_y, bw, self._LH, r, fill=1, stroke=1)
+        c.setFillColor(BLACK)
+        c.setFont("Times-Bold", 7)
+        c.drawCentredString(cx, loss_y + self._LH - 3.3*mm, "Training Loss")
+        c.setFont("Times-Roman", 6.3)
+        c.setFillColor(MGREY)
+        c.drawCentredString(cx, loss_y + 1.5*mm, self._LOSS)
+
+        # caption
+        c.setFont("Times-Italic", 7)
+        c.setFillColor(MGREY)
+        c.drawCentredString(cx, loss_y - 3.5*mm,
+                            "Fig. 1.  CTH-NODE architecture overview.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -406,8 +524,13 @@ def to_roman(n):
 _ALPHA = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
 
 
-def parse_ieee(md_text, styles):
-    """Parse markdown into IEEE-formatted two-column flowables."""
+def parse_ieee(md_text, styles, col_w=None):
+    """Parse markdown into IEEE-formatted two-column flowables.
+
+    col_w: column width in points, used to size %%ARCH_FIGURE%% inline.
+    """
+    if col_w is None:
+        col_w = COL_W
     lines = md_text.strip().split('\n')
     items = []
     in_code, code_buf = False, []
@@ -450,6 +573,14 @@ def parse_ieee(md_text, styles):
         tbl_rows.clear()
 
     for line in lines:
+        # ── Architecture figure placeholder ───────────────────────────────────
+        if line.strip() == '%%ARCH_FIGURE%%':
+            items.append(Spacer(1, 4))
+            items.append(ArchitectureFigure(col_w))
+            items.append(Spacer(1, 6))
+            first_body = False
+            continue
+
         if line.strip().startswith('```'):
             if in_code:
                 flush_code(); in_code = False
@@ -637,7 +768,7 @@ def build_itsc_paper(filename, title, authors, affiliation,
     story.append(NextPageTemplate('twocol'))
 
     # ── Body (two-column from here) ───────────────────────────────────────────
-    story += parse_ieee(body_md, styles)
+    story += parse_ieee(body_md, styles, col_w=ITSCDoc.CW)
     doc.build(story)
     print(f"  \u2705 {filename}")
 
@@ -719,7 +850,7 @@ def build_ieee_article(filename, title, authors, affiliation,
     story.append(NextPageTemplate('twocol'))
 
     # ── Body ─────────────────────────────────────────────────────────────────
-    story += parse_ieee(body_md, styles)
+    story += parse_ieee(body_md, styles, col_w=COL_W)
     doc.build(story)
     print(f"  ✅ {filename}")
 
@@ -787,6 +918,8 @@ Let G = (V, E) be the road network graph with N = 307 nodes and edges weighted b
 The **6-dimensional input feature** vector per node per timestep is: [obs_speed, global_ctx, nbr_ctx, is_observed, 0.25·sin(2πτ), 0.25·cos(2πτ)] where τ = (t mod 288)/288 encodes time-of-day. Temporal features are scaled to 0.25× to prevent the model predicting rush-hour congestion from time alone.
 
 ## IV. Model Architecture
+
+%%ARCH_FIGURE%%
 
 ### A. Input Encoder
 
