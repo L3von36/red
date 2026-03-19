@@ -533,6 +533,115 @@ def parse_ieee(md_text, styles):
     return items
 
 
+class ITSCDoc(BaseDocTemplate):
+    """
+    Two-column IEEE ITSC conference paper.
+    Exact A4 margins from the official IEEE conference template:
+      top=17mm, bottom=44mm, left=14.3mm, right=14.3mm
+    Copyright notice printed at bottom of page 1 (IEEE requirement).
+    Running header 'YYYY IEEE ITSC' from page 2 onward.
+    """
+    CONF_STR   = "2025 IEEE 28th International Conference on Intelligent Transportation Systems (ITSC)"
+    COPY_STR   = "979-8-3315-XXXX-X/25/$31.00 \u00a92025 IEEE"
+    # IEEE A4 template exact margins
+    MT  = 17*mm
+    MB  = 44*mm
+    ML  = 14.3*mm
+    MR  = 14.3*mm
+    GAP = 4.2*mm
+    CW  = (210*mm - 14.3*mm - 14.3*mm - 4.2*mm) / 2   # 88.65mm each
+
+    def __init__(self, filename, **kw):
+        super().__init__(filename, **kw)
+        body_h  = 297*mm - self.MT - self.MB
+        full_w  = 210*mm - self.ML - self.MR
+        full_f  = Frame(self.ML, self.MB, full_w, body_h, id='full')
+        left_f  = Frame(self.ML, self.MB, self.CW, body_h, id='left')
+        right_f = Frame(self.ML + self.CW + self.GAP, self.MB,
+                        self.CW, body_h, id='right')
+        self.addPageTemplates([
+            PageTemplate(id='title',  frames=[full_f],
+                         onPage=self._page),
+            PageTemplate(id='twocol', frames=[left_f, right_f],
+                         onPage=self._page),
+        ])
+
+    def _page(self, canv, doc):
+        canv.saveState()
+        canv.setFont('Times-Roman', 8)
+        canv.setFillColor(BLACK)
+        if doc.page == 1:
+            # IEEE copyright notice at very bottom of first page
+            canv.drawCentredString(210*mm / 2, self.MB - 14*mm, self.COPY_STR)
+            canv.drawCentredString(210*mm / 2, self.MB - 6*mm, self.CONF_STR)
+        else:
+            # Running header pages 2+: conference name centred at top
+            canv.drawCentredString(210*mm / 2,
+                                   297*mm - self.MT + 5*mm,
+                                   "2025 IEEE ITSC")
+        # Page number bottom-centre (between the two rules)
+        canv.setFont('Times-Roman', 9)
+        canv.drawCentredString(210*mm / 2, self.MB - 7*mm, str(doc.page))
+        canv.restoreState()
+
+
+def itsc_col_styles():
+    """Return ieee_styles() reconfigured for ITSC column width."""
+    s = ieee_styles()
+    return s
+
+
+def build_itsc_paper(filename, title, authors, affiliation,
+                     abstract, keywords, body_md):
+    """Build an IEEE ITSC-compliant A4 two-column conference paper PDF."""
+    M = ITSCDoc
+    doc = ITSCDoc(
+        filename,
+        pagesize=A4,
+        leftMargin=M.ML, rightMargin=M.MR,
+        topMargin=M.MT, bottomMargin=M.MB,
+    )
+    styles = itsc_col_styles()
+    story  = []
+
+    # ── Title block (full-width, page 1) ─────────────────────────────────────
+    story.append(NextPageTemplate('title'))
+    story.append(Spacer(1, 4))
+    story.append(Paragraph(title, styles['title']))
+    story.append(Paragraph(authors, styles['authors']))
+    story.append(Paragraph(affiliation, styles['affiliation']))
+
+    # ── Abstract box (IEEE: bold-italic "Abstract—" em-dash, 9pt) ────────────
+    full_w = 210*mm - M.ML - M.MR
+    abs_inner_w = full_w - 12*mm
+    abs_tbl = Table(
+        [[Paragraph('<b><i>Abstract</i></b>\u2014' + abstract,
+                    styles['abstract_body'])]],
+        colWidths=[abs_inner_w]
+    )
+    abs_tbl.setStyle(TableStyle([
+        ('BOX',          (0,0), (-1,-1), 0.5, BLACK),
+        ('LEFTPADDING',  (0,0), (-1,-1), 6),
+        ('RIGHTPADDING', (0,0), (-1,-1), 6),
+        ('TOPPADDING',   (0,0), (-1,-1), 6),
+        ('BOTTOMPADDING',(0,0), (-1,-1), 4),
+    ]))
+    story.append(abs_tbl)
+    story.append(Spacer(1, 2))
+    story.append(Paragraph(
+        f'<b><i>Index Terms</i></b>\u2014<i>{keywords}</i>',
+        styles['keywords_body']))
+
+    story.append(HRFlowable(width=full_w, thickness=0.75,
+                             color=BLACK, spaceAfter=4))
+    story.append(NextPageTemplate('twocol'))
+
+    # ── Body (two-column from here) ───────────────────────────────────────────
+    story += parse_ieee(body_md, styles)
+    doc.build(story)
+    print(f"  \u2705 {filename}")
+
+
 class IEEEDoc(BaseDocTemplate):
     """Two-column IEEE conference paper document."""
     def __init__(self, filename, **kw):
@@ -1020,6 +1129,19 @@ build_thesis_chapter(
     ),
     content=DOC_CONTENT,
     section_prefix="4.",
+)
+
+build_itsc_paper(
+    "conference_itsc.pdf",
+    title=(
+        "Hypergraph Neural ODEs with Observation Assimilation\n"
+        "for Sparse Traffic Speed Imputation"
+    ),
+    authors="[Author Name]",
+    affiliation="[Department], [University], [City, Country]",
+    abstract=ARTICLE_ABSTRACT,
+    keywords=ARTICLE_KEYWORDS,
+    body_md=ARTICLE_BODY,
 )
 
 print("All PDFs built.")
