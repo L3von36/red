@@ -1,5 +1,12 @@
 # =============================================================================
-# Graph-CTH-NODE  v5  —  Complete Implementation
+# Graph-CTH-NODE  v5 IMPROVED  —  Complete Implementation
+#
+# v5 IMPROVEMENTS (after baseline comparison analysis):
+#   jam_weight:     20.0 → 50.0   (more emphasis on jam regions)
+#   lam_recall_max:  0.20 → 0.05  (reduce false positive pressure)
+#   lam_phy:         0.02 → 0.00  (remove physics loss, not helping)
+#   JAM_KMH_TRAIN:  50.0 → 40.0  (align training threshold with eval)
+#   Target: +0.15-0.25 MAE improvement (from 4.83 → ~4.60 km/h)
 #
 # DIAGNOSIS FROM v4.1 THRESHOLD SWEEP:
 #   Speed-threshold (pred < 40 km/h): prec=0.417  rec=0.056  F1=0.099
@@ -166,7 +173,7 @@ data_norm_all = raw_all.copy()
 data_norm_all[:, :, 2] = data_norm_speed
 
 JAM_KMH_EVAL  = 40.0
-JAM_KMH_TRAIN = 50.0
+JAM_KMH_TRAIN = 40.0  # [IMPROVED] Changed from 50.0 to align with eval threshold
 jam_thresh_eval_np  = (JAM_KMH_EVAL  - node_means) / node_stds
 jam_thresh_train_np = (JAM_KMH_TRAIN - node_means) / node_stds
 jam_thresh_eval_t   = torch.tensor(jam_thresh_eval_np,  dtype=torch.float32).to(device)
@@ -606,13 +613,13 @@ model = GraphCTH_NODE_v5(
 
 criterion = FocalHybridLoss_v5(
     jam_thresh_train     = jam_thresh_train_t,
-    jam_weight           = 20.0,
+    jam_weight           = 50.0,      # [IMPROVED] Increased from 20.0 → 50.0 (more emphasis on jam regions)
     gamma                = 2.0,
     focal_alpha          = 0.85,
     lam_smooth           = 0.60,
-    lam_phy              = 0.02,
+    lam_phy              = 0.00,      # [IMPROVED] Removed from 0.02 → 0.00 (physics loss not helping)
     lam_aux              = 0.10,
-    lam_recall_max       = 0.20,
+    lam_recall_max       = 0.05,      # [IMPROVED] Reduced from 0.20 → 0.05 (less false positive pressure)
     recall_warmup_epochs = 200,
 )
 
@@ -640,7 +647,9 @@ best_val, best_state, no_improve = float('inf'), None, 0
 train_log, val_log = [], []
 
 print(f"\n{'='*80}")
-print(f"Starting v5 training: {EPOCHS} epochs, jam_weight={20.0}, lam_recall_max={0.20}")
+print(f"Starting v5 IMPROVED training: {EPOCHS} epochs")
+print(f"  jam_weight={50.0} (↑ from 20), lam_recall={0.05} (↓ from 0.20), lam_phy={0.00} (removed)")
+print(f"  JAM_KMH_TRAIN={40.0} (aligned with eval)")
 print(f"{'='*80}\n")
 
 for epoch in range(1, EPOCHS + 1):
@@ -1526,7 +1535,10 @@ class GRINPlusPlus(nn.Module):
     def training_step(self, x, m, tod_free=None, tod_jam=None):
         p = self._run(x, m, tod_free, tod_jam)
         # Hybrid loss: MAE for jams, MSE for free-flow (like v5)
-        jt = (50.0 - node_means[torch.arange(x.shape[0]).long()]) / node_stds[torch.arange(x.shape[0]).long()]
+        # Convert numpy arrays to tensors
+        node_means_t = torch.tensor(node_means, dtype=torch.float32).to(x.device)
+        node_stds_t = torch.tensor(node_stds, dtype=torch.float32).to(x.device)
+        jt = (50.0 - node_means_t[torch.arange(x.shape[0]).long()]) / node_stds_t[torch.arange(x.shape[0]).long()]
         jam_flag = (x < jt.unsqueeze(1)).float()
         free_flag = 1.0 - jam_flag
 
