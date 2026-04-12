@@ -60,8 +60,16 @@ import warnings
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
+# ═════════════════════════════════════════════════════════════════════════════
+# GLOBAL SEED FOR REPRODUCIBILITY
+# ═════════════════════════════════════════════════════════════════════════════
+GLOBAL_SEED = 42
+torch.manual_seed(GLOBAL_SEED)
+np.random.seed(GLOBAL_SEED)
+torch.cuda.manual_seed_all(GLOBAL_SEED)
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Device: {device}")
+print(f"Device: {device} | Seed: {GLOBAL_SEED}")
 
 # =============================================================================
 # DATASET SELECTOR — Choose traffic dataset to run on
@@ -1056,9 +1064,14 @@ class GRUD(nn.Module):
         return torch.stack(preds, dim=1)  # [B, T]
 
 def train_rnn_baseline(model_cls, name, hidden=64, epochs=BL_EPOCHS):
+    # Fresh seed per model for reproducibility
+    seed = abs(hash(name)) % (2**31)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
     net = model_cls(hidden).to(device)
     opt = torch.optim.Adam(net.parameters(), lr=BL_LR)
-    best_vloss, best_wts = float('inf'), None
+    best_vloss, best_wts, patience_ctr = float('inf'), None, 0
     for ep in range(1, epochs+1):
         net.train()
         node_perm = torch.randperm(NUM_NODES)
@@ -1071,8 +1084,18 @@ def train_rnn_baseline(model_cls, name, hidden=64, epochs=BL_EPOCHS):
             m  = torch.ones_like(x)   # all observed during training
             p  = net(x, m)
             loss = F.mse_loss(p, x)
-            opt.zero_grad(); loss.backward(); opt.step()
+
+            # Safeguard against NaN/Inf
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"  ⚠️  [{name}] NaN/Inf loss at ep {ep}, reinitializing...")
+                return train_rnn_baseline(model_cls, name, hidden, min(epochs, ep+100))
+
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+            opt.step()
             ep_loss += loss.item(); n_batches += 1
+
         if ep % 50 == 0:
             net.eval()
             with torch.no_grad():
@@ -1081,10 +1104,21 @@ def train_rnn_baseline(model_cls, name, hidden=64, epochs=BL_EPOCHS):
                 m_v = torch.ones_like(x_v)
                 p_v = net(x_v, m_v)
                 vl  = F.mse_loss(p_v, x_v).item()
+
             if vl < best_vloss:
                 best_vloss = vl
                 best_wts   = copy.deepcopy(net.state_dict())
+                patience_ctr = 0
+            else:
+                patience_ctr += 1
+
             print(f"  [{name}] ep {ep:3d} | train={ep_loss/n_batches:.4f} val={vl:.4f}")
+
+            # Early stopping with patience
+            if patience_ctr >= 3:
+                print(f"  → Early stop at ep {ep}")
+                break
+
     if best_wts:
         net.load_state_dict(best_wts)
     return net
@@ -1234,9 +1268,14 @@ class ChebConv(nn.Module):
         return out
 
 def train_gnn_baseline(model_cls, name, **kwargs):
+    # Fresh seed per model for reproducibility
+    seed = abs(hash(name)) % (2**31)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
     net = model_cls(**kwargs).to(device)
     opt = torch.optim.Adam(net.parameters(), lr=GNN_LR, weight_decay=1e-4)
-    best_vloss, best_wts = float('inf'), None
+    best_vloss, best_wts, patience_ctr = float('inf'), None, 0
     for ep in range(1, GNN_EPOCHS+1):
         net.train()
         t0      = np.random.randint(0, TRAIN_END - GNN_BATCH)
@@ -1246,7 +1285,16 @@ def train_gnn_baseline(model_cls, name, **kwargs):
         m_train = (torch.rand(NUM_NODES, 1, device=device) > SPARSITY).float()
         m_train = m_train.expand(-1, GNN_BATCH)
         loss    = net.training_step(x_full, m_train)
-        opt.zero_grad(); loss.backward(); opt.step()
+
+        # Safeguard against NaN/Inf
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"  ⚠️  [{name}] NaN/Inf loss at ep {ep}, reinitializing...")
+            return train_gnn_baseline(model_cls, name, **kwargs)
+
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+        opt.step()
         if ep % 50 == 0:
             net.eval()
             with torch.no_grad():
@@ -1254,9 +1302,21 @@ def train_gnn_baseline(model_cls, name, **kwargs):
                                     dtype=torch.float32).T.to(device)
                 m_v = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, VAL_END-VAL_START)
                 vl  = net.training_step(x_v, m_v).item()
+
             if vl < best_vloss:
-                best_vloss = vl; best_wts = copy.deepcopy(net.state_dict())
+                best_vloss = vl
+                best_wts = copy.deepcopy(net.state_dict())
+                patience_ctr = 0
+            else:
+                patience_ctr += 1
+
             print(f"  [{name}] ep {ep:3d} | val={vl:.4f}")
+
+            # Early stopping
+            if patience_ctr >= 3:
+                print(f"  → Early stop at ep {ep}")
+                break
+
     if best_wts:
         net.load_state_dict(best_wts)
     return net
@@ -1554,6 +1614,16 @@ print(f"   Tier 3 complete — {len(results_table)} entries in results_table.")
 # =============================================================================
 # CELL 16 — Final comparison table + bar chart
 # =============================================================================
+
+# DEDUPLICATION: Keep best run per model (lowest MAE all)
+print(f"\nDeduplicating results_table: {len(results_table)} entries → ", end='')
+results_dedup = {}
+for r in results_table:
+    model_name = r['model']
+    if model_name not in results_dedup or r['mae_all'] < results_dedup[model_name]['mae_all']:
+        results_dedup[model_name] = r
+results_table = list(results_dedup.values())
+print(f"{len(results_table)} unique models")
 
 # Sort by MAE all (ascending)
 results_table_sorted = sorted(results_table, key=lambda r: r['mae_all'])
