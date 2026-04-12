@@ -1442,6 +1442,183 @@ print("\nTraining GRIN...")
 grin_net = train_gnn_baseline(GRIN, 'GRIN')
 eval_gnn_baseline(grin_net, 'GRIN')
 
+# ─── GRIN++ ──────────────────────────────────────────────────────────────────
+# GRIN++ Strategy: GRIN's bidirectional RNN + v5's best ideas (4-path graphs + ToD priors + focal loss)
+# Target: beat GRIN's 0.87 MAE by +0.10-0.15
+class GRINPlusPlusCell(nn.Module):
+    """
+    Enhanced GRIN (GRIN++) — combines:
+    - GRIN's bidirectional RNN core (proven)
+    - 4-path graph aggregation (sym, fwd, bwd, corr from v5)
+    - ToD prior features (v5's dual priors)
+    - Residual skip connections
+    - Mask-aware message passing
+    """
+    def __init__(self, hidden=GNN_HIDDEN, include_tod=True):
+        super().__init__()
+        self.include_tod = include_tod
+        # 4-path message passing
+        msg_in_dim = hidden + 1 + (2 if include_tod else 0)  # h + mask + [tod_free, tod_jam]
+        self.msg_sym  = ChebConv(msg_in_dim, hidden, K=2)
+        self.msg_fwd  = ChebConv(msg_in_dim, hidden, K=2)
+        self.msg_bwd  = ChebConv(msg_in_dim, hidden, K=2)
+        self.msg_corr = ChebConv(msg_in_dim, hidden, K=2)
+        # 4-path mixer: learn weight for each path
+        self.mix_w = nn.Linear(hidden, 4)
+        # GRU with residual
+        self.gru   = nn.GRUCell(hidden + 2, hidden)  # [mixed_msg, x, m]
+        self.out   = nn.Linear(hidden, 1)
+        self.act   = nn.Tanh()
+
+    def forward(self, x_seq, m_seq, tod_free_seq=None, tod_jam_seq=None):
+        N, T = x_seq.shape
+        h = torch.zeros(N, self.gru.hidden_size, device=x_seq.device)
+        preds = []
+        for t in range(T):
+            # Build message input
+            if self.include_tod and tod_free_seq is not None:
+                msg_in = torch.cat([h, m_seq[:,t:t+1],
+                                   tod_free_seq[:,t:t+1], tod_jam_seq[:,t:t+1]], dim=-1)
+            else:
+                msg_in = torch.cat([h, m_seq[:,t:t+1]], dim=-1)
+
+            # 4-path message passing
+            m_sym  = self.act(self.msg_sym(msg_in))
+            m_fwd  = self.act(self.msg_fwd(msg_in))
+            m_bwd  = self.act(self.msg_bwd(msg_in))
+            m_corr = self.act(self.msg_corr(msg_in))
+
+            # Learn mixing weights
+            mix_w  = torch.softmax(self.mix_w(h), dim=1)  # [N, 4]
+            msg = (mix_w[:,0:1]*m_sym + mix_w[:,1:2]*m_fwd +
+                   mix_w[:,2:3]*m_bwd + mix_w[:,3:4]*m_corr)
+
+            # GRU step with skip connection
+            x_t = x_seq[:,t:t+1]
+            inp = torch.cat([msg, x_t, m_seq[:,t:t+1]], dim=-1)
+            h_new = self.gru(inp, h)
+            h = h_new + 0.1 * h  # residual skip (light)
+            preds.append(self.out(h)[:,0])
+        return torch.stack(preds, dim=1)   # [N, T]
+
+class GRINPlusPlus(nn.Module):
+    def __init__(self, hidden=GNN_HIDDEN, include_tod=True):
+        super().__init__()
+        self.include_tod = include_tod
+        self.fwd = GRINPlusPlusCell(hidden, include_tod)
+        self.bwd = GRINPlusPlusCell(hidden, include_tod)
+        # Learn fusion weights instead of fixed average
+        self.fuse = nn.Sequential(
+            nn.Linear(2, hidden), nn.ReLU(),
+            nn.Linear(hidden, 2), nn.Softmax(dim=-1)
+        )
+
+    def _run(self, x, m, tod_free=None, tod_jam=None):
+        pf = self.fwd(x, m, tod_free, tod_jam)
+        pb = self.bwd(x.flip(1), m.flip(1),
+                      tod_free.flip(1) if tod_free is not None else None,
+                      tod_jam.flip(1) if tod_jam is not None else None).flip(1)
+        # Learn fusion weights per node
+        fuse_in = torch.stack([pf, pb], dim=-1)  # [N, T, 2]
+        w = self.fuse(fuse_in)  # [N, T, 2]
+        return (w[...,0:1]*pf.unsqueeze(-1) + w[...,1:2]*pb.unsqueeze(-1)).squeeze(-1)
+
+    def training_step(self, x, m, tod_free=None, tod_jam=None):
+        p = self._run(x, m, tod_free, tod_jam)
+        # Hybrid loss: MAE for jams, MSE for free-flow (like v5)
+        jt = (50.0 - node_means[torch.arange(x.shape[0]).long()]) / node_stds[torch.arange(x.shape[0]).long()]
+        jam_flag = (x < jt.unsqueeze(1)).float()
+        free_flag = 1.0 - jam_flag
+
+        loss_ff  = torch.mean(((p - x) * m * free_flag) ** 2)
+        loss_jam = torch.mean(torch.abs(p - x) * m * jam_flag) * 2.0  # 2× weight on jam regions
+        return loss_ff + loss_jam
+
+    def impute(self, x, m, tod_free=None, tod_jam=None):
+        p = self._run(x, m, tod_free, tod_jam)
+        return m*x + (1-m)*p
+
+# Prepare ToD features for GRIN++
+def eval_grinpp_baseline(net, name):
+    net.eval()
+    x_e = torch.tensor(speed_np[EVAL_START:EVAL_START+_T_eval, :],
+                        dtype=torch.float32).T.to(device)   # [N, T]
+    m_e = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, _T_eval)
+
+    # Add ToD priors
+    t_slots = (np.arange(EVAL_START, EVAL_START+_T_eval) % STEPS_PER_DAY).astype(int)
+    tod_free_e = torch.tensor(tod_free_np[:, t_slots].T, dtype=torch.float32).T.to(device)
+    tod_jam_e  = torch.tensor(tod_jam_np[:, t_slots].T, dtype=torch.float32).T.to(device)
+
+    with torch.no_grad():
+        p_e = net.impute(x_e, m_e, tod_free_e, tod_jam_e).cpu().numpy()  # [N, T]
+    pred_kmh = np.zeros((len(blind_idx), _T_eval), dtype=np.float32)
+    for ni, n in enumerate(blind_idx):
+        pred_kmh[ni] = p_e[n] * node_stds[n] + node_means[n]
+    results_table.append({'model': name, **eval_pred_np(pred_kmh, true_eval_kmh)})
+    print(f"✅ {name} evaluated.")
+
+def train_grinpp_baseline(model_cls, name, **kwargs):
+    # Fresh seed per model
+    seed = abs(hash(name)) % (2**31)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    net = model_cls(**kwargs).to(device)
+    opt = torch.optim.Adam(net.parameters(), lr=GNN_LR, weight_decay=1e-4)
+    best_vloss, best_wts, patience_ctr = float('inf'), None, 0
+    for ep in range(1, GNN_EPOCHS+1):
+        net.train()
+        t0      = np.random.randint(0, TRAIN_END - GNN_BATCH)
+        x_full  = torch.tensor(speed_np[t0:t0+GNN_BATCH, :], dtype=torch.float32).T.to(device)
+        m_train = (torch.rand(NUM_NODES, 1, device=device) > SPARSITY).float().expand(-1, GNN_BATCH)
+
+        # ToD priors for this batch
+        t_slots = (np.arange(t0, t0+GNN_BATCH) % STEPS_PER_DAY).astype(int)
+        tod_free_b = torch.tensor(tod_free_np[:, t_slots].T, dtype=torch.float32).T.to(device)
+        tod_jam_b  = torch.tensor(tod_jam_np[:, t_slots].T, dtype=torch.float32).T.to(device)
+
+        loss = net.training_step(x_full, m_train, tod_free_b, tod_jam_b)
+
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"  ⚠️  [{name}] NaN/Inf loss at ep {ep}")
+            return train_grinpp_baseline(model_cls, name, **kwargs)
+
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+        opt.step()
+
+        if ep % 50 == 0:
+            net.eval()
+            with torch.no_grad():
+                x_v = torch.tensor(speed_np[VAL_START:VAL_END, :], dtype=torch.float32).T.to(device)
+                m_v = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, VAL_END-VAL_START)
+                t_slots_v = (np.arange(VAL_START, VAL_END) % STEPS_PER_DAY).astype(int)
+                tod_free_v = torch.tensor(tod_free_np[:, t_slots_v].T, dtype=torch.float32).T.to(device)
+                tod_jam_v  = torch.tensor(tod_jam_np[:, t_slots_v].T, dtype=torch.float32).T.to(device)
+                vl = net.training_step(x_v, m_v, tod_free_v, tod_jam_v).item()
+
+            if vl < best_vloss:
+                best_vloss = vl
+                best_wts = copy.deepcopy(net.state_dict())
+                patience_ctr = 0
+            else:
+                patience_ctr += 1
+
+            print(f"  [{name}] ep {ep:3d} | val={vl:.4f}")
+            if patience_ctr >= 3:
+                print(f"  → Early stop at ep {ep}")
+                break
+
+    if best_wts:
+        net.load_state_dict(best_wts)
+    return net
+
+print("\nTraining GRIN++...")
+grinpp_net = train_grinpp_baseline(GRINPlusPlus, 'GRIN++', hidden=GNN_HIDDEN, include_tod=True)
+eval_grinpp_baseline(grinpp_net, 'GRIN++')
+
 # ─── SPIN ────────────────────────────────────────────────────────────────────
 class SPIN(nn.Module):
     """
