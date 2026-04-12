@@ -834,3 +834,757 @@ fig.colorbar(im, ax=ax5).set_label('Speed (km/h)', rotation=270, labelpad=15)
 plt.savefig('v5_results.png', bbox_inches='tight', dpi=150)
 plt.show()
 print("✅ Figure saved to v5_results.png")
+
+# =============================================================================
+# CELL 12 — Baseline evaluation harness
+#   Same blind_idx, same test window [EVAL_START, EVAL_START+EVAL_LEN),
+#   same denormalisation, same jam_prec_recall. All baselines append to
+#   `results_table` which CELL 22 prints as the final comparison table.
+# =============================================================================
+
+# results_table: list of dicts keyed by model name
+results_table = []
+
+def eval_pred_np(pred_kmh_bl, true_kmh_bl):
+    """
+    pred_kmh_bl, true_kmh_bl: np arrays [n_blind, T_eval] in km/h
+    Returns dict of metrics.
+    """
+    mae_all = float(np.abs(pred_kmh_bl - true_kmh_bl).mean())
+    jm = true_kmh_bl < JAM_KMH_EVAL
+    mae_jam = float(np.abs((pred_kmh_bl - true_kmh_bl)[jm]).mean()) if jm.any() else float('nan')
+    pr, rc, f1 = jam_prec_recall(pred_kmh_bl, true_kmh_bl)
+    ssim = compute_ssim(pred_kmh_bl, true_kmh_bl)
+    return dict(mae_all=mae_all, mae_jam=mae_jam, prec=pr, rec=rc, f1=f1, ssim=ssim)
+
+# Ground truth on blind nodes for the eval window (km/h)
+_T_eval = (EVAL_LEN // BATCH_TIME) * BATCH_TIME
+true_eval_kmh = np.zeros((len(blind_idx), _T_eval), dtype=np.float32)
+for ni, n in enumerate(blind_idx):
+    true_eval_kmh[ni] = (
+        data_norm_speed[EVAL_START:EVAL_START+_T_eval, n]
+        * node_stds[n] + node_means[n]
+    )
+
+# Store v5 result already computed
+results_table.append({'model': 'Graph-CTH-NODE v5',
+                      **eval_pred_np(pred_bl_kmh[:, :_T_eval], true_eval_kmh)})
+print("✅ Baseline harness ready. true_eval_kmh shape:", true_eval_kmh.shape)
+
+# =============================================================================
+# CELL 13 — Tier 1: Statistical baselines
+#   Global Mean, Historical Average, IDW, Linear Interpolation, KNN Kriging
+#   No training required — deterministic from training data.
+# =============================================================================
+
+# --- 13a: Global Mean ---
+gm_pred = node_means[blind_idx][:, None] * np.ones_like(true_eval_kmh)
+results_table.append({'model': 'Global Mean', **eval_pred_np(gm_pred, true_eval_kmh)})
+print("✅ Global Mean done.")
+
+# --- 13b: Historical Average (per-node, per-slot mean) ---
+ha_pred = np.zeros_like(true_eval_kmh)
+for ni, n in enumerate(blind_idx):
+    for t in range(_T_eval):
+        s = (EVAL_START + t) % STEPS_PER_DAY
+        ha_pred[ni, t] = tod_mean_sp[n, s] * node_stds[n] + node_means[n]
+results_table.append({'model': 'Historical Average', **eval_pred_np(ha_pred, true_eval_kmh)})
+print("✅ Historical Average done.")
+
+# --- 13c: IDW (Inverse Distance Weighted) from observed nodes ---
+# Use adj_sym edge weights as proximity proxy; observed = node_mask==1
+obs_nodes = (node_mask[0, :, 0, 0] == 1).cpu().numpy().nonzero()[0]
+idw_pred  = np.zeros_like(true_eval_kmh)
+for ni, n in enumerate(blind_idx):
+    weights = adj_sym[n, obs_nodes]  # shape [n_obs]
+    wsum    = weights.sum() + 1e-8
+    for t in range(_T_eval):
+        obs_vals = (data_norm_speed[EVAL_START+t, obs_nodes]
+                    * node_stds[obs_nodes] + node_means[obs_nodes])
+        idw_pred[ni, t] = (weights * obs_vals).sum() / wsum
+results_table.append({'model': 'IDW', **eval_pred_np(idw_pred, true_eval_kmh)})
+print("✅ IDW done.")
+
+# --- 13d: Linear Interpolation (temporal, per blind node) ---
+# For each blind node: linearly interpolate using the last known observed
+# value from obs_nodes' global mean as anchor at t=EVAL_START-1 and t=EVAL_START+_T_eval
+lip_pred = np.zeros_like(true_eval_kmh)
+for ni, n in enumerate(blind_idx):
+    # Use the node's own tod prior as "interpolation target"
+    slot_start = EVAL_START % STEPS_PER_DAY
+    slot_end   = (EVAL_START + _T_eval - 1) % STEPS_PER_DAY
+    v_start    = tod_mean_sp[n, slot_start] * node_stds[n] + node_means[n]
+    v_end      = tod_mean_sp[n, slot_end]   * node_stds[n] + node_means[n]
+    lip_pred[ni] = np.linspace(v_start, v_end, _T_eval)
+results_table.append({'model': 'Linear Interpolation', **eval_pred_np(lip_pred, true_eval_kmh)})
+print("✅ Linear Interpolation done.")
+
+# --- 13e: KNN Kriging (k nearest observed neighbours by road distance) ---
+K_KNN = 5
+knn_pred = np.zeros_like(true_eval_kmh)
+for ni, n in enumerate(blind_idx):
+    dists   = dist_mat[n, obs_nodes]
+    finite  = dists < np.inf
+    if finite.sum() == 0:
+        knn_pred[ni] = gm_pred[ni]
+        continue
+    k_actual = min(K_KNN, finite.sum())
+    nn_idx   = np.argsort(dists[finite])[:k_actual]
+    nn_nodes = obs_nodes[finite][nn_idx]
+    nn_dists = dists[finite][nn_idx] + 1e-8
+    w        = 1.0 / nn_dists; w /= w.sum()
+    for t in range(_T_eval):
+        obs_vals = (data_norm_speed[EVAL_START+t, nn_nodes]
+                    * node_stds[nn_nodes] + node_means[nn_nodes])
+        knn_pred[ni, t] = (w * obs_vals).sum()
+results_table.append({'model': 'KNN Kriging (k=5)', **eval_pred_np(knn_pred, true_eval_kmh)})
+print("✅ KNN Kriging done.")
+print(f"   Tier 1 complete — {len(results_table)} entries in results_table.")
+
+# =============================================================================
+# CELL 14 — Tier 2: RNN / temporal baselines (no graph)
+#   GRU-D  (Che et al. 2018)  — GRU with time-decay imputation
+#   BRITS  (Cao et al. 2018)  — Bidirectional RNN with regression imputation
+#   SAITS  (Du et al. 2023)   — Self-Attention Imputation (transformer-style)
+#   All run node-independently (treat each node as an independent time series).
+#   Input: normalised speed only. Observed nodes supply targets; blind nodes
+#   are held out at eval but included in training with their observed values.
+# =============================================================================
+
+BL_HIDDEN  = 64
+BL_EPOCHS  = 300
+BL_LR      = 3e-3
+BL_BATCH   = 32   # number of nodes per mini-batch
+BL_SEQ     = 48   # sequence window (same as BATCH_TIME)
+
+# Training data: [TIME_STEPS, NUM_NODES] speed (normalised)
+# We train on ALL nodes (blind and observed) using their actual values.
+# At eval, we only read predictions for blind nodes.
+speed_np = data_norm_speed  # [T, N]
+
+# ─── GRU-D ───────────────────────────────────────────────────────────────────
+class GRUD(nn.Module):
+    """
+    GRU-D (Che et al. 2018): time-decay gates on input and hidden state.
+    Simplified: constant delta=1 (5-min steps), no covariate mask feature.
+    Input per step: [x_t, m_t, gamma_x, gamma_h]  → 4-dim
+    """
+    def __init__(self, hidden=64):
+        super().__init__()
+        self.h   = hidden
+        # Input decay: γ_x = exp(-max(0, W_γ·δ + b_γ))
+        self.W_gx = nn.Linear(1, 1, bias=True)
+        self.W_gh = nn.Linear(1, 1, bias=True)
+        self.gru  = nn.GRUCell(3, hidden)   # [x_imp, m, gamma_h]
+        self.out  = nn.Linear(hidden, 1)
+
+    def forward(self, x_seq, m_seq):
+        # x_seq, m_seq: [B, T]
+        B, T = x_seq.shape
+        h = torch.zeros(B, self.h, device=x_seq.device)
+        preds = []
+        x_last = torch.zeros(B, device=x_seq.device)
+        for t in range(T):
+            delta = torch.ones(B, 1, device=x_seq.device)
+            gx = torch.exp(-torch.clamp(self.W_gx(delta), min=0))[:,0]
+            gh = torch.exp(-torch.clamp(self.W_gh(delta), min=0))[:,0]
+            x_imp = m_seq[:,t] * x_seq[:,t] + (1 - m_seq[:,t]) * (gx * x_last + (1-gx)*0.)
+            h = gh.unsqueeze(1) * h
+            inp = torch.stack([x_imp, m_seq[:,t], gh], dim=1)
+            h   = self.gru(inp, h)
+            preds.append(self.out(h)[:,0])
+            x_last = x_imp
+        return torch.stack(preds, dim=1)  # [B, T]
+
+def train_rnn_baseline(model_cls, name, hidden=64, epochs=BL_EPOCHS):
+    net = model_cls(hidden).to(device)
+    opt = torch.optim.Adam(net.parameters(), lr=BL_LR)
+    best_vloss, best_wts = float('inf'), None
+    for ep in range(1, epochs+1):
+        net.train()
+        node_perm = torch.randperm(NUM_NODES)
+        ep_loss = 0.; n_batches = 0
+        for b0 in range(0, NUM_NODES, BL_BATCH):
+            nodes_b = node_perm[b0:b0+BL_BATCH].tolist()
+            t0 = np.random.randint(0, TRAIN_END - BL_SEQ)
+            x  = torch.tensor(speed_np[t0:t0+BL_SEQ, nodes_b],
+                               dtype=torch.float32).T.to(device)  # [B, T]
+            m  = torch.ones_like(x)   # all observed during training
+            p  = net(x, m)
+            loss = F.mse_loss(p, x)
+            opt.zero_grad(); loss.backward(); opt.step()
+            ep_loss += loss.item(); n_batches += 1
+        if ep % 50 == 0:
+            net.eval()
+            with torch.no_grad():
+                x_v = torch.tensor(speed_np[VAL_START:VAL_END, :],
+                                   dtype=torch.float32).T.to(device)
+                m_v = torch.ones_like(x_v)
+                p_v = net(x_v, m_v)
+                vl  = F.mse_loss(p_v, x_v).item()
+            if vl < best_vloss:
+                best_vloss = vl
+                best_wts   = copy.deepcopy(net.state_dict())
+            print(f"  [{name}] ep {ep:3d} | train={ep_loss/n_batches:.4f} val={vl:.4f}")
+    if best_wts:
+        net.load_state_dict(best_wts)
+    return net
+
+def eval_rnn_baseline(net, name):
+    net.eval()
+    x_e = torch.tensor(speed_np[EVAL_START:EVAL_START+_T_eval, :],
+                        dtype=torch.float32).T.to(device)  # [N, T]
+    m_e = torch.zeros_like(x_e)
+    m_e[obs_nodes, :] = 1.0   # observed nodes are "known"
+    with torch.no_grad():
+        p_e = net(x_e, m_e).cpu().numpy()  # [N, T]
+    pred_kmh = np.zeros((len(blind_idx), _T_eval), dtype=np.float32)
+    for ni, n in enumerate(blind_idx):
+        pred_kmh[ni] = p_e[n] * node_stds[n] + node_means[n]
+    results_table.append({'model': name, **eval_pred_np(pred_kmh, true_eval_kmh)})
+    print(f"✅ {name} evaluated.")
+
+print("Training GRU-D...")
+grud_net = train_rnn_baseline(GRUD, 'GRU-D')
+eval_rnn_baseline(grud_net, 'GRU-D')
+
+# ─── BRITS ───────────────────────────────────────────────────────────────────
+class BRITSCell(nn.Module):
+    def __init__(self, hidden=64):
+        super().__init__()
+        self.hidden = hidden
+        self.W_x = nn.Linear(1, hidden)
+        self.gru  = nn.GRUCell(hidden + 1, hidden)   # [feat, mask]
+        self.out  = nn.Linear(hidden, 1)
+        self.W_c  = nn.Linear(hidden, 1)   # complement regression
+
+    def forward_dir(self, x_seq, m_seq):
+        B, T = x_seq.shape
+        h = torch.zeros(B, self.hidden, device=x_seq.device)
+        preds, complements = [], []
+        for t in range(T):
+            c_t   = torch.tanh(self.W_c(h))[:,0]
+            x_imp = m_seq[:,t]*x_seq[:,t] + (1-m_seq[:,t])*c_t
+            feat  = torch.relu(self.W_x(x_imp.unsqueeze(1)))
+            inp   = torch.cat([feat, m_seq[:,t:t+1]], dim=1)
+            h     = self.gru(inp, h)
+            preds.append(self.out(h)[:,0])
+            complements.append(c_t)
+        return torch.stack(preds,dim=1), torch.stack(complements,dim=1)
+
+class BRITS(nn.Module):
+    def __init__(self, hidden=64):
+        super().__init__()
+        self.fwd = BRITSCell(hidden)
+        self.bwd = BRITSCell(hidden)
+
+    def forward(self, x_seq, m_seq):
+        pf, cf = self.fwd.forward_dir(x_seq, m_seq)
+        pb, cb = self.bwd.forward_dir(x_seq.flip(1), m_seq.flip(1))
+        return 0.5*(pf + pb.flip(1))
+
+print("\nTraining BRITS...")
+brits_net = train_rnn_baseline(BRITS, 'BRITS')
+eval_rnn_baseline(brits_net, 'BRITS')
+
+# ─── SAITS ───────────────────────────────────────────────────────────────────
+class SAITS(nn.Module):
+    """
+    Simplified SAITS (Du et al. 2023): two-stage masked self-attention
+    imputation on a per-node basis. Each node is treated independently.
+    Stage 1: attend over time to produce first estimate.
+    Stage 2: attend again with first estimate fused in.
+    """
+    def __init__(self, hidden=64, n_heads=4, d_ff=128, seq_len=BL_SEQ):
+        super().__init__()
+        self.proj = nn.Linear(2, hidden)   # [x, mask] → hidden
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=hidden, nhead=n_heads, dim_feedforward=d_ff,
+            dropout=0.1, batch_first=True)
+        self.attn1 = nn.TransformerEncoder(enc_layer, num_layers=1)
+        self.attn2 = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=hidden, nhead=n_heads, dim_feedforward=d_ff,
+                dropout=0.1, batch_first=True),
+            num_layers=1)
+        self.out1  = nn.Linear(hidden, 1)
+        self.out2  = nn.Linear(hidden, 1)
+
+    def forward(self, x_seq, m_seq):
+        # x_seq, m_seq: [B, T]
+        inp  = torch.stack([x_seq, m_seq], dim=-1)       # [B, T, 2]
+        h    = self.proj(inp)                              # [B, T, H]
+        h1   = self.attn1(h)
+        p1   = self.out1(h1)[:,:,0]                       # [B, T]
+        x2   = m_seq*x_seq + (1-m_seq)*p1.detach()
+        inp2 = torch.stack([x2, m_seq], dim=-1)
+        h2   = self.attn2(self.proj(inp2))
+        p2   = self.out2(h2)[:,:,0]
+        return m_seq*x_seq + (1-m_seq)*p2
+
+print("\nTraining SAITS...")
+saits_net = train_rnn_baseline(SAITS, 'SAITS')
+eval_rnn_baseline(saits_net, 'SAITS')
+print(f"   Tier 2 complete — {len(results_table)} entries in results_table.")
+
+# =============================================================================
+# CELL 15 — Tier 3: GNN imputation baselines
+#
+#   IGNNK  (Ye et al. 2021)  — random subgraph kriging, diffusion GCN
+#   GRIN   (Cini et al. 2022) — bidirectional recurrent GNN, message passing
+#   SPIN   (Marisca et al. 2022) — sparse imputation network, designed for
+#            high missingness settings (80%+)
+#   DGCRIN (Zhang et al. 2023) — dynamic graph conv with residual imputation
+#   GCASTN (Liu et al. 2023)  — graph convolution + attention + ST context
+#   ADGCN  (Chen et al. 2023) — adaptive diffusion GCN, tested on PEMS04
+#
+#   All models use adj_sym as the static graph. Training: t=0–4000.
+#   Each model takes [N, T, F] input where F=1 (speed only) with a binary
+#   mask indicating observed nodes. Output: [N, T, 1] imputed speed.
+# =============================================================================
+
+GNN_HIDDEN  = 64
+GNN_EPOCHS  = 300
+GNN_LR      = 3e-3
+GNN_BATCH   = 48
+
+# Pre-compute diffusion matrices for GNN baselines
+def diffusion_cheby(A, K=2):
+    """Returns list of K Chebyshev graph conv matrices."""
+    D     = A.sum(1)
+    D_inv = torch.where(D > 0, 1.0/D, torch.zeros_like(D))
+    Anorm = A * D_inv.unsqueeze(1)
+    mats  = [torch.eye(NUM_NODES, device=device), Anorm]
+    for k in range(2, K):
+        mats.append(2*torch.mm(Anorm, mats[-1]) - mats[-2])
+    return mats  # list of [N,N]
+
+cheby_mats = diffusion_cheby(A_t, K=3)
+
+class ChebConv(nn.Module):
+    def __init__(self, in_dim, out_dim, K=3):
+        super().__init__()
+        self.K    = K
+        self.Ws   = nn.ModuleList([nn.Linear(in_dim, out_dim, bias=(k==0))
+                                   for k in range(K)])
+        self.mats = cheby_mats
+
+    def forward(self, x):
+        # x: [N, F]
+        out = sum(self.Ws[k](torch.mm(self.mats[k], x)) for k in range(self.K))
+        return out
+
+def train_gnn_baseline(model_cls, name, **kwargs):
+    net = model_cls(**kwargs).to(device)
+    opt = torch.optim.Adam(net.parameters(), lr=GNN_LR, weight_decay=1e-4)
+    best_vloss, best_wts = float('inf'), None
+    for ep in range(1, GNN_EPOCHS+1):
+        net.train()
+        t0      = np.random.randint(0, TRAIN_END - GNN_BATCH)
+        x_full  = torch.tensor(speed_np[t0:t0+GNN_BATCH, :],   # [T, N]
+                                dtype=torch.float32).T.to(device)  # [N, T]
+        # Random 80% mask (same sparsity as main experiment)
+        m_train = (torch.rand(NUM_NODES, 1, device=device) > SPARSITY).float()
+        m_train = m_train.expand(-1, GNN_BATCH)
+        loss    = net.training_step(x_full, m_train)
+        opt.zero_grad(); loss.backward(); opt.step()
+        if ep % 50 == 0:
+            net.eval()
+            with torch.no_grad():
+                x_v = torch.tensor(speed_np[VAL_START:VAL_END, :],
+                                    dtype=torch.float32).T.to(device)
+                m_v = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, VAL_END-VAL_START)
+                vl  = net.training_step(x_v, m_v).item()
+            if vl < best_vloss:
+                best_vloss = vl; best_wts = copy.deepcopy(net.state_dict())
+            print(f"  [{name}] ep {ep:3d} | val={vl:.4f}")
+    if best_wts:
+        net.load_state_dict(best_wts)
+    return net
+
+def eval_gnn_baseline(net, name):
+    net.eval()
+    x_e = torch.tensor(speed_np[EVAL_START:EVAL_START+_T_eval, :],
+                        dtype=torch.float32).T.to(device)   # [N, T]
+    m_e = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, _T_eval)
+    with torch.no_grad():
+        p_e = net.impute(x_e, m_e).cpu().numpy()  # [N, T]
+    pred_kmh = np.zeros((len(blind_idx), _T_eval), dtype=np.float32)
+    for ni, n in enumerate(blind_idx):
+        pred_kmh[ni] = p_e[n] * node_stds[n] + node_means[n]
+    results_table.append({'model': name, **eval_pred_np(pred_kmh, true_eval_kmh)})
+    print(f"✅ {name} evaluated.")
+
+# ─── IGNNK ───────────────────────────────────────────────────────────────────
+class IGNNK(nn.Module):
+    """
+    IGNNK (Ye et al. 2021): Kriging via random subgraph sampling + diffusion GCN.
+    At each step, a random subset of observed nodes form the 'anchor' graph;
+    GCN propagates to estimate missing nodes.
+    Simplified: one-layer diffusion GCN without full subgraph sampling loop.
+    """
+    def __init__(self, hidden=GNN_HIDDEN):
+        super().__init__()
+        self.enc   = ChebConv(1, hidden, K=3)
+        self.dec   = nn.Linear(hidden, 1)
+        self.act   = nn.ReLU()
+
+    def _forward(self, x, m):
+        # x, m: [N, T]
+        N, T   = x.shape
+        x_obs  = (x * m).T.unsqueeze(-1)         # [T, N, 1]
+        h      = self.act(torch.stack([self.enc(x_obs[t]) for t in range(T)]))  # [T, N, H]
+        p      = self.dec(h).squeeze(-1).T        # [N, T]
+        return p
+
+    def training_step(self, x, m):
+        p    = self._forward(x, m)
+        # Supervised on observed nodes only (teacher-force with true vals)
+        return F.mse_loss(p[m==1], x[m==1])
+
+    def impute(self, x, m):
+        p = self._forward(x, m)
+        return m*x + (1-m)*p
+
+print("\nTraining IGNNK...")
+ignnk_net = train_gnn_baseline(IGNNK, 'IGNNK')
+eval_gnn_baseline(ignnk_net, 'IGNNK')
+
+# ─── GRIN ────────────────────────────────────────────────────────────────────
+class GRINCell(nn.Module):
+    """Single direction of GRIN (Cini et al. 2022)."""
+    def __init__(self, hidden=GNN_HIDDEN):
+        super().__init__()
+        self.msg   = ChebConv(hidden + 1, hidden, K=2)   # h + mask → message
+        self.gru   = nn.GRUCell(hidden + 2, hidden)      # [msg, x, m]
+        self.out   = nn.Linear(hidden, 1)
+        self.act   = nn.Tanh()
+
+    def forward(self, x_seq, m_seq):
+        # x_seq, m_seq: [N, T]
+        N, T = x_seq.shape
+        h = torch.zeros(N, self.gru.hidden_size, device=x_seq.device)
+        preds = []
+        for t in range(T):
+            msg_in = torch.cat([h, m_seq[:,t:t+1]], dim=-1)  # [N, H+1]
+            msg    = self.act(self.msg(msg_in))               # [N, H]
+            x_t    = x_seq[:,t:t+1]
+            inp    = torch.cat([msg, x_t, m_seq[:,t:t+1]], dim=-1)  # [N, H+2]
+            h      = self.gru(inp, h)
+            preds.append(self.out(h)[:,0])
+        return torch.stack(preds, dim=1)   # [N, T]
+
+class GRIN(nn.Module):
+    def __init__(self, hidden=GNN_HIDDEN):
+        super().__init__()
+        self.fwd = GRINCell(hidden)
+        self.bwd = GRINCell(hidden)
+        self.fuse = nn.Linear(2, 1)
+
+    def _run(self, x, m):
+        pf = self.fwd(x, m)
+        pb = self.bwd(x.flip(1), m.flip(1)).flip(1)
+        return self.fuse(torch.stack([pf, pb], dim=-1)).squeeze(-1)
+
+    def training_step(self, x, m):
+        p = self._run(x, m)
+        return F.mse_loss(p[m==1], x[m==1])
+
+    def impute(self, x, m):
+        p = self._run(x, m)
+        return m*x + (1-m)*p
+
+print("\nTraining GRIN...")
+grin_net = train_gnn_baseline(GRIN, 'GRIN')
+eval_gnn_baseline(grin_net, 'GRIN')
+
+# ─── SPIN ────────────────────────────────────────────────────────────────────
+class SPIN(nn.Module):
+    """
+    SPIN (Marisca et al. 2022): Sparse Imputation Network.
+    Spatial attention over observed neighbours + temporal attention.
+    Designed for high-sparsity (80%+ missing) settings.
+    """
+    def __init__(self, hidden=GNN_HIDDEN, n_heads=4):
+        super().__init__()
+        self.proj    = nn.Linear(2, hidden)            # [x, mask]
+        # Spatial: node attends over graph neighbours
+        self.sp_attn = nn.MultiheadAttention(hidden, n_heads, batch_first=True)
+        # Temporal
+        enc = nn.TransformerEncoderLayer(hidden, n_heads, dim_feedforward=hidden*2,
+                                         dropout=0.1, batch_first=True)
+        self.t_enc   = nn.TransformerEncoder(enc, num_layers=1)
+        self.out     = nn.Linear(hidden, 1)
+
+    def _forward(self, x, m):
+        # x, m: [N, T]
+        N, T     = x.shape
+        inp      = torch.stack([x, m], dim=-1)           # [N, T, 2]
+        h        = self.proj(inp)                         # [N, T, H]
+        # Spatial attention: each timestep, nodes attend over neighbours
+        # Reshape to [T, N, H] → apply attention along N dim → [T, N, H]
+        h_s      = h.permute(1, 0, 2)                    # [T, N, H]
+        h_s, _   = self.sp_attn(h_s, h_s, h_s)
+        h_s      = h_s.permute(1, 0, 2)                  # [N, T, H]
+        # Temporal attention: each node, attend over time
+        h_t      = self.t_enc(h_s)                       # [N, T, H]
+        p        = self.out(h_t).squeeze(-1)              # [N, T]
+        return p
+
+    def training_step(self, x, m):
+        p = self._forward(x, m)
+        return F.mse_loss(p[m==1], x[m==1])
+
+    def impute(self, x, m):
+        p = self._forward(x, m)
+        return m*x + (1-m)*p
+
+print("\nTraining SPIN...")
+spin_net = train_gnn_baseline(SPIN, 'SPIN')
+eval_gnn_baseline(spin_net, 'SPIN')
+
+# ─── DGCRIN ──────────────────────────────────────────────────────────────────
+class DGCRIN(nn.Module):
+    """
+    DGCRIN (Zhang et al. 2023): Dynamic GCN with residual imputation.
+    Constructs a dynamic adjacency from node features at each step,
+    applies GCN, then residual-adds to initial estimate.
+    """
+    def __init__(self, hidden=GNN_HIDDEN):
+        super().__init__()
+        self.enc    = nn.Linear(2, hidden)                 # [x, m]
+        self.dyn_W1 = nn.Linear(hidden, hidden // 2)
+        self.dyn_W2 = nn.Linear(hidden, hidden // 2)
+        self.gcn    = ChebConv(hidden, hidden, K=2)
+        self.out    = nn.Linear(hidden, 1)
+        self.act    = nn.ReLU()
+
+    def _adj_dynamic(self, h):
+        # h: [N, H] → soft adjacency [N, N]
+        e1 = self.dyn_W1(h); e2 = self.dyn_W2(h)
+        A  = torch.softmax(torch.mm(e1, e2.T) / (e1.size(1)**0.5), dim=-1)
+        return A
+
+    def _step(self, x_t, m_t):
+        # x_t, m_t: [N]
+        inp = torch.stack([x_t, m_t], dim=-1)     # [N, 2]
+        h   = self.act(self.enc(inp))              # [N, H]
+        A_d = self._adj_dynamic(h)
+        h2  = self.act(torch.mm(A_d, self.gcn(h) ))
+        p   = self.out(h2).squeeze(-1)             # [N]
+        return p
+
+    def _forward(self, x, m):
+        N, T = x.shape
+        preds = [self._step(x[:, t], m[:, t]) for t in range(T)]
+        return torch.stack(preds, dim=1)   # [N, T]
+
+    def training_step(self, x, m):
+        p = self._forward(x, m)
+        return F.mse_loss(p[m==1], x[m==1])
+
+    def impute(self, x, m):
+        p = self._forward(x, m)
+        return m*x + (1-m)*p
+
+print("\nTraining DGCRIN...")
+dgcrin_net = train_gnn_baseline(DGCRIN, 'DGCRIN')
+eval_gnn_baseline(dgcrin_net, 'DGCRIN')
+
+# ─── GCASTN ──────────────────────────────────────────────────────────────────
+class GCASTN(nn.Module):
+    """
+    GCASTN (Liu et al. 2023): Graph Conv + Cross-Attention + ST context.
+    Encodes spatial context via GCN, temporal context via attention,
+    then cross-attends spatial into temporal representations.
+    """
+    def __init__(self, hidden=GNN_HIDDEN, n_heads=4):
+        super().__init__()
+        self.sp_enc  = ChebConv(2, hidden, K=2)           # spatial [x,m]→H
+        self.t_proj  = nn.Linear(2, hidden)
+        enc = nn.TransformerEncoderLayer(hidden, n_heads, hidden*2,
+                                         dropout=0.1, batch_first=True)
+        self.t_enc   = nn.TransformerEncoder(enc, num_layers=1)
+        self.cross   = nn.MultiheadAttention(hidden, n_heads, batch_first=True)
+        self.out     = nn.Linear(hidden, 1)
+        self.act     = nn.ReLU()
+
+    def _forward(self, x, m):
+        N, T = x.shape
+        inp  = torch.stack([x, m], dim=-1)            # [N, T, 2]
+        # Spatial encoding per timestep
+        sp   = torch.stack([self.act(self.sp_enc(inp[:, t, :]))
+                             for t in range(T)], dim=1)   # [N, T, H]
+        # Temporal encoding per node
+        t_in = self.t_proj(inp)                        # [N, T, H]
+        t_h  = self.t_enc(t_in)                        # [N, T, H]
+        # Cross-attention: query=temporal, key/value=spatial
+        out, _ = self.cross(t_h, sp, sp)               # [N, T, H]
+        p    = self.out(out).squeeze(-1)               # [N, T]
+        return p
+
+    def training_step(self, x, m):
+        p = self._forward(x, m)
+        return F.mse_loss(p[m==1], x[m==1])
+
+    def impute(self, x, m):
+        p = self._forward(x, m)
+        return m*x + (1-m)*p
+
+print("\nTraining GCASTN...")
+gcastn_net = train_gnn_baseline(GCASTN, 'GCASTN')
+eval_gnn_baseline(gcastn_net, 'GCASTN')
+
+# ─── ADGCN ───────────────────────────────────────────────────────────────────
+class ADGCN(nn.Module):
+    """
+    ADGCN (Chen et al. 2023): Adaptive Diffusion GCN with learned node embeddings.
+    Tested on PEMS04 in the original paper. Uses a static learned adjacency
+    combined with the road graph (mix). Bidirectional GRU backbone.
+    """
+    def __init__(self, hidden=GNN_HIDDEN):
+        super().__init__()
+        self.E1   = nn.Parameter(torch.randn(NUM_NODES, 10))   # node emb
+        self.E2   = nn.Parameter(torch.randn(10, NUM_NODES))
+        self.gcn  = ChebConv(hidden, hidden, K=2)
+        self.gru_f = nn.GRUCell(hidden + 1, hidden)
+        self.gru_b = nn.GRUCell(hidden + 1, hidden)
+        self.enc  = nn.Linear(2, hidden)                       # [x, m]
+        self.out  = nn.Linear(hidden * 2, 1)
+        self.act  = nn.Tanh()
+
+    def _adaptive_adj(self):
+        A_ada = torch.softmax(torch.relu(torch.mm(self.E1, self.E2)), dim=1)
+        return 0.5 * A_t + 0.5 * A_ada   # blend with road graph
+
+    def _run_dir(self, x, m, gru, reverse=False):
+        N, T = x.shape
+        seq  = range(T-1, -1, -1) if reverse else range(T)
+        h    = torch.zeros(N, gru.hidden_size, device=x.device)
+        A    = self._adaptive_adj()
+        hs   = []
+        for t in seq:
+            inp_t = torch.stack([x[:,t], m[:,t]], dim=-1)
+            h_enc = self.act(self.enc(inp_t))
+            h_enc = self.act(torch.mm(A, self.gcn(h_enc)))
+            h     = gru(torch.cat([h_enc, m[:,t:t+1]], dim=-1), h)
+            hs.append(h)
+        if reverse:
+            hs = hs[::-1]
+        return torch.stack(hs, dim=1)   # [N, T, H]
+
+    def _forward(self, x, m):
+        hf = self._run_dir(x, m, self.gru_f, reverse=False)
+        hb = self._run_dir(x, m, self.gru_b, reverse=True)
+        p  = self.out(torch.cat([hf, hb], dim=-1)).squeeze(-1)   # [N, T]
+        return p
+
+    def training_step(self, x, m):
+        p = self._forward(x, m)
+        return F.mse_loss(p[m==1], x[m==1])
+
+    def impute(self, x, m):
+        p = self._forward(x, m)
+        return m*x + (1-m)*p
+
+print("\nTraining ADGCN...")
+adgcn_net = train_gnn_baseline(ADGCN, 'ADGCN')
+eval_gnn_baseline(adgcn_net, 'ADGCN')
+print(f"   Tier 3 complete — {len(results_table)} entries in results_table.")
+
+# =============================================================================
+# CELL 16 — Final comparison table + bar chart
+# =============================================================================
+
+# Sort by MAE all (ascending)
+results_table_sorted = sorted(results_table, key=lambda r: r['mae_all'])
+
+print("\n" + "=" * 90)
+print("  COMPREHENSIVE BASELINE COMPARISON — PEMS04  |  80% blind nodes  |  test t=4500–4950")
+print("=" * 90)
+print(f"  {'Model':<26} {'MAE all':>9} {'MAE jam':>9} {'Prec':>7} {'Rec':>7} {'F1':>7} {'SSIM':>7}")
+print("  " + "-"*86)
+
+tier_labels = {
+    'Global Mean':           'T1',
+    'Historical Average':    'T1',
+    'IDW':                   'T1',
+    'Linear Interpolation':  'T1',
+    'KNN Kriging (k=5)':     'T1',
+    'GRU-D':                 'T2',
+    'BRITS':                 'T2',
+    'SAITS':                 'T2',
+    'IGNNK':                 'T3',
+    'GRIN':                  'T3',
+    'SPIN':                  'T3',
+    'DGCRIN':                'T3',
+    'GCASTN':                'T3',
+    'ADGCN':                 'T3',
+    'Graph-CTH-NODE v5':     'Ours',
+}
+
+for r in results_table_sorted:
+    tier  = tier_labels.get(r['model'], '')
+    flag  = ' ◀' if r['model'] == 'Graph-CTH-NODE v5' else ''
+    print(f"  [{tier:<4}] {r['model']:<21} "
+          f"{r['mae_all']:>9.2f} {r['mae_jam']:>9.2f} "
+          f"{r['prec']:>7.3f} {r['rec']:>7.3f} {r['f1']:>7.3f} "
+          f"{r['ssim']:>7.3f}{flag}")
+
+print("=" * 90)
+print("  Metric definitions:")
+print("    MAE all : mean absolute error (km/h) on all blind nodes in test window")
+print("    MAE jam : MAE restricted to timesteps where true speed < 40 km/h")
+print("    Prec/Rec/F1 : jam detection via speed threshold < 40 km/h on predictions")
+print("    SSIM    : structural similarity of spatiotemporal speed field")
+print("  Tier: T1=Statistical  T2=RNN/temporal  T3=GNN imputation  Ours=Graph-CTH-NODE")
+print("=" * 90)
+
+# Bar chart
+fig2, axes = plt.subplots(1, 3, figsize=(18, 6), dpi=120)
+names   = [r['model'] for r in results_table_sorted]
+mae_all = [r['mae_all'] for r in results_table_sorted]
+mae_jam = [r['mae_jam'] for r in results_table_sorted]
+f1_vals = [r['f1']      for r in results_table_sorted]
+
+colors  = []
+for r in results_table_sorted:
+    t = tier_labels.get(r['model'], '')
+    if t == 'Ours':    colors.append('#d62728')
+    elif t == 'T3':    colors.append('#1f77b4')
+    elif t == 'T2':    colors.append('#ff7f0e')
+    else:              colors.append('#7f7f7f')
+
+short_names = [n.replace('Graph-CTH-NODE ', '').replace('KNN Kriging (k=5)', 'KNN-K')
+               .replace('Linear Interpolation', 'Lin.Interp')
+               .replace('Historical Average', 'Hist.Avg') for n in names]
+
+for ax, vals, title, ylabel in [
+    (axes[0], mae_all, 'MAE — All Blind Nodes (km/h)', 'MAE (km/h)'),
+    (axes[1], mae_jam, 'MAE — Jam Conditions (km/h)',  'MAE (km/h)'),
+    (axes[2], f1_vals, 'Jam Detection F1 (speed<40)',  'F1'),
+]:
+    bars = ax.bar(range(len(vals)), vals, color=colors, edgecolor='white', linewidth=0.5)
+    ax.set_xticks(range(len(vals)))
+    ax.set_xticklabels(short_names, rotation=45, ha='right', fontsize=8)
+    ax.set_title(title, fontsize=11, fontweight='bold')
+    ax.set_ylabel(ylabel, fontsize=10)
+    # Highlight ours
+    our_idx = next(i for i, r in enumerate(results_table_sorted)
+                   if r['model'] == 'Graph-CTH-NODE v5')
+    bars[our_idx].set_edgecolor('black')
+    bars[our_idx].set_linewidth(2)
+
+from matplotlib.patches import Patch
+legend_els = [
+    Patch(color='#d62728', label='Ours'),
+    Patch(color='#1f77b4', label='T3: GNN imputation'),
+    Patch(color='#ff7f0e', label='T2: RNN/temporal'),
+    Patch(color='#7f7f7f', label='T1: Statistical'),
+]
+fig2.legend(handles=legend_els, loc='upper center', ncol=4,
+            bbox_to_anchor=(0.5, 1.02), fontsize=10)
+fig2.tight_layout()
+plt.savefig('baseline_comparison.png', bbox_inches='tight', dpi=150)
+plt.show()
+print("✅ Comparison table printed. Figure saved to baseline_comparison.png")
