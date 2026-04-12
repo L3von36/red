@@ -64,25 +64,84 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Device: {device}")
 
 # =============================================================================
+# DATASET SELECTOR — Choose traffic dataset to run on
+# =============================================================================
+
+DATASETS = {
+    'PEMS04': {
+        'npz_url': "https://zenodo.org/records/7816008/files/PEMS04.npz?download=1",
+        'csv_url': "https://zenodo.org/records/7816008/files/PEMS04.csv?download=1",
+        'num_nodes': 307,
+        'time_steps': 5000,
+        'channel_idx': 2,  # speed channel index
+    },
+    'PEMS08': {
+        'npz_url': "https://zenodo.org/records/7816008/files/PEMS08.npz?download=1",
+        'csv_url': "https://zenodo.org/records/7816008/files/PEMS08.csv?download=1",
+        'num_nodes': 170,
+        'time_steps': 5000,
+        'channel_idx': 2,
+    },
+    'METR-LA': {
+        'npz_url': "https://zenodo.org/records/4518122/files/metr-la.npz?download=1",
+        'csv_url': "https://zenodo.org/records/4518122/files/metr-la.csv?download=1",
+        'num_nodes': 207,
+        'time_steps': 34272,  # longer timeseries
+        'channel_idx': 0,
+    },
+    'PEMS-BAY': {
+        'npz_url': "https://zenodo.org/records/4512072/files/pems-bay.npz?download=1",
+        'csv_url': "https://zenodo.org/records/4512072/files/pems-bay.csv?download=1",
+        'num_nodes': 325,
+        'time_steps': 34272,
+        'channel_idx': 0,
+    },
+}
+
+# ╔─ CHANGE THIS TO SELECT DATASET ─╗
+DATASET_NAME = 'PEMS04'  # Options: 'PEMS04', 'PEMS08', 'METR-LA', 'PEMS-BAY'
+# ╚──────────────────────────────────╝
+
+if DATASET_NAME not in DATASETS:
+    raise ValueError(f"Unknown dataset: {DATASET_NAME}. Choose from {list(DATASETS.keys())}")
+
+ds_cfg = DATASETS[DATASET_NAME]
+print(f"\n✅ Using dataset: {DATASET_NAME}")
+print(f"   Nodes: {ds_cfg['num_nodes']} | Time steps: {ds_cfg['time_steps']}")
+
+# =============================================================================
 # CELL 1 — Data loading
 # =============================================================================
 
-url_npz = "https://zenodo.org/records/7816008/files/PEMS04.npz?download=1"
-url_csv = "https://zenodo.org/records/7816008/files/PEMS04.csv?download=1"
-for fn, url in [("PEMS04.npz", url_npz), ("PEMS04.csv", url_csv)]:
+url_npz = ds_cfg['npz_url']
+url_csv = ds_cfg['csv_url']
+fn_npz  = f"{DATASET_NAME}.npz"
+fn_csv  = f"{DATASET_NAME}.csv"
+
+for fn, url in [(fn_npz, url_npz), (fn_csv, url_csv)]:
     if not os.path.exists(fn):
         print(f"Downloading {fn}...")
-        urllib.request.urlretrieve(url, fn)
+        try:
+            urllib.request.urlretrieve(url, fn)
+        except Exception as e:
+            print(f"❌ Download failed: {e}")
+            raise
 
-raw_npz   = np.load("PEMS04.npz")
-NUM_NODES, TIME_STEPS = 307, 5000
-TRAIN_END             = 4000
-VAL_START, VAL_END    = 4000, 4240
-EVAL_START, EVAL_LEN  = 4500, 450
+raw_npz   = np.load(fn_npz)
+NUM_NODES  = ds_cfg['num_nodes']
+TIME_STEPS = ds_cfg['time_steps']
+CHAN_IDX   = ds_cfg['channel_idx']
+TRAIN_END  = min(4000, int(0.8 * TIME_STEPS))
+VAL_END    = min(TRAIN_END + 240, int(0.9 * TIME_STEPS))
+EVAL_START = min(VAL_END + 260, int(0.9 * TIME_STEPS))
+EVAL_LEN   = min(450, TIME_STEPS - EVAL_START)
+
+VAL_START = TRAIN_END
+print(f"   Train: t=0–{TRAIN_END} | Val: t={VAL_START}–{VAL_END} | Eval: t={EVAL_START}–{EVAL_START+EVAL_LEN}")
 
 raw_all   = raw_npz['data'][:TIME_STEPS, :NUM_NODES, :]
 raw_all   = np.nan_to_num(raw_all, nan=0.0)
-raw_speed = raw_all[:, :, 2]
+raw_speed = raw_all[:, :, CHAN_IDX]
 
 # Per-node normalisation — Beeking et al. 2023
 node_means = raw_speed[:TRAIN_END].mean(axis=0)
@@ -156,7 +215,7 @@ print(f"✅ Data loaded. Per-node normalised. Dual tod prior computed.")
 # CELL 2 — Adjacency matrices
 # =============================================================================
 
-df       = pd.read_csv("PEMS04.csv", header=0)
+df       = pd.read_csv(fn_csv, header=0)
 dist_mat = np.full((NUM_NODES, NUM_NODES), np.inf)
 dist_fwd = np.full((NUM_NODES, NUM_NODES), np.inf)
 dist_bwd = np.full((NUM_NODES, NUM_NODES), np.inf)
