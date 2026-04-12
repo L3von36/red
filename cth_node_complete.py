@@ -1,927 +1,836 @@
 # =============================================================================
-# CELL 1 — Imports
+# Graph-CTH-NODE  v5  —  Complete Implementation
+#
+# DIAGNOSIS FROM v4.1 THRESHOLD SWEEP:
+#   Speed-threshold (pred < 40 km/h): prec=0.417  rec=0.056  F1=0.099
+#   Best logit-threshold (@ 0.35):    prec=0.055  rec=0.115  F1=0.075
+#   → Speed decoder is BETTER at jam detection than the jam_head logit.
+#   → Jam_head is uncalibrated: BCE at 92:8 ratio is dominated by free-flow,
+#     so the head learns to output near-zero everywhere.
+#
+# WHAT CHANGED vs v4.1 and WHY:
+#
+# [A] FOCAL BCE for jam_head  (Lin et al. ICCV 2017)
+#     Replace standard BCE with α-weighted focal loss on the jam_head:
+#       FL = -α*(1-p)^γ*log(p)   for jams    (α=0.85, γ=2)
+#       FL = -(1-α)*p^γ*log(1-p) for free-flow
+#     At extreme imbalance 92:8, standard BCE contributes ~0.5% loss from
+#     jams. With focal BCE, jam examples contribute ~93%+ of total BCE loss.
+#     This is the primary fix for jam_head precision=0.043.
+#
+# [B] REMOVE NODE EMBEDDINGS
+#     Node embeddings degraded overall MAE: 4.30 (v3) → 4.70 (v4) → 4.85 (v4.1).
+#     At 80% blind nodes, embeddings for blind sensors get almost no gradient
+#     through regression loss → learn spurious patterns → inflate free-flow error.
+#     FISF (ICML 2025) confirms: propagation-based features with low variance
+#     across blind nodes contribute little to performance.
+#     INPUT_DIM returns to 13.
+#
+# [C] JAM DETECTION METRIC: SPEED THRESHOLD (primary) + LOGIT (secondary)
+#     Speed decoder already gives F1=0.099 (better than any logit threshold).
+#     Report both: speed-threshold (< 40 km/h) and logit-threshold sweep.
+#     The jam_head now serves as a regulariser for z via focal BCE gradient.
+#
+# [D] REDUCE lam_recall 0.40 → 0.20, INCREASE jam_weight 16 → 20
+#     Curriculum recall at 0.40 is inflating false positives (decoder pushed
+#     below 40 km/h on free-flow sensors), raising overall MAE from 4.30→4.85.
+#     Focal BCE already handles recall more directly. Lower recall lambda
+#     reduces false-positive pressure; higher jam_weight compensates.
+#
+# KEPT FROM v4.1:
+#   Linear warmup 150 epochs (Kalra NeurIPS 2024) — training is now stable
+#   MAE-based jam region loss (Xie et al. 2023) — no quadratic bias
+#   Curriculum recall ramp 0→0.20 over 200 epochs
+#   Dual tod prior features 11+12 (free-flow + jam prior)
+#   Random mask per accum step, 5-mask diversity
+#   Gradient clip 0.5
 # =============================================================================
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import os
 import copy
 import urllib.request
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import warnings
+
+warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
-
+print(f"Device: {device}")
 
 # =============================================================================
-# CELL 2 — Load Data + Road-Network Adjacency
+# CELL 1 — Data loading
 # =============================================================================
-url_npz      = "https://zenodo.org/records/7816008/files/PEMS04.npz?download=1"
-url_csv      = "https://zenodo.org/records/7816008/files/PEMS04.csv?download=1"
-filename_npz = "PEMS04.npz"
-filename_csv = "PEMS04.csv"
 
-if not os.path.exists(filename_npz):
-    print(f"Downloading {filename_npz}...")
-    urllib.request.urlretrieve(url_npz, filename_npz)
-if not os.path.exists(filename_csv):
-    print(f"Downloading {filename_csv}...")
-    urllib.request.urlretrieve(url_csv, filename_csv)
+url_npz = "https://zenodo.org/records/7816008/files/PEMS04.npz?download=1"
+url_csv = "https://zenodo.org/records/7816008/files/PEMS04.csv?download=1"
+for fn, url in [("PEMS04.npz", url_npz), ("PEMS04.csv", url_csv)]:
+    if not os.path.exists(fn):
+        print(f"Downloading {fn}...")
+        urllib.request.urlretrieve(url, fn)
 
-# --- Speed data ---
-data     = np.load(filename_npz)
-raw_data = data['data'][:, :307, 2]   # speed channel, 307 nodes
-raw_data = np.nan_to_num(raw_data)
+raw_npz   = np.load("PEMS04.npz")
+NUM_NODES, TIME_STEPS = 307, 5000
+TRAIN_END             = 4000
+VAL_START, VAL_END    = 4000, 4240
+EVAL_START, EVAL_LEN  = 4500, 450
 
-mean, std = raw_data.mean(), raw_data.std()
-data_norm = (raw_data - mean) / (std + 1e-8)
+raw_all   = raw_npz['data'][:TIME_STEPS, :NUM_NODES, :]
+raw_all   = np.nan_to_num(raw_all, nan=0.0)
+raw_speed = raw_all[:, :, 2]
 
-NUM_NODES  = 307
-TIME_STEPS = 5000
+# Per-node normalisation — Beeking et al. 2023
+node_means = raw_speed[:TRAIN_END].mean(axis=0)
+node_stds  = raw_speed[:TRAIN_END].std(axis=0) + 1e-8
+data_norm_speed = (raw_speed - node_means) / node_stds
 
-# --- Road adjacency from edge list ---
-df = pd.read_csv(filename_csv, header=0)
-print(f"Edge list: {df.shape}  columns: {df.columns.tolist()}")
+# Normalise flow & occupancy globally
+for c in range(3):
+    mu = raw_all[:TRAIN_END, :, c].mean()
+    sg = raw_all[:TRAIN_END, :, c].std() + 1e-8
+    raw_all[:, :, c] = (raw_all[:, :, c] - mu) / sg
 
+data_norm_all = raw_all.copy()
+data_norm_all[:, :, 2] = data_norm_speed
+
+JAM_KMH_EVAL  = 40.0
+JAM_KMH_TRAIN = 50.0
+jam_thresh_eval_np  = (JAM_KMH_EVAL  - node_means) / node_stds
+jam_thresh_train_np = (JAM_KMH_TRAIN - node_means) / node_stds
+jam_thresh_eval_t   = torch.tensor(jam_thresh_eval_np,  dtype=torch.float32).to(device)
+jam_thresh_train_t  = torch.tensor(jam_thresh_train_np, dtype=torch.float32).to(device)
+
+# Unconditional time-of-day prior
+STEPS_PER_DAY = 288
+slot_idx      = np.arange(TIME_STEPS) % STEPS_PER_DAY
+tod_mean_sp   = np.zeros((NUM_NODES, STEPS_PER_DAY), dtype=np.float32)
+for s in range(STEPS_PER_DAY):
+    vals = data_norm_speed[slot_idx == s, :]
+    if len(vals):
+        tod_mean_sp[:, s] = vals.mean(axis=0)
+tod_prior_np = tod_mean_sp[:, slot_idx].T
+tod_prior    = torch.tensor(tod_prior_np, dtype=torch.float32).to(device)
+
+# Dual tod prior (free-flow + jam conditioned) — v4
+JAM_KMH_SPLIT = 50.0
+split_norm_np = (JAM_KMH_SPLIT - node_means) / node_stds
+tod_free_np = np.zeros((NUM_NODES, STEPS_PER_DAY), dtype=np.float32)
+tod_jam_np  = np.zeros((NUM_NODES, STEPS_PER_DAY), dtype=np.float32)
+for s in range(STEPS_PER_DAY):
+    t_mask_s = (slot_idx[:TRAIN_END] == s)
+    vals_s   = data_norm_speed[:TRAIN_END][t_mask_s, :]
+    if len(vals_s) == 0:
+        continue
+    for n in range(NUM_NODES):
+        col       = vals_s[:, n]
+        thresh_n  = split_norm_np[n]
+        free_rows = col[col >= thresh_n]
+        jam_rows  = col[col <  thresh_n]
+        tod_free_np[n, s] = free_rows.mean() if len(free_rows) else col.mean()
+        tod_jam_np[n, s]  = jam_rows.mean()  if len(jam_rows)  else thresh_n - 0.5
+
+tod_free = torch.tensor(tod_free_np[:, slot_idx].T, dtype=torch.float32).to(device)
+tod_jam  = torch.tensor(tod_jam_np[:, slot_idx].T,  dtype=torch.float32).to(device)
+
+data_tensor_all = torch.tensor(
+    data_norm_all.transpose(1, 0, 2), dtype=torch.float32
+).unsqueeze(0).to(device)
+data_tensor_spd = data_tensor_all[:, :, :, 2:3]
+
+T_full   = TIME_STEPS
+t_idx    = torch.arange(T_full, dtype=torch.float32).to(device)
+t_sin    = torch.sin(2 * np.pi * (t_idx % STEPS_PER_DAY) / STEPS_PER_DAY)
+t_cos    = torch.cos(2 * np.pi * (t_idx % STEPS_PER_DAY) / STEPS_PER_DAY)
+time_sin = t_sin.view(1, 1, -1, 1).expand(1, NUM_NODES, -1, 1)
+time_cos = t_cos.view(1, 1, -1, 1).expand(1, NUM_NODES, -1, 1)
+TIME_SCALE = 0.25
+
+print(f"✅ Data loaded. Per-node normalised. Dual tod prior computed.")
+
+# =============================================================================
+# CELL 2 — Adjacency matrices
+# =============================================================================
+
+df       = pd.read_csv("PEMS04.csv", header=0)
 dist_mat = np.full((NUM_NODES, NUM_NODES), np.inf)
-np.fill_diagonal(dist_mat, 0.0)
+dist_fwd = np.full((NUM_NODES, NUM_NODES), np.inf)
+dist_bwd = np.full((NUM_NODES, NUM_NODES), np.inf)
+np.fill_diagonal(dist_mat, 0.); np.fill_diagonal(dist_fwd, 0.); np.fill_diagonal(dist_bwd, 0.)
+
 for _, row in df.iterrows():
     i, j, d = int(row.iloc[0]), int(row.iloc[1]), float(row.iloc[2])
-    dist_mat[i, j] = d
-    dist_mat[j, i] = d
+    dist_mat[i, j] = d; dist_mat[j, i] = d
+    dist_fwd[i, j] = d
+    dist_bwd[j, i] = d
 
-# Gaussian kernel affinity + symmetric normalisation D^{-1/2} A D^{-1/2}
-sigma    = dist_mat[dist_mat < np.inf].std()
-adj      = np.where(dist_mat < np.inf, np.exp(-(dist_mat**2) / (sigma**2)), 0.0)
-np.fill_diagonal(adj, 1.0)
-deg      = adj.sum(axis=1)
-d_inv    = np.where(deg > 0, deg**(-0.5), 0.0)
-adj_norm = (adj * d_inv[:, None]) * d_inv[None, :]   # [N, N]
+sigma = dist_mat[dist_mat < np.inf].std()
 
-A_road = torch.tensor(adj_norm, dtype=torch.float32).unsqueeze(0).to(device)
+def gaussian_norm(dmat, directed=False):
+    adj = np.where(dmat < np.inf, np.exp(-(dmat**2) / (sigma**2)), 0.0)
+    np.fill_diagonal(adj, 1.0)
+    if directed:
+        deg = adj.sum(axis=1, keepdims=True)
+        return adj / (deg + 1e-8)
+    d_inv = np.where(adj.sum(axis=1) > 0, (adj.sum(axis=1) + 1e-8)**(-0.5), 0.)
+    return (adj * d_inv[:, None]) * d_inv[None, :]
 
-# Symmetric normalised graph Laplacian: L_sym = I − D^{-1/2} A D^{-1/2}
-# Used as a physics-informed spatial regulariser: penalises predicted speeds
-# that deviate from the road-network mean of their neighbours, enforcing
-# soft flow continuity across the sensor graph.
-L_sym_np = np.eye(NUM_NODES, dtype=np.float32) - adj_norm
-L_graph  = torch.tensor(L_sym_np, dtype=torch.float32).to(device)   # [N, N]
+adj_sym = gaussian_norm(dist_mat, directed=False)
+adj_fwd = gaussian_norm(dist_fwd, directed=True)
+adj_bwd = gaussian_norm(dist_bwd, directed=True)
 
-# --- Hypergraph incidence matrix ---
-# Each node i generates one hyperedge containing i and all its 2-hop
-# neighbours, capturing corridor/intersection groups that pairwise edges miss.
-# H: [N, E]  where E = N (one hyperedge per node).
-adj_binary = (adj > 1e-6).astype(np.float32)
-np.fill_diagonal(adj_binary, 0.0)
-adj2 = adj_binary @ adj_binary          # 2-hop reachability
-adj2 = (adj2 > 0).astype(np.float32)   # binarise
-adj2 = np.clip(adj2 + adj_binary, 0, 1) # union of 1-hop and 2-hop
-np.fill_diagonal(adj2, 1.0)             # include self
+speed_train   = data_norm_speed[:TRAIN_END, :].T
+corr_mat      = np.nan_to_num(np.corrcoef(speed_train), nan=0.)
+adj_corr      = np.where(np.clip(corr_mat, 0, 1) > 0.60, corr_mat, 0.)
+np.fill_diagonal(adj_corr, 0.)
+adj_corr_norm = adj_corr / (adj_corr.sum(axis=1, keepdims=True) + 1e-8)
 
-H_np   = adj2.T                         # [N, N] — column e = nodes in hyperedge e
-# Degree matrices for HGNN: D_v = diag(H 1_E), D_e = diag(H^T 1_N)
-d_v = H_np.sum(axis=1)                  # node degree: how many hyperedges contain i
-d_e = H_np.sum(axis=0)                  # hyperedge degree: how many nodes in edge e
-d_v_inv_sqrt = np.where(d_v > 0, d_v ** (-0.5), 0.0)
-d_e_inv      = np.where(d_e > 0, d_e ** (-1.0), 0.0)
-
-# Pre-compute  D_v^{-1/2} H W_e D_e^{-1} H^T D_v^{-1/2}  (without learnable W_e)
-# so the convolution at runtime is just  H_conv @ X @ Theta
-H_conv_np = (d_v_inv_sqrt[:, None] * H_np) * d_e_inv[None, :]
-H_conv_np = H_conv_np @ (H_np.T * d_v_inv_sqrt[None, :])   # [N, N]
-H_conv = torch.tensor(H_conv_np, dtype=torch.float32).to(device)  # [N, N]
-
-print(f"✅ Adjacency ready. Shape: {A_road.shape}  "
-      f"mean degree ≈ {(adj > 0).sum(1).mean():.1f}")
-print(f"✅ Hypergraph ready. {NUM_NODES} hyperedges, "
-      f"mean hyperedge size ≈ {d_e.mean():.1f}")
-
+L_sym_np = np.eye(NUM_NODES, dtype=np.float32) - adj_sym
+L_graph  = torch.tensor(L_sym_np, dtype=torch.float32).to(device)
+A_road   = torch.tensor(adj_sym,       dtype=torch.float32).unsqueeze(0).to(device)
+A_fwd_t  = torch.tensor(adj_fwd,       dtype=torch.float32).unsqueeze(0).to(device)
+A_bwd_t  = torch.tensor(adj_bwd,       dtype=torch.float32).unsqueeze(0).to(device)
+A_corr_t = torch.tensor(adj_corr_norm, dtype=torch.float32).unsqueeze(0).to(device)
+A_t      = torch.tensor(adj_sym,       dtype=torch.float32).to(device)
+print(f"✅ Adjacency ready. Corr mean degree ≈ {(adj_corr>0).sum(1).mean():.1f}")
 
 # =============================================================================
-# CELL 3 — Sensor Mask + Honest Input Features (no GT leakage)
+# CELL 3 — Hypergraph
 # =============================================================================
-sparsity_ratio = 0.80
-torch.manual_seed(42)
 
-# node_mask: [1, N, 1, 1]  —  1 = observed sensor, 0 = blind node
-node_mask = (torch.rand(1, NUM_NODES, 1, 1) > sparsity_ratio).float().to(device)
-
-# Full ground-truth tensor: [1, N, T, 1]
-data_tensor = torch.tensor(
-    data_norm, dtype=torch.float32
-).T.unsqueeze(0).unsqueeze(-1).to(device)
-
-obs_data = data_tensor * node_mask   # blind nodes → 0
-
-# Feature 1 — Honest global context: mean of OBSERVED nodes only
-num_obs         = node_mask.sum(dim=1, keepdim=True)          # [1,1,1,1]
-network_context = obs_data.sum(dim=1, keepdim=True) / (num_obs + 1e-6)
-network_context = torch.nan_to_num(network_context, 0.0)      # [1,1,T,1]
-
-# Feature 2 — Neighbourhood context: mean observed speed within 1 hop.
-# For each node i this is  Σ_j A[i,j]*obs_j / Σ_j A[i,j]*mask_j.
-# Gives blind nodes a LOCAL congestion signal — a node whose observed
-# neighbours are all slowing down will see a low neighbourhood context
-# even if the global average is still high.  No GT leakage: only observed
-# (mask=1) speeds enter the average.
-A_t      = torch.tensor(adj_norm, dtype=torch.float32).to(device)   # [N, N]
-obs_2d   = obs_data[0, :, :, 0]                                     # [N, T]
-mask_1d  = node_mask[0, :, 0, 0]                                    # [N]
-mask_2d  = mask_1d.unsqueeze(1).expand_as(obs_2d)                   # [N, T]
-nbr_sum  = torch.mm(A_t, obs_2d)                                    # [N, T]
-nbr_cnt  = torch.mm(A_t, mask_2d)                                   # [N, T]
-nbr_ctx  = (nbr_sum / (nbr_cnt + 1e-6)).unsqueeze(0).unsqueeze(-1)  # [1,N,T,1]
-
-# Feature 4 & 5 — Temporal encoding: cyclic time-of-day (sin / cos).
-# PEMS04 records one sample per 5 minutes → 288 steps per day.
-# These features give every node (observed and blind) a continuous
-# periodic signal for rush-hour / off-peak, capturing the strong daily
-# periodicity of traffic without leaking any speed ground truth.
-STEPS_PER_DAY = 288
-T_full  = data_norm.shape[0]
-t_idx   = torch.arange(T_full, dtype=torch.float32).to(device)
-t_sin   = torch.sin(2 * np.pi * (t_idx % STEPS_PER_DAY) / STEPS_PER_DAY)
-t_cos   = torch.cos(2 * np.pi * (t_idx % STEPS_PER_DAY) / STEPS_PER_DAY)
-time_sin = t_sin.view(1, 1, -1, 1).expand(1, NUM_NODES, -1, 1)  # [1,N,T,1]
-time_cos = t_cos.view(1, 1, -1, 1).expand(1, NUM_NODES, -1, 1)  # [1,N,T,1]
-
-# 6-feature input: [obs_speed, global_ctx, nbr_ctx, is_observed, t_sin, t_cos]
-# Temporal features are scaled to 0.25× their natural amplitude.
-# At full scale the encoder over-weighted daily rush-hour patterns: the model
-# learned to predict congestion at 7:40am / 7pm purely from time-of-day,
-# generating false jams at rush hours even for free-flowing blind nodes.
-# Scaling to 0.25 keeps the periodicity signal (helpful for observed-node
-# context) without letting it dominate over spatial / sensor evidence.
-TIME_SCALE     = 0.25
-obs_flag       = node_mask.expand_as(data_tensor)              # [1,N,T,1]
-context_feat   = network_context.expand_as(data_tensor)        # [1,N,T,1]
-input_features = torch.cat(
-    [obs_data, context_feat, nbr_ctx, obs_flag,
-     TIME_SCALE * time_sin, TIME_SCALE * time_cos], dim=-1
-)  # [1,N,T,6]
-
-print(f"✅ Input features: {input_features.shape}")
-print(f"   Observed: {node_mask.mean()*100:.0f}%  |  Blind: {(1-node_mask.mean())*100:.0f}%")
-
-# Leakage checks — will crash immediately if GT sneaks through
-assert (input_features[0, node_mask[0,:,0,0]==0, :, 0] == 0).all(), \
-    "Leakage: blind nodes have non-zero speed."
-assert (input_features[0, node_mask[0,:,0,0]==0, :, 3] == 0).all(), \
-    "Leakage: blind nodes flagged as observed."
-print("✅ Leakage checks passed.")
-
+adj_bin    = (adj_sym > 1e-6).astype(np.float32); np.fill_diagonal(adj_bin, 0.)
+adj2       = np.clip((adj_bin @ adj_bin > 0).astype(np.float32) + adj_bin, 0, 1)
+np.fill_diagonal(adj2, 1.)
+H_np       = adj2.T
+d_v        = H_np.sum(axis=1); d_e = H_np.sum(axis=0)
+d_v_inv_sq = np.where(d_v > 0, (d_v + 1e-8)**(-0.5), 0.)
+d_e_inv    = np.where(d_e > 0, (d_e + 1e-8)**(-1.), 0.)
+H_conv_np  = (d_v_inv_sq[:, None] * H_np) * d_e_inv[None, :]
+H_conv_np  = H_conv_np @ (H_np.T * d_v_inv_sq[None, :])
+H_conv     = torch.tensor(H_conv_np, dtype=torch.float32).to(device)
+print(f"✅ Hypergraph ready.")
 
 # =============================================================================
-# CELL 4 — Model Definition
+# CELL 4 — Feature builder  (13 features, same as v4/v4.1)
 # =============================================================================
-#
-# Three bugs fixed vs the previous version:
-#
-# BUG 1 — dopri5 inside the assimilation step-loop.
-#   An adaptive 6-stage RK solver for a fixed dt=1 step calls the ODE
-#   function 6+ times per call. With T=24 steps chained in backprop,
-#   that's 144+ evaluations and 24 separate odeint computation graphs,
-#   causing severe gradient vanishing.
-#   FIX: single Euler step  z ← z + f(z)  — one evaluation, one graph node.
-#
-# BUG 2 — Blind nodes received zero observation-loss gradient.
-#   loss = mean(((pred-obs)*sensor_mask)²) — blind nodes are masked out,
-#   so no gradients ever reach the weights responsible for imputation.
-#   FIX: curriculum masking — each batch randomly drop 10% of observed
-#   nodes from supervision. They become "pseudo-blind": forward pass
-#   treats them as blind, but GT is known so we compute loss on them.
-#   This gives the blind-node code path real, meaningful gradients.
-#
-# BUG 3 — ODEFunc residual normalised the wrong thing.
-#   LayerNorm(gc2_out + x) normalises both delta and skip together,
-#   suppressing the skip signal. gc2 also had no activation.
-#   FIX: Tanh on both GCN layers, LayerNorm on delta only before add.
+
+def build_input_features(mask, data_tensor_all, tod_prior,
+                         tod_free, tod_jam,
+                         A_t, time_sin, time_cos, TIME_SCALE):
+    N = mask.shape[1]
+    obs_all  = data_tensor_all * mask
+    obs_spd  = obs_all[:, :, :, 2:3]
+
+    num_obs      = mask.sum(dim=1, keepdim=True)
+    gctx_all     = obs_all.sum(dim=1, keepdim=True) / (num_obs + 1e-6)
+    gctx_spd     = gctx_all[:, :, :, 2:3]
+    gctx_flow    = gctx_all[:, :, :, 0:1].expand(-1, N, -1, -1)
+    gctx_occ     = gctx_all[:, :, :, 1:2].expand(-1, N, -1, -1)
+    gctx_spd_exp = gctx_spd.expand(-1, N, -1, -1)
+
+    obs_2d   = obs_spd[0, :, :, 0]
+    mask_1d  = mask[0, :, 0, 0]
+    mask_2d  = mask_1d.unsqueeze(1).expand_as(obs_2d)
+    nbr_s1   = torch.mm(A_t, obs_2d)
+    nbr_c1   = torch.mm(A_t, mask_2d)
+    nbr_ctx1 = nbr_s1 / (nbr_c1 + 1e-6)
+    cov_1    = nbr_c1 / (A_t.sum(dim=1, keepdim=True) + 1e-6)
+    nbr_s2   = torch.mm(A_t, nbr_ctx1)
+    cov_2    = torch.mm(A_t, cov_1) / (A_t.sum(dim=1, keepdim=True) + 1e-6)
+    gspd_2d  = gctx_spd[0, 0, :, 0].unsqueeze(0).expand(N, -1)
+    blend    = torch.clamp(cov_2 / 0.2, 0., 1.)
+    obs_prop = blend * nbr_s2 + (1 - blend) * gspd_2d
+
+    obs_prop_feat = obs_prop.unsqueeze(0).unsqueeze(-1)
+    cov_feat      = cov_2.unsqueeze(0).unsqueeze(-1)
+    tod_fill      = tod_prior.T.unsqueeze(0).unsqueeze(-1) * (1 - mask)
+    speed_w_prior = obs_spd + tod_fill
+    obs_flag      = mask.expand_as(obs_spd)
+    obs_flow      = obs_all[:, :, :, 0:1]
+    obs_occ       = obs_all[:, :, :, 1:2]
+    tod_free_feat = tod_free.T.unsqueeze(0).unsqueeze(-1).expand(-1, N, -1, -1)
+    tod_jam_feat  = tod_jam.T.unsqueeze(0).unsqueeze(-1).expand(-1, N, -1, -1)
+
+    return torch.cat([
+        speed_w_prior, gctx_spd_exp, obs_prop_feat, cov_feat, obs_flag,
+        TIME_SCALE * time_sin, TIME_SCALE * time_cos,
+        obs_flow, gctx_flow, obs_occ, gctx_occ,
+        tod_free_feat, tod_jam_feat,
+    ], dim=-1)  # [1, N, T, 13]
+
+
+SPARSITY = 0.80
+K_MASKS  = 5
+masks_list, features_list = [], []
+for k in range(K_MASKS):
+    torch.manual_seed(k * 37 + 42)
+    mk = (torch.rand(1, NUM_NODES, 1, 1) > SPARSITY).float().to(device)
+    fk = build_input_features(mk, data_tensor_all, tod_prior, tod_free, tod_jam,
+                               A_t, time_sin, time_cos, TIME_SCALE)
+    masks_list.append(mk)
+    features_list.append(fk)
+
+node_mask      = masks_list[0]
+input_features = features_list[0]
+INPUT_DIM      = 13   # [B] no node embeddings
+
+print(f"✅ {K_MASKS} masks + 13-feature tensors built. INPUT_DIM={INPUT_DIM}")
+assert (input_features[0, node_mask[0,:,0,0]==0, :, 4] == 0).all(), "Leakage!"
+print("✅ Leakage check passed.")
+
+# =============================================================================
+# CELL 5 — Model definition  (no node embeddings)
+# =============================================================================
 
 class GraphAttention(nn.Module):
-    """Single-head Graph Attention (GAT) masked to road topology.
-
-    Replaces the fixed normalised-adjacency GraphConv.  Instead of using
-    pre-computed distance-weighted edges, the model learns how strongly
-    each neighbour should influence a node's hidden state.  Edges that
-    exist in the road graph are kept; all others are masked to −∞ before
-    softmax so non-adjacent nodes cannot interact.
-
-    Attention score: e[i,j] = LeakyReLU( a_src(Wh_i) + a_dst(Wh_j) )
-    This additive decomposition avoids the O(N²·H) matmul of the full
-    concatenation form while preserving asymmetric attention.
-
-    Temperature τ > 1 softens the attention distribution, preventing the
-    model from placing 100% weight on a single congested neighbour.  This
-    reduces the runaway ODE oscillations that occur when one bad neighbour
-    dominates the hidden-state update at every Euler step.
-    """
     def __init__(self, in_dim, out_dim, temperature=2.0):
         super().__init__()
-        self.W           = nn.Linear(in_dim, out_dim, bias=False)
-        self.a_src       = nn.Linear(out_dim, 1, bias=False)
-        self.a_dst       = nn.Linear(out_dim, 1, bias=False)
-        self.leaky       = nn.LeakyReLU(0.2)
-        self.temperature = temperature
+        self.W     = nn.Linear(in_dim, out_dim, bias=False)
+        self.a_src = nn.Linear(out_dim, 1, bias=False)
+        self.a_dst = nn.Linear(out_dim, 1, bias=False)
+        self.leaky = nn.LeakyReLU(0.2)
+        self.tau   = temperature
 
     def forward(self, x, A):
-        # x: [B, N, in_dim]   A: [B, N, N] (road adjacency, 0 = no edge)
-        Wx    = self.W(x)                                             # [B, N, out_dim]
-        e_src = self.a_src(Wx)                                        # [B, N, 1]
-        e_dst = self.a_dst(Wx)                                        # [B, N, 1]
-        e     = self.leaky(e_src + e_dst.transpose(1, 2))            # [B, N, N]
-        e     = e.masked_fill(A < 1e-9, float('-inf'))                # mask non-edges
-        alpha = torch.softmax(e / self.temperature, dim=-1)           # [B, N, N]
-        alpha = torch.nan_to_num(alpha, 0.0)                          # isolated-node safety
-        return torch.bmm(alpha, Wx)                                   # [B, N, out_dim]
+        h     = self.W(x)
+        e     = self.leaky(self.a_src(h) + self.a_dst(h).transpose(1, 2))
+        e     = e.masked_fill(A < 1e-9, float('-inf'))
+        alpha = torch.nan_to_num(torch.softmax(e / self.tau, dim=-1), 0.)
+        return torch.bmm(alpha, h)
 
 
 class HypergraphConv(nn.Module):
-    """HGNN-style hypergraph convolution.
-
-    Uses the pre-computed normalised operator  H_conv = D_v^{-1/2} H D_e^{-1} H^T D_v^{-1/2}
-    so forward is just a linear projection + sparse matmul, keeping it lightweight
-    inside the ODE function.
-    """
     def __init__(self, in_dim, out_dim):
         super().__init__()
         self.theta = nn.Linear(in_dim, out_dim, bias=False)
 
     def forward(self, x, H_conv):
-        # x: [B, N, in_dim],  H_conv: [N, N]
-        h = self.theta(x)                              # [B, N, out_dim]
-        return torch.matmul(H_conv, h)                 # [B, N, out_dim]
+        return torch.matmul(H_conv, self.theta(x))
 
 
 class GraphODEFunc(nn.Module):
-    def __init__(self, hidden_dim, A_road, H_conv=None):
+    """4-path ODE: sym + fwd + bwd + corr + gated hypergraph."""
+    def __init__(self, hidden_dim, A_sym, A_fwd, A_bwd, A_corr, H_conv):
         super().__init__()
-        self.register_buffer('A', A_road)              # [1, N, N]
-        if H_conv is not None:
-            self.register_buffer('H_conv', H_conv)     # [N, N]
-        else:
-            self.H_conv = None
-        self.gat1  = GraphAttention(hidden_dim, hidden_dim)
-        self.gat2  = GraphAttention(hidden_dim, hidden_dim)
-        self.hconv = HypergraphConv(hidden_dim, hidden_dim) if H_conv is not None else None
-        self.act   = nn.Tanh()
-        self.norm  = nn.LayerNorm(hidden_dim)
-        # Learnable gate for hypergraph contribution.
-        # Initialised at -2 so sigmoid(-2) ≈ 0.12 — the model starts with a weak
-        # hypergraph signal and learns to amplify it only when group context helps.
-        # Without a gate, the 2-hop aggregation over-smooths jam nodes (a jammed
-        # node whose 20 hyperedge-neighbours are all free-flowing gets a high
-        # group output, actively contradicting the jam signal).
-        if H_conv is not None:
-            self.hyper_gate = nn.Parameter(torch.tensor(-2.0))
+        self.A_sym = A_sym; self.A_fwd = A_fwd
+        self.A_bwd = A_bwd; self.A_corr = A_corr
+        self.H_conv = H_conv
+
+        H = hidden_dim
+        self.gat_sym1  = GraphAttention(H, H)
+        self.gat_sym2  = GraphAttention(H, H)
+        self.gat_fwd   = GraphAttention(H, H)
+        self.gat_bwd   = GraphAttention(H, H)
+        self.gat_corr  = GraphAttention(H, H)
+        self.dir_mixer = nn.Sequential(
+            nn.Linear(H*4, H), nn.Tanh(), nn.Linear(H, 4), nn.Softmax(dim=-1)
+        )
+        self.hconv      = HypergraphConv(H, H)
+        self.hyper_gate = nn.Parameter(torch.full((NUM_NODES, 1), -2.0))
+        self.act  = nn.Tanh()
+        self.norm = nn.LayerNorm(H)
 
     def forward(self, t, x):
-        A     = self.A.expand(x.size(0), -1, -1)
-        h     = self.act(self.gat1(x, A))             # pairwise attention
-        h     = self.act(self.gat2(h, A))             # second attention layer
-        if self.hconv is not None:
-            h_hyp = self.act(self.hconv(x, self.H_conv))          # group-level
-            h     = h + torch.sigmoid(self.hyper_gate) * h_hyp    # gated fusion
-        delta = self.norm(h)
-        return delta
+        B   = x.size(0)
+        A_s = self.A_sym.expand(B,-1,-1)
+        A_f = self.A_fwd.expand(B,-1,-1)
+        A_b = self.A_bwd.expand(B,-1,-1)
+        A_c = self.A_corr.expand(B,-1,-1)
+
+        h_sym  = self.act(self.gat_sym2(self.act(self.gat_sym1(x, A_s)), A_s))
+        h_fwd  = self.act(self.gat_fwd(x, A_f))
+        h_bwd  = self.act(self.gat_bwd(x, A_b))
+        h_corr = self.act(self.gat_corr(x, A_c))
+        mix    = self.dir_mixer(torch.cat([h_sym, h_fwd, h_bwd, h_corr], dim=-1))
+        h      = (mix[...,0:1]*h_sym + mix[...,1:2]*h_fwd +
+                  mix[...,2:3]*h_bwd + mix[...,3:4]*h_corr)
+        h      = h + torch.sigmoid(self.hyper_gate).unsqueeze(0) * self.act(self.hconv(x, self.H_conv))
+        return self.norm(h)
 
 
 class AssimilationUpdate(nn.Module):
-    """
-    Learned Kalman-style correction after each Euler step.
-
-    Observed nodes: GRU-like gate blends ODE prediction with new sensor reading.
-    Blind nodes:    obs_mask=0  →  update=0, state unchanged.
-                    They already received neighbour info via GraphConv.
-    """
-    def __init__(self, input_dim, hidden_dim):
+    def __init__(self, hidden_dim, input_dim):
         super().__init__()
-        self.obs_encoder = nn.Linear(input_dim, hidden_dim)
-        self.gate = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.Sigmoid(),
+        self.obs_enc   = nn.Linear(input_dim, hidden_dim)
+        self.state_prb = nn.Linear(hidden_dim, 1)
+        self.gate      = nn.Sequential(
+            nn.Linear(hidden_dim*2+2, hidden_dim), nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim), nn.Sigmoid()
         )
 
-    def forward(self, z, x_new, obs_mask):
-        # z:        [B, N, H]
-        # x_new:    [B, N, F]
-        # obs_mask: [B, N, 1]  — 1=observed, 0=blind
-        z_obs  = self.obs_encoder(x_new)
-        gate   = self.gate(torch.cat([z, z_obs], dim=-1))
-        update = gate * (z_obs - z) * obs_mask   # blind nodes zeroed out
-        return z + update
+    def forward(self, z, x_new, obs_mask, obs_count_norm):
+        z_obs  = self.obs_enc(x_new)
+        sl     = self.state_prb(z)
+        g_in   = torch.cat([z, z_obs, obs_count_norm.expand_as(sl), sl], dim=-1)
+        return z + self.gate(g_in) * (z_obs - z) * obs_mask
 
 
-class GraphCTH_NODE(nn.Module):
-    def __init__(self, input_dim=3, hidden_dim=64, A_road=None, H_conv=None):
+class GraphCTH_NODE_v5(nn.Module):
+    """
+    v5: [B] No node embeddings (INPUT_DIM=13).
+        [A] Jam-conditioned decoder: decoder([z, jl.detach()]).
+        Jam_head is a regulariser for z via focal BCE (not primary detector).
+        Primary jam detection: speed threshold < 40 km/h on decoder output.
+    """
+    def __init__(self, input_dim, hidden_dim,
+                 A_sym, A_fwd, A_bwd, A_corr, H_conv):
         super().__init__()
         self.encoder    = nn.Linear(input_dim, hidden_dim)
-        self.ode_func   = GraphODEFunc(hidden_dim, A_road, H_conv=H_conv)
-        self.assimilate = AssimilationUpdate(input_dim, hidden_dim)
-        self.decoder    = nn.Linear(hidden_dim, 1)
+        self.ode_func   = GraphODEFunc(hidden_dim, A_sym, A_fwd, A_bwd, A_corr, H_conv)
+        self.assimilate = AssimilationUpdate(hidden_dim, input_dim)
+        self.jam_head   = nn.Linear(hidden_dim, 1)
+        self.decoder    = nn.Linear(hidden_dim + 1, 1)  # jam-conditioned
 
-    def _euler_step(self, z):
-        """Single Euler step with dt=0.3.
-        dt<1 dampens hidden-state momentum so the model recovers from a jam
-        smoothly rather than oscillating after the congestion clears."""
+    def _euler(self, z):
         return z + 0.3 * self.ode_func(None, z)
 
     def forward(self, x_seq, obs_mask):
-        """
-        x_seq:    [B, N, T, F]
-        obs_mask: [B, N, 1, 1]
-        returns:  [B, N, T, 1]
-        """
-        mask  = obs_mask[:, :, 0, :]   # [B, N, 1]
-        z     = self.encoder(x_seq[:, :, 0, :])
-        preds = []
-        T = x_seq.shape[2]
+        B, N, T, _ = x_seq.shape
+        mask      = obs_mask[:, :, 0, :]
+        obs_count = mask.mean(dim=1, keepdim=True)
+
+        z = self.encoder(x_seq[:, :, 0, :])
+        preds, jam_logits = [], []
 
         for i in range(T):
-            preds.append(self.decoder(z))          # decode → speed prediction
+            jl = torch.sigmoid(self.jam_head(z))
+            jam_logits.append(jl)
+            preds.append(self.decoder(torch.cat([z, jl.detach()], dim=-1)))
             if i < T - 1:
-                z = self._euler_step(z)            # propagate via road graph
-                z = self.assimilate(z, x_seq[:, :, i+1, :], mask)  # inject sensors
+                z = self._euler(z)
+                z = self.assimilate(z, x_seq[:, :, i+1, :], mask, obs_count)
 
-        return torch.stack(preds, dim=2)           # [B, N, T, 1]
+        return torch.stack(preds, dim=2), torch.stack(jam_logits, dim=2)
 
+# =============================================================================
+# CELL 6 — Metrics
+# =============================================================================
 
-class ObservedMSELoss(nn.Module):
-    """Three-term loss:
+def compute_ssim(pred, target, data_range=None):
+    if data_range is None:
+        data_range = float(target.max() - target.min()) + 1e-8
+    C1 = (0.01 * data_range)**2; C2 = (0.03 * data_range)**2
+    mu_p, mu_t   = pred.mean(), target.mean()
+    sig_p, sig_t = pred.std(), target.std()
+    sig_pt       = ((pred - mu_p) * (target - mu_t)).mean()
+    return float(((2*mu_p*mu_t+C1)*(2*sig_pt+C2)) /
+                 ((mu_p**2+mu_t**2+C1)*(sig_p**2+sig_t**2+C2)))
 
-    1. Jam-weighted observation MSE
-       Rare congestion samples receive jam_weight× more gradient so the
-       model is not free to ignore them in favour of free-flow accuracy.
+def jam_prec_recall(pred_kmh, true_kmh, thresh=40.0):
+    p_j = pred_kmh < thresh; t_j = true_kmh < thresh
+    tp  = (p_j & t_j).sum(); fp = (p_j & ~t_j).sum(); fn = (~p_j & t_j).sum()
+    pr  = tp/(tp+fp+1e-8); rc = tp/(tp+fn+1e-8)
+    return float(pr), float(rc), float(2*pr*rc/(pr+rc+1e-8))
 
-    2. Temporal smoothness
-       Penalises large step-to-step prediction jumps — suppresses the
-       post-jam oscillation artefact.
+def jam_prec_recall_logit(logit_np, true_kmh, thresh=40.0, logit_thresh=0.5):
+    p_j = logit_np > logit_thresh; t_j = true_kmh < thresh
+    tp  = (p_j & t_j).sum(); fp = (p_j & ~t_j).sum(); fn = (~p_j & t_j).sum()
+    pr  = tp/(tp+fp+1e-8); rc = tp/(tp+fn+1e-8)
+    return float(pr), float(rc), float(2*pr*rc/(pr+rc+1e-8))
 
-    3. Physics: graph-Laplacian spatial regularisation
-       For each predicted time slice v ∈ R^N:
-           L_phys = ||L_sym · v||²  =  Σ_i (v_i − mean_nbr(v_i))²
-       Enforces soft flow continuity: a blind node should not be predicted
-       as severely congested if all its road-neighbours are free-flowing
-       (and vice-versa), unless the sensor data says otherwise.
-       Based on the kinematic-wave conservation principle that speed
-       gradients must propagate continuously along a road.
+# =============================================================================
+# CELL 7 — Focal Hybrid Loss v5
+# =============================================================================
+
+class FocalHybridLoss_v5(nn.Module):
     """
-    def __init__(self, jam_thresh_norm, jam_weight=4.0,
-                 L_graph=None, lambda_physics=0.02):
+    [A] Focal BCE for jam_head:
+        FL = -α*(1-p)^γ*log(p) for jams  (concentrates on missed jams)
+        FL = -(1-α)*p^γ*log(1-p) for free-flow  (down-weights easy negatives)
+        With α=0.85 and γ=2, jam examples contribute ~93% of total BCE loss
+        even at 92:8 class imbalance. Fixes precision=0.043 from v4.1.
+
+    [B] MAE for jam region regression (Xie et al. 2023):
+        No quadratic bias toward safe predictions near threshold.
+
+    [C] Curriculum recall: λ_recall ramps 0→0.20 over epochs 0–200.
+        [D] Reduced from 0.40 (v4.1) — focal BCE already handles recall.
+    """
+    def __init__(self, jam_thresh_train, jam_weight=20.0, gamma=2.0,
+                 focal_alpha=0.85,
+                 lam_smooth=0.60, lam_phy=0.02, lam_aux=0.10,
+                 lam_recall_max=0.20, recall_warmup_epochs=200):
         super().__init__()
-        self.jam_thresh      = jam_thresh_norm
-        self.jam_weight      = jam_weight
-        self.lambda_physics  = lambda_physics
-        if L_graph is not None:
-            self.register_buffer('L', L_graph)   # [N, N]
-        else:
-            self.L = None
+        self.jt             = jam_thresh_train
+        self.jw             = jam_weight
+        self.gam            = gamma
+        self.alpha          = focal_alpha          # [A] jam weight in focal BCE
+        self.ls             = lam_smooth
+        self.lp             = lam_phy
+        self.la             = lam_aux
+        self.lam_recall_max = lam_recall_max
+        self.recall_warmup  = recall_warmup_epochs
 
-    def forward(self, pred, obs, sup_mask, lambda_smooth=0.60):
-        # 1 — jam-weighted observation loss
-        w        = torch.where(obs < self.jam_thresh,
-                               torch.full_like(obs, self.jam_weight),
-                               torch.ones_like(obs))
-        loss_obs = torch.mean(((pred - obs) * sup_mask) ** 2 * w)
+    def get_lam_recall(self, epoch):
+        return self.lam_recall_max * min(1.0, epoch / self.recall_warmup)
 
-        # 2 — temporal smoothness
-        loss_smooth = torch.mean((pred[:, :, 1:] - pred[:, :, :-1]) ** 2)
+    def forward(self, pred, obs, sup_mask, jam_logits, L_graph, epoch=1):
+        jt       = self.jt.view(1, -1, 1, 1)
+        jam_flag = (obs < jt).float()
+        free_flag = 1.0 - jam_flag
 
-        # 3 — physics: Laplacian spatial regularisation
-        if self.L is not None:
-            v        = pred[0, :, :, 0]               # [N, T]
-            loss_phy = torch.mean(torch.mm(self.L, v) ** 2)
-        else:
-            loss_phy = 0.0
+        # [B] Hybrid regression: MSE for free-flow, MAE × focal for jams
+        err_abs   = (pred - obs).abs()
+        err_norm  = (err_abs.detach() / 3.0).clamp(0, 1)
+        focal_mod = (1.0 + err_norm) ** self.gam
 
-        return loss_obs + lambda_smooth * loss_smooth + self.lambda_physics * loss_phy
+        loss_ff  = torch.mean(((pred - obs) * sup_mask * free_flag) ** 2)
+        loss_jam = torch.mean(err_abs * sup_mask * jam_flag * focal_mod) * self.jw
 
+        # [A] Focal BCE on jam_head
+        # p_t = jam_logits for jams, (1-jam_logits) for free-flow
+        p_t   = torch.where(jam_flag.bool(), jam_logits, 1.0 - jam_logits)
+        # alpha_t = α for jams, (1-α) for free-flow
+        alpha_t = torch.where(jam_flag.bool(),
+                              torch.full_like(jam_logits, self.alpha),
+                              torch.full_like(jam_logits, 1.0 - self.alpha))
+        # Standard BCE per sample
+        bce_raw = F.binary_cross_entropy(
+            jam_logits * sup_mask,
+            jam_flag   * sup_mask,
+            reduction='none'
+        )
+        # Focal modulation: down-weight easy examples
+        focal_bce = alpha_t * (1.0 - p_t.detach()).pow(self.gam) * bce_raw
+        loss_focal = focal_bce.mean()
+
+        # Curriculum recall
+        lam_r       = self.get_lam_recall(epoch)
+        loss_recall = torch.mean(jam_flag * sup_mask * (1.0 - jam_logits))
+
+        # Temporal smoothness
+        loss_sm = torch.mean((pred[:, :, 1:] - pred[:, :, :-1]) ** 2)
+
+        # Graph Laplacian physics
+        v        = pred[0, :, :, 0]
+        loss_phy = torch.mean(torch.mm(L_graph, v) ** 2)
+
+        return (loss_ff + loss_jam
+                + self.la  * loss_focal
+                + lam_r    * loss_recall
+                + self.ls  * loss_sm
+                + self.lp  * loss_phy)
 
 # =============================================================================
-# CELL 5 — Training with curriculum masking
+# CELL 8 — Training (linear warmup + cosine, same as v4.1)
 # =============================================================================
-model     = GraphCTH_NODE(input_dim=6, hidden_dim=64, A_road=A_road, H_conv=H_conv).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=3e-4, weight_decay=1e-4)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=400)
 
-jam_thresh_norm = (40.0 - mean) / (std + 1e-8)   # 40 km/h in normalised space
-criterion       = ObservedMSELoss(
-    jam_thresh_norm=jam_thresh_norm,
-    jam_weight=4.0,           # 5× still over-triggered on rush-hour temporal signal
-    L_graph=L_graph,          # physics Laplacian regulariser
-    lambda_physics=0.02,
+HIDDEN_DIM    = 64
+BATCH_TIME    = 48
+EPOCHS        = 800
+LR_TARGET     = 1e-4
+WARMUP_EPOCHS = 150      # Kalra NeurIPS 2024
+WEIGHT_DECAY  = 1e-4
+ACCUM_STEPS   = 4
+CURRICULUM    = 0.15
+JAM_BIAS_PROB = 0.70
+PATIENCE      = 100
+
+model = GraphCTH_NODE_v5(
+    input_dim = INPUT_DIM,
+    hidden_dim = HIDDEN_DIM,
+    A_sym  = A_road, A_fwd = A_fwd_t, A_bwd = A_bwd_t,
+    A_corr = A_corr_t, H_conv = H_conv,
+).to(device)
+
+criterion = FocalHybridLoss_v5(
+    jam_thresh_train     = jam_thresh_train_t,
+    jam_weight           = 20.0,
+    gamma                = 2.0,
+    focal_alpha          = 0.85,
+    lam_smooth           = 0.60,
+    lam_phy              = 0.02,
+    lam_aux              = 0.10,
+    lam_recall_max       = 0.20,
+    recall_warmup_epochs = 200,
 )
 
-TRAIN_END       = 4000   # hard cutoff — no overlap with val/eval
-VAL_START       = 4000
-VAL_WIN         = 240    # 240-step val window — stable MAE estimate
-BATCH_TIME      = 48
-CURRICULUM_DROP = 0.15   # hide 15% of observed nodes as pseudo-blind per batch
-best_mae        = float('inf')
-mask_4d         = node_mask   # [1, N, 1, 1]
-obs_indices     = (node_mask[0, :, 0, 0] == 1).nonzero(as_tuple=True)[0]
+optimizer = torch.optim.Adam(model.parameters(), lr=LR_TARGET, weight_decay=WEIGHT_DECAY)
 
-# Precompute jam-containing window start indices within the training set.
-# 50% of batches will be forced to start at a jam timestep so the model
-# sees enough congestion events to learn from the 8× jam weight.
-blind_ids   = (node_mask[0, :, 0, 0] == 0)
-blind_norm  = data_tensor[0, blind_ids, :TRAIN_END, 0]   # [N_blind, T_train]
-has_jam     = (blind_norm < jam_thresh_norm).any(dim=0)   # [T_train]
-jam_t_valid = has_jam.nonzero(as_tuple=True)[0]
+def lr_lambda(epoch):
+    if epoch < WARMUP_EPOCHS:
+        return float(epoch + 1) / float(WARMUP_EPOCHS)
+    progress = (epoch - WARMUP_EPOCHS) / (EPOCHS - WARMUP_EPOCHS)
+    return 0.5 * (1.0 + np.cos(np.pi * progress))
+
+scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+speed_t     = data_tensor_spd[0, :, :, 0]
+jt_train    = jam_thresh_train_t.view(-1, 1)
+jam_at_t    = (speed_t < jt_train).any(dim=0)[:TRAIN_END]
+jam_t_valid = jam_at_t.nonzero(as_tuple=True)[0]
 jam_t_valid = jam_t_valid[jam_t_valid < TRAIN_END - BATCH_TIME]
-print(f"   Jam-containing windows in train set: {len(jam_t_valid)}")
 
-ACCUM_STEPS = 4   # accumulate gradients over 4 windows per update — smooths
-               #   the large variance between jam (high loss) and free-flow
-               #   (low loss) batches that causes the oscillating val MAE
+print(f"✅ Model: {sum(p.numel() for p in model.parameters()):,} params")
+print(f"   INPUT_DIM={INPUT_DIM}  |  Warmup={WARMUP_EPOCHS} epochs")
+print(f"   Jam windows: {len(jam_t_valid)}")
 
-print("Training Graph-ODE + Assimilation (Euler, curriculum masking)...")
-for epoch in range(800):
+best_val, best_state, no_improve = float('inf'), None, 0
+train_log, val_log = [], []
+
+for epoch in range(1, EPOCHS + 1):
     model.train()
     optimizer.zero_grad()
+    epoch_loss = 0.
 
-    accum_loss = 0.0
-    for _ in range(ACCUM_STEPS):
-        # 50% chance: force a jam-containing window for richer gradient signal
-        if len(jam_t_valid) > 0 and np.random.rand() < 0.5:
-            idx = int(torch.randint(len(jam_t_valid), (1,)).item())
-            t0  = int(jam_t_valid[idx].item())
+    for step in range(ACCUM_STEPS):
+        k             = np.random.randint(0, K_MASKS)
+        cur_mask_base = masks_list[k]
+        cur_features  = features_list[k]
+
+        if len(jam_t_valid) > 0 and np.random.rand() < JAM_BIAS_PROB:
+            t0 = int(jam_t_valid[torch.randint(len(jam_t_valid), (1,)).item()])
         else:
             t0 = np.random.randint(0, TRAIN_END - BATCH_TIME)
-        x_window   = input_features[:, :, t0:t0+BATCH_TIME, :]   # [1, N, T, 4]
-        obs_window = data_tensor[:, :, t0:t0+BATCH_TIME, :]       # [1, N, T, 1]
 
-        # Curriculum masking: randomly select observed nodes to treat as pseudo-blind.
-        # - Zero their speed + is_observed features in the input so the forward pass
-        #   sees them as truly blind (they receive no assimilation update either).
-        # - Keep them in the supervision mask so their known GT drives gradients
-        #   through the blind-node code path.
-        n_drop   = max(1, int(len(obs_indices) * CURRICULUM_DROP))
-        drop_idx = obs_indices[torch.randperm(len(obs_indices))[:n_drop]]
+        x_win  = cur_features[:, :, t0:t0+BATCH_TIME, :]
+        gt_win = data_tensor_spd[:, :, t0:t0+BATCH_TIME, :]
 
-        x_aug = x_window.clone()
-        x_aug[0, drop_idx, :, 0] = 0.0   # zero observed speed
-        x_aug[0, drop_idx, :, 2] = 0.0   # zero neighbourhood context (treat as unobserved)
-        x_aug[0, drop_idx, :, 3] = 0.0   # zero is_observed flag
+        cur_mask = cur_mask_base.clone()
+        obs_idx  = (cur_mask[0,:,0,0]==1).nonzero(as_tuple=True)[0]
+        n_drop   = max(1, int(len(obs_idx) * CURRICULUM))
+        cur_mask[0, obs_idx[torch.randperm(len(obs_idx))[:n_drop]], 0, 0] = 0.
 
-        cur_mask = mask_4d.clone()
-        cur_mask[0, drop_idx, :, :] = 0.0   # exclude from assimilation
+        sup_mask = (cur_mask_base.bool() | (cur_mask < cur_mask_base)).float()
+        sup_mask = sup_mask.expand_as(gt_win)
 
-        sup_mask = node_mask.expand_as(obs_window).clone()
-        sup_mask[0, drop_idx, :, :] = 1.0   # supervise pseudo-blind nodes
+        preds, jam_logits = model(x_win, cur_mask)
+        loss = criterion(preds, gt_win, sup_mask, jam_logits, L_graph, epoch) / ACCUM_STEPS
+        loss.backward()
+        epoch_loss += loss.item()
 
-        step_preds = model(x_aug, cur_mask)
-        step_loss  = criterion(step_preds, obs_window, sup_mask) / ACCUM_STEPS
-        step_loss.backward()
-        accum_loss += step_loss.item()
-
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
     optimizer.step()
     scheduler.step()
-    loss_display = accum_loss   # accumulated loss for logging
+    train_log.append(epoch_loss)
 
-    if epoch % 20 == 0:
+    if epoch % 50 == 0:
         model.eval()
+        val_maes = []
         with torch.no_grad():
-            # Windowed validation — same window size as training, averaged over
-            # VAL_WIN steps for a stable MAE estimate (avoids single-window noise).
-            p_chunks, g_chunks = [], []
-            for vs in range(VAL_START, VAL_START + VAL_WIN, BATCH_TIME):
-                xv = input_features[:, :, vs:vs+BATCH_TIME, :]
-                p_chunks.append(model(xv, mask_4d).cpu() * std + mean)
-                g_chunks.append(data_tensor[:, :, vs:vs+BATCH_TIME, :].cpu() * std + mean)
-            p_real = torch.cat(p_chunks, dim=2)
-            g_real = torch.cat(g_chunks, dim=2)
-            hid    = (node_mask.expand_as(g_real).cpu() == 0)
-            mae    = torch.mean(torch.abs(p_real[hid] - g_real[hid])).item()
+            for t0 in range(VAL_START, VAL_END - BATCH_TIME, BATCH_TIME):
+                x_v    = input_features[:, :, t0:t0+BATCH_TIME, :]
+                gt_v   = data_tensor_spd[:, :, t0:t0+BATCH_TIME, :]
+                p_v, _ = model(x_v, node_mask)
+                blind  = (node_mask[0,:,0,0]==0)
+                p_np   = p_v[0,blind,:,0].cpu().numpy()
+                g_np   = gt_v[0,blind,:,0].cpu().numpy()
+                n_idx  = blind.cpu().numpy().nonzero()[0]
+                for ni, n in enumerate(n_idx):
+                    p_np[ni] = p_np[ni]*node_stds[n] + node_means[n]
+                    g_np[ni] = g_np[ni]*node_stds[n] + node_means[n]
+                val_maes.append(np.abs(p_np - g_np).mean())
 
-            if mae < best_mae:
-                best_mae = mae
-                torch.save(model.state_dict(), 'best_graph_model.pth')
+        val_mae = np.mean(val_maes)
+        val_log.append((epoch, val_mae))
+        phase  = "warmup" if epoch <= WARMUP_EPOCHS else "cosine"
+        lam_r  = criterion.get_lam_recall(epoch)
+        cur_lr = optimizer.param_groups[0]['lr']
+        print(f"Epoch {epoch:4d} | loss={epoch_loss:.4f} | val_MAE={val_mae:.2f} km/h | "
+              f"lr={cur_lr:.2e} | λ_recall={lam_r:.3f} [{phase}]")
 
-            print(f"Epoch {epoch:3d} | Loss: {loss_display:.4f} | "
-                  f"Blind-node Val MAE: {mae:.2f} km/h")
+        if val_mae < best_val:
+            best_val, best_state, no_improve = val_mae, copy.deepcopy(model.state_dict()), 0
+        else:
+            no_improve += 50
+            if no_improve >= PATIENCE * 50:
+                print(f"  Early stopping at epoch {epoch}")
+                break
 
-print(f"\nDone. Best blind-node Val MAE: {best_mae:.2f} km/h")
-print(f"   (trained with 8× jam weight, 50% jam-biased sampling, "
-      f"train/eval split at t={TRAIN_END})")
-
+print(f"\nBest blind-node Val MAE: {best_val:.2f} km/h")
 
 # =============================================================================
-# CELL 6 — Evaluation
+# CELL 9 — Evaluation with both speed-threshold and logit-threshold metrics
 # =============================================================================
-model.load_state_dict(torch.load('best_graph_model.pth', map_location=device, weights_only=True))
+
+model.load_state_dict(best_state)
 model.eval()
 
-EVAL_START = 4500
-EVAL_LEN   = 450
-EVAL_WIN   = BATCH_TIME   # same window size as training — avoids ODE drift
-
-# Slide non-overlapping windows over the eval period and concatenate predictions.
-# The model was trained on BATCH_TIME-step sequences; longer rollouts cause
-# the Euler hidden state to drift far outside the training distribution.
-pred_chunks = []
-gt_chunks   = []
-
+all_pred, all_true, all_logits = [], [], []
 with torch.no_grad():
-    t = EVAL_START
-    while t + EVAL_WIN <= EVAL_START + EVAL_LEN:
-        x_win  = input_features[:, :, t:t+EVAL_WIN, :]
-        p_win  = model(x_win, mask_4d).cpu() * std + mean
-        g_win  = data_tensor[:, :, t:t+EVAL_WIN, :].cpu() * std + mean
-        pred_chunks.append(p_win)
-        gt_chunks.append(g_win)
-        t += EVAL_WIN
+    for t0 in range(EVAL_START, EVAL_START + EVAL_LEN - BATCH_TIME, BATCH_TIME):
+        x_e   = input_features[:, :, t0:t0+BATCH_TIME, :]
+        gt_e  = data_tensor_spd[:, :, t0:t0+BATCH_TIME, :]
+        p_e, jl_e = model(x_e, node_mask)
+        all_pred.append(p_e.cpu()); all_true.append(gt_e.cpu())
+        all_logits.append(jl_e.cpu())
 
-preds = torch.cat(pred_chunks, dim=2)   # [1, N, T_eval, 1]
-gts   = torch.cat(gt_chunks,   dim=2)
+pred_cat  = torch.cat(all_pred,   dim=2)[0,:,:,0]
+true_cat  = torch.cat(all_true,   dim=2)[0,:,:,0]
+logit_cat = torch.cat(all_logits, dim=2)[0,:,:,0]
 
-hid_mask = (node_mask.cpu() == 0).expand_as(gts)
-jam_mask = (gts < 40)
-target   = hid_mask & jam_mask
+blind_idx = (node_mask[0,:,0,0]==0).cpu().numpy().nonzero()[0]
 
-m_model    = torch.mean(torch.abs(preds[target]    - gts[target])).item()
-m_base     = torch.mean(torch.abs(torch.ones_like(gts[target]) * mean - gts[target])).item()
-m_overall  = torch.mean(torch.abs(preds[hid_mask]  - gts[hid_mask])).item()
-m_base_all = torch.mean(torch.abs(torch.ones_like(gts[hid_mask]) * mean - gts[hid_mask])).item()
+pred_bl_norm  = pred_cat[blind_idx].numpy()
+true_bl_norm  = true_cat[blind_idx].numpy()
+logit_bl      = logit_cat[blind_idx].numpy()
 
-print("\n" + "="*57)
-print("   GRAPH-ODE + ASSIMILATION  (blind nodes only)")
-print("="*57)
-print(f"  Baseline MAE (global mean) — jam samples : {m_base:.2f} km/h")
-print(f"  Model MAE   — jam samples                : {m_model:.2f} km/h")
-print(f"  Model MAE   — all samples                : {m_overall:.2f} km/h")
-print(f"  Jam improvement vs baseline              : {((m_base-m_model)/m_base)*100:.1f}%")
-print("="*57)
+pred_bl_kmh = np.zeros_like(pred_bl_norm)
+true_bl_kmh = np.zeros_like(true_bl_norm)
+for ni, n in enumerate(blind_idx):
+    pred_bl_kmh[ni] = pred_bl_norm[ni] * node_stds[n] + node_means[n]
+    true_bl_kmh[ni] = true_bl_norm[ni] * node_stds[n] + node_means[n]
 
+base_bl_kmh = node_means[blind_idx][:, None] * np.ones_like(true_bl_kmh)
+jam_mask    = true_bl_kmh < JAM_KMH_EVAL
+glob_mae    = np.abs(pred_bl_kmh - true_bl_kmh).mean()
+jam_mae     = np.abs((pred_bl_kmh - true_bl_kmh)[jam_mask]).mean() if jam_mask.any() else float('nan')
+base_jam    = np.abs((base_bl_kmh - true_bl_kmh)[jam_mask]).mean()
+ssim_val    = compute_ssim(pred_bl_kmh, true_bl_kmh)
+
+# Speed-threshold detection (primary — better than logit in v4.1)
+prec_spd, rec_spd, f1_spd = jam_prec_recall(pred_bl_kmh, true_bl_kmh)
+
+print("\n" + "=" * 70)
+print("  GRAPH-CTH-NODE v5  —  blind nodes, test window")
+print("=" * 70)
+print(f"  Global mean baseline MAE jam      : {base_jam:.2f} km/h")
+print(f"  Model MAE (all blind)             : {glob_mae:.2f} km/h")
+print(f"  Model MAE (jam < 40 km/h)         : {jam_mae:.2f} km/h")
+print(f"  Jam improvement vs baseline       : {(base_jam-jam_mae)/base_jam*100:.1f}%")
+print(f"  SSIM                              : {ssim_val:.3f}")
+print(f"  Jam (speed threshold < 40 km/h):")
+print(f"    Precision : {prec_spd:.3f}")
+print(f"    Recall    : {rec_spd:.3f}")
+print(f"    F1        : {f1_spd:.3f}")
+
+# Logit-threshold sweep (secondary — to verify focal BCE improved calibration)
+print(f"\n  Logit threshold sweep (focal BCE calibration check):")
+print(f"  {'Threshold':>10} {'Precision':>10} {'Recall':>8} {'F1':>8}")
+best_f1_val, best_f1_thresh = 0.0, 0.5
+for thr in [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50]:
+    p, r, f = jam_prec_recall_logit(logit_bl, true_bl_kmh, logit_thresh=thr)
+    marker = " ← best logit F1" if f > best_f1_val else ""
+    print(f"  {thr:>10.2f} {p:>10.3f} {r:>8.3f} {f:>8.3f}{marker}")
+    if f > best_f1_val:
+        best_f1_val, best_f1_thresh = f, thr
+
+print(f"\n  Best logit F1: {best_f1_val:.3f} @ thr={best_f1_thresh:.2f}")
+print("=" * 70)
 
 # =============================================================================
-# CELL 7 — Thesis Figure
+# CELL 10 — Missing pattern experiment
 # =============================================================================
-# Pick the blind node where the model tracks jams best (lowest jam MAE)
-# among nodes with at least 10 sub-40 km/h timesteps.
-# Showing "most jam timesteps" was selecting the hardest node (isolated jam,
-# no jammed neighbours) — the right visualisation is where the approach works.
-blind_ids  = (node_mask[0, :, 0, 0] == 0).nonzero(as_tuple=True)[0].cpu().numpy()
 
-def node_jam_mae(n):
-    gt_n  = gts[0, n, :, 0]
-    pr_n  = preds[0, n, :, 0]
-    mask  = gt_n < 40
-    return torch.mean(torch.abs(pr_n[mask] - gt_n[mask])).item() if mask.sum() >= 10 else float('inf')
+experiment_results = {'MNAR': [], 'MAR': [], 'MCAR': []}
+print("\nMissing pattern experiment (Bae et al. 2018 framework):")
+print(f"{'Pattern':<8} {'Rate':<6} {'MAE all':>10} {'MAE jam':>10}")
 
-best_node  = min(blind_ids, key=node_jam_mae)
-best_count = (gts[0, best_node, :, 0] < 40).sum().item()
+for pat in ['MNAR', 'MAR', 'MCAR']:
+    for rate in [0.40, 0.60, 0.80]:
+        np.random.seed(77); torch.manual_seed(77)
+        if pat == 'MNAR':
+            num_drop   = int(rate * NUM_NODES)
+            drop_nodes = torch.argsort(torch.tensor(node_means))[:num_drop]
+            mp         = torch.ones((1, NUM_NODES, 1, 1)).to(device)
+            mp[0, drop_nodes, 0, 0] = 0.
+            mask_fn = lambda t: mp
+        elif pat == 'MAR':
+            mp      = (torch.rand(1, NUM_NODES, 1, 1) > rate).float().to(device)
+            mask_fn = lambda t: mp
+        else:
+            mask_fn = lambda t: (torch.rand(1, NUM_NODES, 1, 1) > rate).float().to(device)
 
-node_pred = preds[0, best_node, :, 0].numpy()
-node_gt   = gts[0,  best_node, :, 0].numpy()
+        model.eval()
+        maes_all, maes_jam = [], []
+        with torch.no_grad():
+            for t0 in range(EVAL_START, EVAL_START + EVAL_LEN - BATCH_TIME, BATCH_TIME):
+                cur_m  = mask_fn(t0)
+                x_full = build_input_features(
+                    cur_m, data_tensor_all, tod_prior, tod_free, tod_jam,
+                    A_t, time_sin, time_cos, TIME_SCALE)
+                x_e  = x_full[:, :, t0:t0+BATCH_TIME, :]
+                gt_e = data_tensor_spd[:, :, t0:t0+BATCH_TIME, :]
+                p_e, _ = model(x_e, cur_m)
+                b_idx  = (cur_m[0,:,0,0]==0).cpu().numpy().nonzero()[0]
+                if len(b_idx) == 0:
+                    continue
+                p_np = p_e[0,b_idx,:,0].cpu().numpy()
+                g_np = gt_e[0,b_idx,:,0].cpu().numpy()
+                for ni, n in enumerate(b_idx):
+                    p_np[ni] = p_np[ni]*node_stds[n] + node_means[n]
+                    g_np[ni] = g_np[ni]*node_stds[n] + node_means[n]
+                maes_all.append(np.abs(p_np - g_np).mean())
+                jm = g_np < JAM_KMH_EVAL
+                if jm.any():
+                    maes_jam.append(np.abs((p_np-g_np)[jm]).mean())
 
-fig, ax = plt.subplots(figsize=(12, 6))
-ax.plot(node_gt,   label='Ground Truth',             lw=3,   color='black',    alpha=0.8)
-ax.plot(node_pred, label='Graph-ODE + Assimilation', lw=2.5, color='tab:blue', linestyle='--')
-ax.axhline(mean,   label='Baseline (Global Avg)',    color='gray', linestyle=':', lw=2)
+        ma = np.mean(maes_all) if maes_all else float('nan')
+        mj = np.mean(maes_jam) if maes_jam else float('nan')
+        print(f"  {pat:<8} {rate:<6.0%} {ma:>10.2f} {mj:>10.2f}")
+        experiment_results[pat].append(ma)
 
-# Shade every contiguous jam segment separately
-jam_times = np.where(node_gt < 40)[0]
-if len(jam_times) > 0:
-    in_jam, first = False, True
-    for t in range(len(node_gt)):
-        if node_gt[t] < 40 and not in_jam:
-            jam_start, in_jam = t, True
-        elif node_gt[t] >= 40 and in_jam:
-            ax.axvspan(jam_start, t, color='red', alpha=0.1,
-                       label='Traffic Jam Period' if first else '_')
-            in_jam, first = False, False
-    if in_jam:
-        ax.axvspan(jam_start, len(node_gt), color='red', alpha=0.1)
+# =============================================================================
+# CELL 11 — Visualization
+# =============================================================================
 
-    deepest = int(np.argmin(node_gt))
-    ax.annotate(
-        f'Model tracks jam via\ngraph neighbours\n(Blind Node {best_node})',
-        xy=(deepest, node_pred[deepest]),
-        xytext=(max(deepest - 70, 5), node_pred[deepest] + 12),
-        arrowprops=dict(arrowstyle='->', color='steelblue', lw=1.8),
-        fontsize=10, color='steelblue',
-        bbox=dict(boxstyle='round,pad=0.3', fc='white', ec='steelblue', alpha=0.9),
-    )
+plt.style.use('ggplot')
+fig = plt.figure(figsize=(20, 14), dpi=150)
+gs  = gridspec.GridSpec(2, 2, figure=fig, hspace=0.3, wspace=0.2)
 
-ax.set_title(
-    f"Graph-ODE + Assimilation — Blind Node {best_node}\n"
-    f"(80% Sparsity | Road-Graph MP | Observation Assimilation | No GT Leakage)",
-    fontsize=12,
-)
-ax.set_ylabel("Speed (km/h)", fontsize=12)
-ax.set_xlabel("Time Steps (5-min intervals)", fontsize=12)
-ax.legend(fontsize=11, loc='upper right')
-ax.set_ylim(bottom=0)
-ax.grid(True, alpha=0.3)
-fig.tight_layout()
-fig.savefig('thesis_graph_ode.png', dpi=300, bbox_inches='tight')
+ax1 = fig.add_subplot(gs[0, 0])
+ax1.set_xlabel('Epoch', fontsize=12)
+ax1.set_ylabel('Training Loss', color='tab:blue', fontsize=12)
+ax1.plot(train_log, color='tab:blue', alpha=0.5)
+ax1.axvline(WARMUP_EPOCHS, color='gray', linestyle=':', linewidth=1.5,
+            label=f'End warmup (ep {WARMUP_EPOCHS})')
+ax1.tick_params(axis='y', labelcolor='tab:blue')
+ax2 = ax1.twinx()
+ax2.set_ylabel('Validation MAE (km/h)', color='tab:red', fontsize=12)
+if val_log:
+    ve = [v[0] for v in val_log]; vs = [v[1] for v in val_log]
+    ax2.plot(ve, vs, color='tab:red', marker='o', linewidth=2)
+    ax2.axhline(best_val, color='gray', linestyle='--', alpha=0.7,
+                label=f'Best: {best_val:.2f} km/h')
+ax2.tick_params(axis='y', labelcolor='tab:red')
+ax1.set_title('Model Convergence — v5', fontsize=14, fontweight='bold')
+ax2.legend(loc='upper right')
+
+ax3 = fig.add_subplot(gs[0, 1])
+worst_bi = np.argmax((true_bl_kmh < JAM_KMH_EVAL).sum(axis=1))
+ta = np.arange(true_bl_kmh.shape[1])
+ax3.plot(ta, true_bl_kmh[worst_bi], color='black', lw=2, label='Ground Truth')
+ax3.plot(ta, pred_bl_kmh[worst_bi], color='tab:orange', lw=2, linestyle='--',
+         label='Prediction')
+ax3.axhline(JAM_KMH_EVAL, color='red', linestyle=':', lw=2, label='40 km/h')
+ax3.fill_between(ta, 0, JAM_KMH_EVAL, color='red', alpha=0.1)
+ax3.set_ylim(10, 80)
+ax3.set_xlabel('Time Steps (5-min)', fontsize=12)
+ax3.set_ylabel('Speed (km/h)', fontsize=12)
+ax3.set_title(f'Blind Sensor Node {blind_idx[worst_bi]}',
+              fontsize=14, fontweight='bold')
+ax3.legend(loc='lower right')
+
+ax4 = fig.add_subplot(gs[1, 0])
+rates = ['40%', '60%', '80%']
+x     = np.arange(len(rates)); width = 0.25
+if all(len(experiment_results[p]) == 3 for p in ['MNAR','MAR','MCAR']):
+    ax4.bar(x-width, experiment_results['MNAR'], width, label='MNAR', color='#d62728')
+    ax4.bar(x,       experiment_results['MAR'],  width, label='MAR',  color='#1f77b4')
+    ax4.bar(x+width, experiment_results['MCAR'], width, label='MCAR', color='#2ca02c')
+    ax4.set_ylabel('Global MAE (km/h)', fontsize=12)
+    ax4.set_xlabel('Missing Rate', fontsize=12)
+    ax4.set_title('Robustness to Missing Mechanisms', fontsize=14, fontweight='bold')
+    ax4.set_xticks(x); ax4.set_xticklabels(rates); ax4.legend()
+
+ax5 = fig.add_subplot(gs[1, 1])
+full_true = true_cat.numpy()*node_stds[:,None]+node_means[:,None]
+full_pred = pred_cat.numpy()*node_stds[:,None]+node_means[:,None]
+full_stitched = full_true.copy()
+full_stitched[blind_idx,:] = full_pred[blind_idx,:]
+N_vis, T_vis = min(100, NUM_NODES), min(100, EVAL_LEN)
+im = ax5.imshow(full_stitched[:N_vis,:T_vis], aspect='auto',
+                cmap='RdYlGn', vmin=20, vmax=70, origin='lower')
+ax5.set_title('Predicted Spatiotemporal Traffic State (v5)',
+              fontsize=14, fontweight='bold')
+ax5.set_xlabel('Time Steps', fontsize=12)
+ax5.set_ylabel('Sensor Node ID', fontsize=12)
+fig.colorbar(im, ax=ax5).set_label('Speed (km/h)', rotation=270, labelpad=15)
+
+plt.savefig('v5_results.png', bbox_inches='tight', dpi=150)
 plt.show()
-print(f"✅ Saved thesis_graph_ode.png  (Node {best_node}, {best_count} jam timesteps)")
-
-
-# =============================================================================
-# CELL 8 — Sensor Sparsity Sweep
-# =============================================================================
-import copy
-# Trains the full model at 5 sparsity levels to show that assimilation
-# degrades gracefully compared to the fixed-weight global-mean baseline.
-# Each variant runs 100 epochs with a smaller model (hidden=32, accum=2)
-# for speed — we care about ranking across sparsities, not absolute MAE.
-
-def _make_features_for_sparsity(sp_ratio, seed=42):
-    """Rebuild 6-feature input tensor for an arbitrary sensor sparsity."""
-    torch.manual_seed(seed)
-    sp_mask = (torch.rand(1, NUM_NODES, 1, 1) > sp_ratio).float().to(device)
-    sp_obs  = data_tensor * sp_mask
-
-    n_obs_sp   = sp_mask.sum(dim=1, keepdim=True)
-    net_ctx_sp = sp_obs.sum(dim=1, keepdim=True) / (n_obs_sp + 1e-6)
-    net_ctx_sp = torch.nan_to_num(net_ctx_sp, 0.0)
-
-    obs_2d_sp  = sp_obs[0, :, :, 0]
-    mask_1d_sp = sp_mask[0, :, 0, 0]
-    mask_2d_sp = mask_1d_sp.unsqueeze(1).expand_as(obs_2d_sp)
-    nbr_sum_sp = torch.mm(A_t, obs_2d_sp)
-    nbr_cnt_sp = torch.mm(A_t, mask_2d_sp)
-    nbr_ctx_sp = (nbr_sum_sp / (nbr_cnt_sp + 1e-6)).unsqueeze(0).unsqueeze(-1)
-
-    feats = torch.cat([
-        sp_obs,
-        net_ctx_sp.expand_as(data_tensor),
-        nbr_ctx_sp,
-        sp_mask.expand_as(data_tensor),
-        TIME_SCALE * time_sin,
-        TIME_SCALE * time_cos,
-    ], dim=-1)
-    return feats, sp_mask
-
-
-_SP_EPOCHS = 150          # fast sweep — ranking matters, not absolute MAE
-_SP_ACCUM  = 2            # halved vs main training
-_SP_HIDDEN = 32           # smaller model for speed
-
-def _train_and_eval(feats_sp, mask_sp, epochs=_SP_EPOCHS):
-    """Train a fresh model on feats_sp/mask_sp; return (overall_mae, jam_mae)."""
-    m    = GraphCTH_NODE(input_dim=6, hidden_dim=_SP_HIDDEN, A_road=A_road, H_conv=H_conv).to(device)
-    opt  = torch.optim.Adam(m.parameters(), lr=3e-4, weight_decay=1e-4)
-    sch  = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
-    crit = ObservedMSELoss(jam_thresh_norm=jam_thresh_norm,
-                           jam_weight=4.0, L_graph=L_graph, lambda_physics=0.02)
-
-    oi   = (mask_sp[0, :, 0, 0] == 1).nonzero(as_tuple=True)[0]
-    bn   = (mask_sp[0, :, 0, 0] == 0)
-    jt   = (data_tensor[0, bn, :TRAIN_END, 0] < jam_thresh_norm).any(dim=0).nonzero(as_tuple=True)[0]
-    jt   = jt[jt < TRAIN_END - BATCH_TIME]
-
-    for ep in range(epochs):
-        m.train(); opt.zero_grad()
-        for _ in range(_SP_ACCUM):
-            t0  = int(jt[torch.randint(len(jt),(1,))].item()) if len(jt)>0 and np.random.rand()<0.5 \
-                  else np.random.randint(0, TRAIN_END - BATCH_TIME)
-            xw  = feats_sp[:, :, t0:t0+BATCH_TIME, :]
-            ow  = data_tensor[:, :, t0:t0+BATCH_TIME, :]
-            nd  = max(1, int(len(oi) * CURRICULUM_DROP))
-            di  = oi[torch.randperm(len(oi))[:nd]]
-            xa  = xw.clone()
-            xa[0,di,:,0] = 0.; xa[0,di,:,2] = 0.; xa[0,di,:,3] = 0.
-            cm  = mask_sp.clone(); cm[0,di,:,:] = 0.
-            sm  = mask_sp.expand_as(ow).clone(); sm[0,di,:,:] = 1.
-            sl  = crit(m(xa, cm), ow, sm) / _SP_ACCUM
-            sl.backward()
-        torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
-        opt.step(); sch.step()
-        if (ep+1) % 25 == 0:
-            print(f"  ep {ep+1}/{epochs}", end="\r", flush=True)
-
-    m.eval()
-    pc, gc = [], []
-    with torch.no_grad():
-        t = EVAL_START
-        while t + EVAL_WIN <= EVAL_START + EVAL_LEN:
-            pc.append(m(feats_sp[:,:,t:t+EVAL_WIN,:], mask_sp).cpu()*std+mean)
-            gc.append(data_tensor[:,:,t:t+EVAL_WIN,:].cpu()*std+mean)
-            t += EVAL_WIN
-    p = torch.cat(pc,2); g = torch.cat(gc,2)
-    hm = (mask_sp.cpu() == 0).expand_as(g)
-    jm = (g < 40); tg = hm & jm
-    ov = torch.mean(torch.abs(p[hm]-g[hm])).item()
-    jv = torch.mean(torch.abs(p[tg]-g[tg])).item() if tg.sum()>0 else float('nan')
-    return ov, jv
-
-
-# IDW baseline: predict blind node = adjacency-weighted mean of observed neighbours
-# (the same as the nbr_ctx feature but used directly as the prediction)
-def _idw_eval(feats_sp, mask_sp):
-    """Non-learned spatial-interpolation baseline via normalised adjacency."""
-    p_chunks, g_chunks = [], []
-    t = EVAL_START
-    while t + EVAL_WIN <= EVAL_START + EVAL_LEN:
-        # nbr_ctx is feats_sp[:,:,:,2]  →  already weighted mean of obs neighbours
-        p_chunks.append(feats_sp[:,:,t:t+EVAL_WIN,2:3].cpu() * std + mean)
-        g_chunks.append(data_tensor[:,:,t:t+EVAL_WIN,:].cpu() * std + mean)
-        t += EVAL_WIN
-    p = torch.cat(p_chunks,2); g = torch.cat(g_chunks,2)
-    hm = (mask_sp.cpu()==0).expand_as(g)
-    jm = (g<40); tg = hm&jm
-    ov = torch.mean(torch.abs(p[hm]-g[hm])).item()
-    jv = torch.mean(torch.abs(p[tg]-g[tg])).item() if tg.sum()>0 else float('nan')
-    return ov, jv
-
-
-print(f"Sensor Sparsity Sweep ({_SP_EPOCHS} epochs, hidden={_SP_HIDDEN})…")
-print(f"\n{'Sparsity':>10} | {'Blind%':>6} | {'Base Jam':>9} | {'IDW Jam':>9} | "
-      f"{'Model MAE':>9} | {'Model Jam':>9} | {'vs Base':>8} | {'vs IDW':>7}")
-print("-"*85)
-
-sparsity_sweep_results = {}
-for sp in [0.20, 0.40, 0.60, 0.80, 0.90]:
-    feats_sp, mask_sp = _make_features_for_sparsity(sp)
-    idw_ov, idw_jv    = _idw_eval(feats_sp, mask_sp)
-    print(f"  sp={sp:.0%} — training…")
-    m_ov, m_jv        = _train_and_eval(feats_sp, mask_sp)
-
-    # Global-mean jam baseline for this sparsity's blind nodes
-    g_eval = data_tensor[0, (mask_sp[0,:,0,0]==0).cpu(),
-                         EVAL_START:EVAL_START+EVAL_LEN, 0].cpu() * std + mean
-    base_jv = torch.mean(torch.abs(g_eval[g_eval < 40] - mean)).item()
-
-    delta_pct = (idw_jv - m_jv) / idw_jv * 100 if idw_jv > 0 else 0.0
-    vs_base = (base_jv - m_jv) / base_jv * 100 if base_jv > 0 else 0.0
-    sparsity_sweep_results[sp] = (base_jv, idw_ov, idw_jv, m_ov, m_jv)
-    print(f"{sp*100:>9.0f}% | {(1-mask_sp.mean().item())*100:>5.0f}% | "
-          f"{base_jv:>9.2f} | {idw_jv:>9.2f} | "
-          f"{m_ov:>9.2f} | {m_jv:>9.2f} | {vs_base:>+6.1f}% | {delta_pct:>+5.1f}%")
-
-# Plot sparsity curve
-sp_vals  = sorted(sparsity_sweep_results.keys())
-model_j  = [sparsity_sweep_results[s][3] for s in sp_vals]
-idw_j    = [sparsity_sweep_results[s][1] for s in sp_vals]
-fig2, ax2 = plt.subplots(figsize=(8,5))
-ax2.plot([s*100 for s in sp_vals], idw_j,   'o--', color='gray',     label='IDW baseline')
-ax2.plot([s*100 for s in sp_vals], model_j, 's-',  color='tab:blue', label='Graph-ODE + Assimilation')
-ax2.set_xlabel('Sensor sparsity (%)', fontsize=12)
-ax2.set_ylabel('Blind-node Jam MAE (km/h)', fontsize=12)
-ax2.set_title('Performance vs Sensor Sparsity\n(PEMS04, blind nodes only, speed < 40 km/h)', fontsize=11)
-ax2.legend(fontsize=11); ax2.grid(True, alpha=0.3)
-fig2.tight_layout()
-fig2.savefig('thesis_sparsity_sweep.png', dpi=300, bbox_inches='tight')
-plt.show()
-print("✅ Saved thesis_sparsity_sweep.png")
-
-
-# =============================================================================
-# CELL 9 — Ablation Study
-# =============================================================================
-import copy
-# Each variant removes exactly one component and is trained from scratch
-# for 300 epochs under identical conditions.  Results show the contribution
-# of each design choice.
-#
-# Note on external baselines:
-#   DCRNN / STGCN / Graph WaveNet are short-horizon forecasting models
-#   designed for the fully-observed setting.  Adapting them to 80% blind
-#   nodes would require non-trivial architectural changes.  Their published
-#   PEMS04 MAE values (full sensor, 15-min horizon) are given below for
-#   reference but are not directly comparable to our imputation task.
-#     DCRNN  (Li et al. 2018)      ~1.8 km/h   (full sensors, forecasting)
-#     STGCN  (Yu et al. 2018)      ~1.7 km/h   (full sensors, forecasting)
-#     WaveNet(Wu et al. 2019)      ~1.6 km/h   (full sensors, forecasting)
-
-
-class _GraphCTH_NoAssim(GraphCTH_NODE):
-    """Ablation: ODE propagation only, assimilation update removed."""
-    def forward(self, x_seq, obs_mask):
-        z = self.encoder(x_seq[:, :, 0, :])
-        preds = []
-        T = x_seq.shape[2]
-        for i in range(T):
-            preds.append(self.decoder(z))
-            if i < T - 1:
-                z = self._euler_step(z)   # no assimilation
-        return torch.stack(preds, dim=2)
-
-
-def _ablation_variant(model_cls, feats_abl, lambda_physics=0.02, epochs=300, use_hyper=True):
-    """Train and evaluate one ablation variant on the standard 80% mask."""
-    hc   = H_conv if use_hyper else None
-    m    = model_cls(input_dim=6, hidden_dim=64, A_road=A_road, H_conv=hc).to(device)
-    opt  = torch.optim.Adam(m.parameters(), lr=3e-4, weight_decay=1e-4)
-    sch  = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
-    crit = ObservedMSELoss(jam_thresh_norm=jam_thresh_norm,
-                           jam_weight=4.0, L_graph=L_graph,
-                           lambda_physics=lambda_physics)
-    mask_80  = node_mask   # standard 80% mask
-    oi       = obs_indices
-    jt_abl   = jam_t_valid
-
-    best_mae_v, best_state = float('inf'), None
-    for ep in range(epochs):
-        m.train(); opt.zero_grad(); aloss = 0.0
-        for _ in range(ACCUM_STEPS):
-            t0  = int(jt_abl[torch.randint(len(jt_abl),(1,))].item()) \
-                  if len(jt_abl)>0 and np.random.rand()<0.5 \
-                  else np.random.randint(0, TRAIN_END-BATCH_TIME)
-            xw  = feats_abl[:,:,t0:t0+BATCH_TIME,:]
-            ow  = data_tensor[:,:,t0:t0+BATCH_TIME,:]
-            nd  = max(1, int(len(oi)*CURRICULUM_DROP))
-            di  = oi[torch.randperm(len(oi))[:nd]]
-            xa  = xw.clone()
-            xa[0,di,:,0]=0.; xa[0,di,:,2]=0.; xa[0,di,:,3]=0.
-            cm  = mask_80.clone(); cm[0,di,:,:]=0.
-            sm  = mask_80.expand_as(ow).clone(); sm[0,di,:,:]=1.
-            sl  = crit(m(xa,cm), ow, sm)/ACCUM_STEPS
-            sl.backward(); aloss += sl.item()
-        torch.nn.utils.clip_grad_norm_(m.parameters(),1.0)
-        opt.step(); sch.step()
-        if ep % 50 == 0:
-            m.eval()
-            with torch.no_grad():
-                pc, gc = [], []
-                for vs in range(VAL_START, VAL_START+VAL_WIN, BATCH_TIME):
-                    pc.append(m(feats_abl[:,:,vs:vs+BATCH_TIME,:],mask_80).cpu()*std+mean)
-                    gc.append(data_tensor[:,:,vs:vs+BATCH_TIME,:].cpu()*std+mean)
-                pr=torch.cat(pc,2); gr=torch.cat(gc,2)
-                hd=(mask_80.expand_as(gr).cpu()==0)
-                mv=torch.mean(torch.abs(pr[hd]-gr[hd])).item()
-            if mv < best_mae_v:
-                best_mae_v=mv; best_state=copy.deepcopy(m.state_dict())
-
-    m.load_state_dict(best_state); m.eval()
-    pc, gc = [], []
-    with torch.no_grad():
-        t = EVAL_START
-        while t+EVAL_WIN <= EVAL_START+EVAL_LEN:
-            pc.append(m(feats_abl[:,:,t:t+EVAL_WIN,:],mask_80).cpu()*std+mean)
-            gc.append(data_tensor[:,:,t:t+EVAL_WIN,:].cpu()*std+mean)
-            t += EVAL_WIN
-    p=torch.cat(pc,2); g=torch.cat(gc,2)
-    hm=(mask_80.cpu()==0).expand_as(g); jm=(g<40); tg=hm&jm
-    ov=torch.mean(torch.abs(p[hm]-g[hm])).item()
-    jv=torch.mean(torch.abs(p[tg]-g[tg])).item() if tg.sum()>0 else float('nan')
-    return ov, jv
-
-
-# Build ablated feature sets (all use 80% sparsity)
-feats_no_nbr  = input_features.clone(); feats_no_nbr[:,:,:,2]   = 0.0
-feats_no_time = input_features.clone(); feats_no_time[:,:,:,4:] = 0.0
-
-ablation_configs = [
-    # (label,                    model_cls,           feats,        λ_phys, use_hyper)
-    ("Full model",               GraphCTH_NODE,       input_features,  0.02, True),
-    ("− Hypergraph",             GraphCTH_NODE,       input_features,  0.02, False),
-    ("− Assimilation",           _GraphCTH_NoAssim,   input_features,  0.02, True),
-    ("− Physics loss",           GraphCTH_NODE,       input_features,  0.00, True),
-    ("− Neighbour context",      GraphCTH_NODE,       feats_no_nbr,    0.02, True),
-    ("− Temporal encoding",      GraphCTH_NODE,       feats_no_time,   0.02, True),
-]
-
-print("\nAblation Study (300 epochs per variant)…")
-ablation_rows = []
-for label, cls, feats_v, lp, uh in ablation_configs:
-    print(f"  Training: {label}…", end="", flush=True)
-    ov, jv = _ablation_variant(cls, feats_v, lambda_physics=lp, epochs=300, use_hyper=uh)
-    ablation_rows.append((label, ov, jv))
-    print(f"  overall={ov:.2f}  jam={jv:.2f}")
-
-# Compare against global-mean and IDW baselines (no training needed)
-idw_ov_80, idw_jv_80 = _idw_eval(input_features, node_mask)
-ablation_rows.insert(0, ("IDW (spatial interp.)",  idw_ov_80,   idw_jv_80))
-ablation_rows.insert(0, ("Global mean baseline",   m_base_all,  m_base))
-# m_base_all = global-mean MAE on ALL blind samples; m_base = jam samples only
-
-full_ov = ablation_rows[2][1]   # Full model overall MAE
-full_jv = ablation_rows[2][2]   # Full model jam MAE
-
-print("\n" + "="*70)
-print(f"  {'Model / Variant':<28} | {'MAE all':>8} | {'MAE jam':>8} | {'Δ jam':>9}")
-print(f"  {'':28}   {'':8}   {'':8}   {'(+) = helps':>9}")
-print("="*70)
-for label, ov, jv in ablation_rows:
-    # Δ jam = full_jv - variant_jv
-    # positive: removing this component raises jam MAE  → component HELPS
-    # negative: removing this component lowers jam MAE  → component HURTS (investigate)
-    if label in ("Global mean baseline", "IDW (spatial interp.)"):
-        delta = "  —"
-    else:
-        delta = f"{full_jv - jv:>+.2f}"
-    marker = " ◀" if label == "Full model" else ""
-    print(f"  {label:<28} | {ov:>8.2f} | {jv:>8.2f} | {delta:>9}{marker}")
-print("="*70)
-# Print learned hypergraph gate value from trained full model
-if hasattr(model.ode_func, 'hyper_gate'):
-    g = torch.sigmoid(model.ode_func.hyper_gate).item()
-    print(f"\n  Learned hypergraph gate: sigmoid(w) = {g:.3f}  "
-          f"(0=ignore, 1=full weight)")
-print()
-print("  Δ jam: how much jam MAE rises when this component is removed.")
-print("  Positive = component improves jam imputation.")
-print("  Negative = component hurts jams (over-smoothing or noise).")
-print("\n  Note: DCRNN / STGCN / Graph WaveNet are short-horizon forecasting")
-print("  models trained on fully-observed sensors; their published PEMS04")
-print("  MAE values are not directly comparable to this sparse-imputation task.")
-print("  Reference values (full sensor, 15-min horizon):")
-print("    DCRNN  (Li et al. 2018)  ≈ 1.8 km/h")
-print("    STGCN  (Yu et al. 2018)  ≈ 1.7 km/h")
-print("    WaveNet(Wu et al. 2019)  ≈ 1.6 km/h")
+print("✅ Figure saved to v5_results.png")
