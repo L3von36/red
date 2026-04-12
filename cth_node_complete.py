@@ -1535,7 +1535,10 @@ class GRINPlusPlus(nn.Module):
     def training_step(self, x, m, tod_free=None, tod_jam=None):
         p = self._run(x, m, tod_free, tod_jam)
         # Hybrid loss: MAE for jams, MSE for free-flow (like v5)
-        jt = (50.0 - node_means[torch.arange(x.shape[0]).long()]) / node_stds[torch.arange(x.shape[0]).long()]
+        # Convert numpy arrays to tensors
+        node_means_t = torch.tensor(node_means, dtype=torch.float32).to(x.device)
+        node_stds_t = torch.tensor(node_stds, dtype=torch.float32).to(x.device)
+        jt = (50.0 - node_means_t[torch.arange(x.shape[0]).long()]) / node_stds_t[torch.arange(x.shape[0]).long()]
         jam_flag = (x < jt.unsqueeze(1)).float()
         free_flag = 1.0 - jam_flag
 
