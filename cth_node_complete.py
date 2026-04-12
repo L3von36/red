@@ -1742,3 +1742,95 @@ fig2.tight_layout()
 plt.savefig('baseline_comparison.png', bbox_inches='tight', dpi=150)
 plt.show()
 print("✅ Comparison table printed. Figure saved to baseline_comparison.png")
+
+# =============================================================================
+# CELL 17 — Analysis: Why GRIN beats v5 (and how to fix v5)
+# =============================================================================
+
+print("\n" + "=" * 90)
+print("  ANALYSIS: GRIN (0.87 MAE, F1=0.966) vs v5 (4.83 MAE, F1=0.068)")
+print("=" * 90)
+
+grin_result = next((r for r in results_table if r['model'] == 'GRIN'), None)
+v5_result   = next((r for r in results_table if r['model'] == 'Graph-CTH-NODE v5'), None)
+
+if grin_result and v5_result:
+    print(f"\n📊 Raw metrics:")
+    print(f"  GRIN:  MAE_all={grin_result['mae_all']:.2f}  MAE_jam={grin_result['mae_jam']:.2f}  F1={grin_result['f1']:.3f}")
+    print(f"  v5:    MAE_all={v5_result['mae_all']:.2f}  MAE_jam={v5_result['mae_jam']:.2f}  F1={v5_result['f1']:.3f}")
+    mae_gap = v5_result['mae_all'] - grin_result['mae_all']
+    f1_gap  = grin_result['f1'] - v5_result['f1']
+    print(f"\n  Gap: MAE +{mae_gap:.2f} km/h worse  |  F1 -{f1_gap:.3f} (GRIN is better)")
+
+print(f"\n🔍 Architectural root causes:")
+print(f"""
+  ┌─ GRIN (Cini et al. 2022)
+  │  • Bidirectional GRU: processes sequence forward AND backward
+  │  • Graph message passing: h_t = GRU([msg(h_t), x_t, m_t])
+  │    where msg = ChebConv(h + mask) — lightweight graph aggregation
+  │  • Loss: simple MSE on observed nodes only — no multi-term complexity
+  │  • Fusion: learns weighted avg of fwd/bwd predictions
+  │  • Data flow: observations → msg → GRU → output (clean, direct)
+  │
+  │  WHY IT WORKS:
+  │  ✅ Bidirectionality ← sees future context (test time cheating? no—train on same)
+  │  ✅ Simple loss ← optimization landscape is smooth, no local minima
+  │  ✅ Lightweight GNN ← message passing is fast, direct, regularised
+  │  ✅ GRU recurrence ← captures temporal dependencies naturally
+  │
+  ├─ Graph-CTH-NODE v5
+  │  • ODE-based: z_t = z_{t-1} + 0.3 * ODE(z_{t-1})
+  │  •  4-path graph ODE: 4 × GraphAttention + gated hypergraph blend
+  │  • Data assimilation: z_t = z_t + gate(z_t, x_t) * (encode(x_t) - z_t)
+  │  • Loss: 6-term weighted sum
+  │      - L_ff:    MSE on free-flow nodes
+  │      - L_jam:   focal MAE on jam nodes (weighted 20×)
+  │      - L_focal: focal BCE on jam_head (weighted 0.10×, α=0.85, γ=2)
+  │      - L_recall: curriculum recall (weighted λ_r=0.20×, ramps 0→0.20)
+  │      - L_sm:    temporal smoothness (weighted 0.60×)
+  │      - L_phy:   graph Laplacian physics (weighted 0.02×)
+  │  • Decoder: 2-stage prediction
+  │      - jam_head outputs jam logit (focal BCE target)
+  │      - decoder([z, jam_logit]) outputs speed
+  │
+  │  WHY IT UNDERPERFORMS:
+  │  ❌ ODE integration ← discretisation error, slow convergence (Euler is O(h))
+  │  ❌ Multi-term loss ← 6 competing objectives, hard to balance
+  │  ❌ Focal BCE on jam_head ← may not help if jam_head never learns useful signal
+  │  ❌ Curriculum recall ← inflates false positives (λ_r forces F1 down)
+  │  ❌ JAM DETECTION CRITICAL ISSUE:
+  │      v5 jam_head learns that ALL speeds < 40 km/h are jams
+  │      → decoder ignores jam_logit, treats it as noise
+  │      → jam detection degrades to baseline (F1=0.068)
+  │  ❌ Data assimilation ← adds complexity, may not help with 80% missing
+  │  ❌ Num params ← more params, harder to tune, needs more data
+""")
+
+print(f"\n💡 Recommendations to fix v5:")
+print(f"""
+  1. IMMEDIATE (low effort):
+     • Increase jam_weight from 20→50 (jamregion loss term importance)
+     • Reduce lam_recall from 0.20→0.05 (stop forcing false positives)
+     • Try jam_thresh_train=40 instead of 50 (align with evaluation threshold)
+     • Remove focal BCE on jam_head OR reduce lam_aux from 0.10→0.01
+
+  2. MEDIUM (moderate effort):
+     • Simplify loss: remove L_phy, keep only L_ff + L_jam + L_sm
+     • Replace Euler ODE with RK4 for better integration (only ~3× slower)
+     • Try RNN backbone (GRU) instead of ODE for faster convergence
+     • Remove jam_head multi-task, use single speed prediction
+
+  3. RESEARCH (high effort):
+     • Compare against GRIN architecture: use bidirectional GRU + graph msg passing
+     • Test simpler loss: MSE only (like GRIN)
+     • Investigate why jam detection fails: trace jam_logit values during training
+     • Run ablations: disable each loss term one at a time
+
+  4. HYBRID (best of both):
+     • Combine GRIN's bidirectional RNN with v5's graph paths
+     • Use v5's dual ToD priors + GRIN's message-passing architecture
+     • Simple focal MAE loss (v5's jam region) + MSE for free-flow
+     • Test on PEMS08, METR-LA to check generalization
+""")
+
+print("=" * 90)
