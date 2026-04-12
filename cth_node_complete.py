@@ -639,6 +639,10 @@ print(f"   Jam windows: {len(jam_t_valid)}")
 best_val, best_state, no_improve = float('inf'), None, 0
 train_log, val_log = [], []
 
+print(f"\n{'='*80}")
+print(f"Starting v5 training: {EPOCHS} epochs, jam_weight={20.0}, lam_recall_max={0.20}")
+print(f"{'='*80}\n")
+
 for epoch in range(1, EPOCHS + 1):
     model.train()
     optimizer.zero_grad()
@@ -697,8 +701,15 @@ for epoch in range(1, EPOCHS + 1):
         phase  = "warmup" if epoch <= WARMUP_EPOCHS else "cosine"
         lam_r  = criterion.get_lam_recall(epoch)
         cur_lr = optimizer.param_groups[0]['lr']
+
+        # DIAGNOSTIC: Check if predictions are collapsing to constant
+        pred_sample = p_v[0, blind, :, 0].cpu().numpy()
+        pred_var = pred_sample.var()
+        pred_mean = pred_sample.mean()
+
         print(f"Epoch {epoch:4d} | loss={epoch_loss:.4f} | val_MAE={val_mae:.2f} km/h | "
-              f"lr={cur_lr:.2e} | λ_recall={lam_r:.3f} [{phase}]")
+              f"lr={cur_lr:.2e} | λ_recall={lam_r:.3f} [{phase}] | "
+              f"pred_μ={pred_mean:.3f} σ={np.sqrt(pred_var):.3f}")
 
         if val_mae < best_val:
             best_val, best_state, no_improve = val_mae, copy.deepcopy(model.state_dict()), 0
@@ -709,6 +720,20 @@ for epoch in range(1, EPOCHS + 1):
                 break
 
 print(f"\nBest blind-node Val MAE: {best_val:.2f} km/h")
+
+# DIAGNOSTIC: Check training convergence
+if len(train_log) > 0:
+    print(f"\n📊 V5 Training Diagnostics:")
+    print(f"   Final train loss: {train_log[-1]:.4f}")
+    print(f"   Loss trend: ", end='')
+    if train_log[-1] < train_log[0]:
+        print(f"✅ Decreasing ({train_log[0]:.4f} → {train_log[-1]:.4f})")
+    else:
+        print(f"⚠️  NOT decreasing ({train_log[0]:.4f} → {train_log[-1]:.4f})")
+    print(f"   Total epochs: {len(train_log)}")
+    if len(val_log) > 0:
+        best_val_epoch = val_log[np.argmin([v[1] for v in val_log])][0]
+        print(f"   Best val MAE at epoch: {best_val_epoch}")
 
 # =============================================================================
 # CELL 9 — Evaluation with both speed-threshold and logit-threshold metrics
