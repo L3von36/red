@@ -1564,6 +1564,19 @@ def eval_grinpp_baseline(net, name):
 
     with torch.no_grad():
         p_e = net.impute(x_e, m_e, tod_free_e, tod_jam_e).cpu().numpy()  # [N, T]
+
+    # 🐛 FIX: Check for NaN/Inf predictions
+    if np.isnan(p_e).any():
+        print(f"❌ {name} has NaN predictions - skipping evaluation")
+        # Add dummy result to avoid breaking table
+        results_table.append({'model': name, 'mae_all': 999.0, 'mae_jam': 999.0,
+                             'prec': 0.0, 'rec': 0.0, 'f1': 0.0, 'ssim': 0.0})
+        return
+
+    if np.isinf(p_e).any():
+        print(f"⚠️  {name} has Inf predictions - clamping to [-5, 5]")
+        p_e = np.clip(p_e, -5, 5)
+
     pred_kmh = np.zeros((len(blind_idx), _T_eval), dtype=np.float32)
     for ni, n in enumerate(blind_idx):
         pred_kmh[ni] = p_e[n] * node_stds[n] + node_means[n]
@@ -1590,6 +1603,12 @@ def train_grinpp_baseline(model_cls, name, **kwargs):
         tod_free_b = torch.tensor(tod_free_np[:, t_slots].T, dtype=torch.float32).T.to(device)
         tod_jam_b  = torch.tensor(tod_jam_np[:, t_slots].T, dtype=torch.float32).T.to(device)
 
+        # 🐛 FIX: Check ToD priors for NaN before loss
+        if torch.isnan(tod_free_b).any() or torch.isnan(tod_jam_b).any():
+            print(f"⚠️  ToD priors contain NaN at ep {ep} - replacing with 0")
+            tod_free_b = torch.nan_to_num(tod_free_b, 0.0)
+            tod_jam_b = torch.nan_to_num(tod_jam_b, 0.0)
+
         loss = net.training_step(x_full, m_train, tod_free_b, tod_jam_b)
 
         if torch.isnan(loss) or torch.isinf(loss):
@@ -1598,7 +1617,7 @@ def train_grinpp_baseline(model_cls, name, **kwargs):
 
         opt.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)  # 🐛 FIX: Tighter clipping
         opt.step()
 
         if ep % 50 == 0:
