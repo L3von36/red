@@ -165,6 +165,7 @@ raw_speed = raw_all[:, :, CHAN_IDX]
 node_means = raw_speed[:TRAIN_END].mean(axis=0)
 node_stds  = raw_speed[:TRAIN_END].std(axis=0) + 1e-8
 data_norm_speed = (raw_speed - node_means) / node_stds
+speed_np = data_norm_speed  # [T, N] — alias for convenience
 
 # Normalise flow & occupancy globally
 for c in range(3):
@@ -577,36 +578,8 @@ def train_v6_model(hidden=64, epochs=300):
     return net
 
 
-v6_net = train_v6_model(hidden=64, epochs=300)
-
-
-def eval_v6(net, name='Graph-CTH-NODE v6'):
-    """Evaluate on test window with per-node denormalization"""
-    net.eval()
-    x_e = torch.tensor(speed_np[EVAL_START:EVAL_START+_T_eval, :], dtype=torch.float32).T.to(device)
-    m_e = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, _T_eval)
-
-    slot_idx_eval = np.arange(EVAL_START, EVAL_START + _T_eval) % 288
-    tod_free_eval = torch.tensor(tod_free_np[:, slot_idx_eval], dtype=torch.float32).to(device)
-    tod_jam_eval = torch.tensor(tod_jam_np[:, slot_idx_eval], dtype=torch.float32).to(device)
-
-    with torch.no_grad():
-        p_e = net.impute(x_e, m_e, tod_free_eval, tod_jam_eval).cpu().numpy()
-
-    pred_kmh = np.zeros((len(blind_idx), _T_eval), dtype=np.float32)
-    for ni, n in enumerate(blind_idx):
-        if np.isnan(p_e[n]).any():
-            pred_kmh[ni] = true_eval_kmh[ni]
-        else:
-            pred_kmh[ni] = np.clip(p_e[n] * node_stds[n] + node_means[n], 0, 120)
-
-    results_table.append({'model': name, **eval_pred_np(pred_kmh, true_eval_kmh)})
-    print(f"✅ {name} evaluated.")
-
-eval_v6(v6_net, 'Graph-CTH-NODE v6')
-
 # =============================================================================
-# CELL 6 — Metrics functions for evaluation
+# CELL 6 — Metrics functions for evaluation (moved before v6 training)
 # =============================================================================
 
 def compute_ssim(pred, target, data_range=None):
@@ -634,7 +607,7 @@ def jam_prec_recall(pred_kmh, true_kmh, thresh=40.0):
     return float(pr), float(rc), float(f1)
 
 # =============================================================================
-# CELL 7 — Prepare evaluation data and blind node indices
+# CELL 7 — Prepare evaluation data and blind node indices (moved before v6 training)
 # =============================================================================
 
 # Identify blind nodes (where node_mask[0,:,0,0]==0)
@@ -642,7 +615,7 @@ blind_idx = np.where(node_mask[0,:,0,0]==0)[0]
 print(f"✅ Blind nodes identified: {len(blind_idx)} nodes out of {NUM_NODES}")
 
 # =============================================================================
-# CELL 8 — Initialize results table and evaluation harness
+# CELL 8 — Initialize results table and evaluation harness (moved before v6 training)
 # =============================================================================
 
 # results_table: list of dicts keyed by model name
@@ -669,8 +642,39 @@ for ni, n in enumerate(blind_idx):
         * node_stds[n] + node_means[n]
     )
 
-# v6 result already computed and added via eval_v6()
 print("✅ Baseline harness ready. true_eval_kmh shape:", true_eval_kmh.shape)
+
+# =============================================================================
+# v6 Training and Evaluation
+# =============================================================================
+
+v6_net = train_v6_model(hidden=64, epochs=300)
+
+
+def eval_v6(net, name='Graph-CTH-NODE v6'):
+    """Evaluate on test window with per-node denormalization"""
+    net.eval()
+    x_e = torch.tensor(speed_np[EVAL_START:EVAL_START+_T_eval, :], dtype=torch.float32).T.to(device)
+    m_e = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, _T_eval)
+
+    slot_idx_eval = np.arange(EVAL_START, EVAL_START + _T_eval) % 288
+    tod_free_eval = torch.tensor(tod_free_np[:, slot_idx_eval], dtype=torch.float32).to(device)
+    tod_jam_eval = torch.tensor(tod_jam_np[:, slot_idx_eval], dtype=torch.float32).to(device)
+
+    with torch.no_grad():
+        p_e = net.impute(x_e, m_e, tod_free_eval, tod_jam_eval).cpu().numpy()
+
+    pred_kmh = np.zeros((len(blind_idx), _T_eval), dtype=np.float32)
+    for ni, n in enumerate(blind_idx):
+        if np.isnan(p_e[n]).any():
+            pred_kmh[ni] = true_eval_kmh[ni]
+        else:
+            pred_kmh[ni] = np.clip(p_e[n] * node_stds[n] + node_means[n], 0, 120)
+
+    results_table.append({'model': name, **eval_pred_np(pred_kmh, true_eval_kmh)})
+    print(f"✅ {name} evaluated.")
+
+eval_v6(v6_net, 'Graph-CTH-NODE v6')
 
 # =============================================================================
 # CELL 9 — Tier 1: Statistical baselines
@@ -761,7 +765,7 @@ BL_SEQ     = 48   # sequence window (same as BATCH_TIME)
 # Training data: [TIME_STEPS, NUM_NODES] speed (normalised)
 # We train on ALL nodes (blind and observed) using their actual values.
 # At eval, we only read predictions for blind nodes.
-speed_np = data_norm_speed  # [T, N]
+# (speed_np already defined at line 168: speed_np = data_norm_speed)
 
 # ─── GRU-D ───────────────────────────────────────────────────────────────────
 class GRUD(nn.Module):
