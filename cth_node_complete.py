@@ -147,13 +147,13 @@ time_sin = t_sin.view(1, 1, -1, 1).expand(1, NUM_NODES, -1, 1)  # [1,N,T,1]
 time_cos = t_cos.view(1, 1, -1, 1).expand(1, NUM_NODES, -1, 1)  # [1,N,T,1]
 
 # 6-feature input: [obs_speed, global_ctx, nbr_ctx, is_observed, t_sin, t_cos]
-# Temporal features are scaled to 0.25× their natural amplitude.
+# Temporal features are scaled to 0.15× their natural amplitude.
 # At full scale the encoder over-weighted daily rush-hour patterns: the model
 # learned to predict congestion at 7:40am / 7pm purely from time-of-day,
 # generating false jams at rush hours even for free-flowing blind nodes.
-# Scaling to 0.25 keeps the periodicity signal (helpful for observed-node
+# Scaling to 0.15 keeps the periodicity signal (helpful for observed-node
 # context) without letting it dominate over spatial / sensor evidence.
-TIME_SCALE     = 0.25
+TIME_SCALE     = 0.15
 obs_flag       = node_mask.expand_as(data_tensor)              # [1,N,T,1]
 context_feat   = network_context.expand_as(data_tensor)        # [1,N,T,1]
 input_features = torch.cat(
@@ -233,7 +233,8 @@ class GraphAttention(nn.Module):
         e     = e.masked_fill(A < 1e-9, float('-inf'))                # mask non-edges
         alpha = torch.softmax(e / self.temperature, dim=-1)           # [B, N, N]
         alpha = torch.nan_to_num(alpha, 0.0)                          # isolated-node safety
-        return torch.bmm(alpha, Wx)                                   # [B, N, out_dim]
+        # Residual connection: add input to attention output for better gradient flow
+        return torch.bmm(alpha, Wx) + x                               # [B, N, out_dim]
 
 
 class HypergraphConv(nn.Module):
@@ -261,19 +262,16 @@ class GraphODEFunc(nn.Module):
             self.register_buffer('H_conv', H_conv)     # [N, N]
         else:
             self.H_conv = None
-        self.gat1  = GraphAttention(hidden_dim, hidden_dim)
-        self.gat2  = GraphAttention(hidden_dim, hidden_dim)
+        self.gat1  = GraphAttention(hidden_dim, hidden_dim, temperature=3.0)
+        self.gat2  = GraphAttention(hidden_dim, hidden_dim, temperature=3.0)
         self.hconv = HypergraphConv(hidden_dim, hidden_dim) if H_conv is not None else None
         self.act   = nn.Tanh()
         self.norm  = nn.LayerNorm(hidden_dim)
         # Learnable gate for hypergraph contribution.
-        # Initialised at -2 so sigmoid(-2) ≈ 0.12 — the model starts with a weak
-        # hypergraph signal and learns to amplify it only when group context helps.
-        # Without a gate, the 2-hop aggregation over-smooths jam nodes (a jammed
-        # node whose 20 hyperedge-neighbours are all free-flowing gets a high
-        # group output, actively contradicting the jam signal).
+        # Initialised at -1.5 so sigmoid(-1.5) ≈ 0.18 — slightly stronger hypergraph signal
+        # to help blind nodes capture corridor-level patterns without over-smoothing.
         if H_conv is not None:
-            self.hyper_gate = nn.Parameter(torch.tensor(-2.0))
+            self.hyper_gate = nn.Parameter(torch.tensor(-1.5))
 
     def forward(self, t, x):
         A     = self.A.expand(x.size(0), -1, -1)
@@ -301,12 +299,14 @@ class AssimilationUpdate(nn.Module):
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.Sigmoid(),
         )
+        # LayerNorm on encoder output for stable assimilation
+        self.norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, z, x_new, obs_mask):
         # z:        [B, N, H]
         # x_new:    [B, N, F]
         # obs_mask: [B, N, 1]  — 1=observed, 0=blind
-        z_obs  = self.obs_encoder(x_new)
+        z_obs  = self.norm(self.obs_encoder(x_new))
         gate   = self.gate(torch.cat([z, z_obs], dim=-1))
         update = gate * (z_obs - z) * obs_mask   # blind nodes zeroed out
         return z + update
@@ -321,10 +321,10 @@ class GraphCTH_NODE(nn.Module):
         self.decoder    = nn.Linear(hidden_dim, 1)
 
     def _euler_step(self, z):
-        """Single Euler step with dt=0.3.
+        """Single Euler step with dt=0.5.
         dt<1 dampens hidden-state momentum so the model recovers from a jam
         smoothly rather than oscillating after the congestion clears."""
-        return z + 0.3 * self.ode_func(None, z)
+        return z + 0.5 * self.ode_func(None, z)
 
     def forward(self, x_seq, obs_mask):
         """
@@ -377,7 +377,7 @@ class ObservedMSELoss(nn.Module):
         else:
             self.L = None
 
-    def forward(self, pred, obs, sup_mask, lambda_smooth=0.60):
+    def forward(self, pred, obs, sup_mask, lambda_smooth=0.40):
         # 1 — jam-weighted observation loss
         w        = torch.where(obs < self.jam_thresh,
                                torch.full_like(obs, self.jam_weight),
@@ -400,14 +400,14 @@ class ObservedMSELoss(nn.Module):
 # =============================================================================
 # CELL 5 — Training with curriculum masking
 # =============================================================================
-model     = GraphCTH_NODE(input_dim=6, hidden_dim=64, A_road=A_road, H_conv=H_conv).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=3e-4, weight_decay=1e-4)
+model     = GraphCTH_NODE(input_dim=6, hidden_dim=128, A_road=A_road, H_conv=H_conv).to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=400)
 
 jam_thresh_norm = (40.0 - mean) / (std + 1e-8)   # 40 km/h in normalised space
 criterion       = ObservedMSELoss(
     jam_thresh_norm=jam_thresh_norm,
-    jam_weight=4.0,           # 5× still over-triggered on rush-hour temporal signal
+    jam_weight=2.5,           # reduced from 4.0 to prevent over-predicting jams
     L_graph=L_graph,          # physics Laplacian regulariser
     lambda_physics=0.02,
 )
@@ -416,7 +416,7 @@ TRAIN_END       = 4000   # hard cutoff — no overlap with val/eval
 VAL_START       = 4000
 VAL_WIN         = 240    # 240-step val window — stable MAE estimate
 BATCH_TIME      = 48
-CURRICULUM_DROP = 0.15   # hide 15% of observed nodes as pseudo-blind per batch
+CURRICULUM_DROP = 0.10   # reduced from 0.15: hide 10% of observed nodes as pseudo-blind per batch
 best_mae        = float('inf')
 mask_4d         = node_mask   # [1, N, 1, 1]
 obs_indices     = (node_mask[0, :, 0, 0] == 1).nonzero(as_tuple=True)[0]
@@ -436,7 +436,7 @@ ACCUM_STEPS = 4   # accumulate gradients over 4 windows per update — smooths
                #   (low loss) batches that causes the oscillating val MAE
 
 print("Training Graph-ODE + Assimilation (Euler, curriculum masking)...")
-for epoch in range(800):
+for epoch in range(600):
     model.train()
     optimizer.zero_grad()
 
