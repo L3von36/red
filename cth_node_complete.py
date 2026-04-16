@@ -611,7 +611,7 @@ def jam_prec_recall(pred_kmh, true_kmh, thresh=40.0):
 # =============================================================================
 
 # Identify blind nodes (where node_mask[0,:,0,0]==0)
-blind_idx = np.where(node_mask[0,:,0,0]==0)[0]
+blind_idx = np.where(node_mask[0,:,0,0].cpu().numpy()==0)[0]
 print(f"✅ Blind nodes identified: {len(blind_idx)} nodes out of {NUM_NODES}")
 
 # =============================================================================
