@@ -360,6 +360,36 @@ assert (input_features[0, node_mask[0,:,0,0]==0, :, 4] == 0).all(), "Leakage!"
 print("✅ Leakage check passed.")
 
 # =============================================================================
+# Helper functions for Chebyshev graph convolution (needed by v6)
+# =============================================================================
+
+def diffusion_cheby(A, K=2):
+    """Returns list of K Chebyshev graph conv matrices."""
+    D     = A.sum(1)
+    D_inv = torch.where(D > 0, 1.0/D, torch.zeros_like(D))
+    Anorm = A * D_inv.unsqueeze(1)
+    mats  = [torch.eye(NUM_NODES, device=device), Anorm]
+    for k in range(2, K):
+        mats.append(2*torch.mm(Anorm, mats[-1]) - mats[-2])
+    return mats  # list of [N,N]
+
+cheby_mats = diffusion_cheby(A_t, K=3)
+
+class ChebConv(nn.Module):
+    """Chebyshev graph convolution layer"""
+    def __init__(self, in_dim, out_dim, K=3):
+        super().__init__()
+        self.K    = K
+        self.Ws   = nn.ModuleList([nn.Linear(in_dim, out_dim, bias=(k==0))
+                                   for k in range(K)])
+        self.mats = cheby_mats
+
+    def forward(self, x):
+        # x: [N, F]
+        out = sum(self.Ws[k](torch.mm(self.mats[k], x)) for k in range(self.K))
+        return out
+
+# =============================================================================
 # =============================================================================
 # CELL 5 — Graph-CTH-NODE v6: GRIN++ baseline + ToD priors + Enhanced mixing
 # =============================================================================
@@ -945,31 +975,7 @@ GNN_EPOCHS  = 300
 GNN_LR      = 3e-3
 GNN_BATCH   = 48
 
-# Pre-compute diffusion matrices for GNN baselines
-def diffusion_cheby(A, K=2):
-    """Returns list of K Chebyshev graph conv matrices."""
-    D     = A.sum(1)
-    D_inv = torch.where(D > 0, 1.0/D, torch.zeros_like(D))
-    Anorm = A * D_inv.unsqueeze(1)
-    mats  = [torch.eye(NUM_NODES, device=device), Anorm]
-    for k in range(2, K):
-        mats.append(2*torch.mm(Anorm, mats[-1]) - mats[-2])
-    return mats  # list of [N,N]
-
-cheby_mats = diffusion_cheby(A_t, K=3)
-
-class ChebConv(nn.Module):
-    def __init__(self, in_dim, out_dim, K=3):
-        super().__init__()
-        self.K    = K
-        self.Ws   = nn.ModuleList([nn.Linear(in_dim, out_dim, bias=(k==0))
-                                   for k in range(K)])
-        self.mats = cheby_mats
-
-    def forward(self, x):
-        # x: [N, F]
-        out = sum(self.Ws[k](torch.mm(self.mats[k], x)) for k in range(self.K))
-        return out
+# Diffusion matrices already computed earlier (CELL 4.5)
 
 def train_gnn_baseline(model_cls, name, **kwargs):
     # Fresh seed per model for reproducibility
