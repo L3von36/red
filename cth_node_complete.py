@@ -151,6 +151,9 @@ VAL_END    = min(TRAIN_END + 240, int(0.9 * TIME_STEPS))
 EVAL_START = min(VAL_END + 260, int(0.9 * TIME_STEPS))
 EVAL_LEN   = min(450, TIME_STEPS - EVAL_START)
 
+# Batch/sequence window size
+BATCH_TIME = 48
+
 VAL_START = TRAIN_END
 print(f"   Train: t=0–{TRAIN_END} | Val: t={VAL_START}–{VAL_END} | Eval: t={EVAL_START}–{EVAL_START+EVAL_LEN}")
 
@@ -361,13 +364,9 @@ print("✅ Leakage check passed.")
 # CELL 5 — Graph-CTH-NODE v6: GRIN++ baseline + ToD priors + Enhanced mixing
 # =============================================================================
 #
-# =============================================================================
-# CELL 5 — Graph-CTH-NODE v6: GRIN++ baseline + ToD priors + Enhanced mixing
-# =============================================================================
-#
 # WINNING FORMULA (learned from GRIN++):
 #   - Bidirectional RNN (proven > ODE/Transformer)
-#   - Per-node learned path mixing (adaptive graph selection)  
+#   - Per-node learned path mixing (adaptive graph selection)
 #   - Simple 2-term loss: MSE(free-flow) + MAE(jams)
 #   - Tight gradient clipping (0.5)
 #   - Residual skip connections
@@ -576,12 +575,44 @@ def eval_v6(net, name='Graph-CTH-NODE v6'):
 
 eval_v6(v6_net, 'Graph-CTH-NODE v6')
 
+# =============================================================================
+# CELL 6 — Metrics functions for evaluation
+# =============================================================================
+
+def compute_ssim(pred, target, data_range=None):
+    """Compute Structural Similarity Index (SSIM) for spatiotemporal field"""
+    if data_range is None:
+        data_range = float(target.max() - target.min()) + 1e-8
+    C1 = (0.01 * data_range)**2
+    C2 = (0.03 * data_range)**2
+    mu_p, mu_t = pred.mean(), target.mean()
+    sig_p, sig_t = pred.std(), target.std()
+    sig_pt = ((pred - mu_p) * (target - mu_t)).mean()
+    return float(((2*mu_p*mu_t+C1)*(2*sig_pt+C2)) /
+                 ((mu_p**2+mu_t**2+C1)*(sig_p**2+sig_t**2+C2)))
+
+def jam_prec_recall(pred_kmh, true_kmh, thresh=40.0):
+    """Compute jam detection metrics (precision, recall, F1) using speed threshold"""
+    p_j = pred_kmh < thresh
+    t_j = true_kmh < thresh
+    tp = (p_j & t_j).sum()
+    fp = (p_j & ~t_j).sum()
+    fn = (~p_j & t_j).sum()
+    pr = tp / (tp + fp + 1e-8)
+    rc = tp / (tp + fn + 1e-8)
+    f1 = 2 * pr * rc / (pr + rc + 1e-8)
+    return float(pr), float(rc), float(f1)
 
 # =============================================================================
-# CELL 12 — Baseline evaluation harness
-#   Same blind_idx, same test window [EVAL_START, EVAL_START+EVAL_LEN),
-#   same denormalisation, same jam_prec_recall. All baselines append to
-#   `results_table` which CELL 22 prints as the final comparison table.
+# CELL 7 — Prepare evaluation data and blind node indices
+# =============================================================================
+
+# Identify blind nodes (where node_mask[0,:,0,0]==0)
+blind_idx = np.where(node_mask[0,:,0,0]==0)[0]
+print(f"✅ Blind nodes identified: {len(blind_idx)} nodes out of {NUM_NODES}")
+
+# =============================================================================
+# CELL 8 — Initialize results table and evaluation harness
 # =============================================================================
 
 # results_table: list of dicts keyed by model name
@@ -612,7 +643,7 @@ for ni, n in enumerate(blind_idx):
 print("✅ Baseline harness ready. true_eval_kmh shape:", true_eval_kmh.shape)
 
 # =============================================================================
-# CELL 13 — Tier 1: Statistical baselines
+# CELL 9 — Tier 1: Statistical baselines
 #   Global Mean, Historical Average, IDW, Linear Interpolation, KNN Kriging
 #   No training required — deterministic from training data.
 # =============================================================================
@@ -682,7 +713,7 @@ print("✅ KNN Kriging done.")
 print(f"   Tier 1 complete — {len(results_table)} entries in results_table.")
 
 # =============================================================================
-# CELL 14 — Tier 2: RNN / temporal baselines (no graph)
+# CELL 10 — Tier 2: RNN / temporal baselines (no graph)
 #   GRU-D  (Che et al. 2018)  — GRU with time-decay imputation
 #   BRITS  (Cao et al. 2018)  — Bidirectional RNN with regression imputation
 #   SAITS  (Du et al. 2023)   — Self-Attention Imputation (transformer-style)
@@ -894,7 +925,7 @@ eval_rnn_baseline(saits_net, 'SAITS')
 print(f"   Tier 2 complete — {len(results_table)} entries in results_table.")
 
 # =============================================================================
-# CELL 15 — Tier 3: GNN imputation baselines
+# CELL 11 — Tier 3: GNN imputation baselines
 #
 #   IGNNK  (Ye et al. 2021)  — random subgraph kriging, diffusion GCN
 #   GRIN   (Cini et al. 2022) — bidirectional recurrent GNN, message passing
@@ -1708,7 +1739,7 @@ eval_gnn_baseline(adgcn_net, 'ADGCN')
 print(f"   Tier 3 complete — {len(results_table)} entries in results_table.")
 
 # =============================================================================
-# CELL 16 — Final comparison table + bar chart
+# CELL 12 — Final comparison table + bar chart
 # =============================================================================
 
 # DEDUPLICATION: Keep best run per model (lowest MAE all)
@@ -1817,7 +1848,7 @@ plt.show()
 print("✅ Comparison table printed. Figure saved to baseline_comparison.png")
 
 # =============================================================================
-# CELL 17 — Analysis: Graph-CTH-NODE v6 vs Baselines
+# CELL 13 — Analysis: Graph-CTH-NODE v6 vs Baselines
 # =============================================================================
 
 print("\n" + "=" * 90)
