@@ -409,8 +409,8 @@ class GraphCTHNodeV6Cell(nn.Module):
         self.path_bias = nn.Parameter(torch.randn(4) * 0.1)
         self.mix_w = nn.Linear(hidden, 4)
 
-        # GRU: [msg, x, mask, (tod)]
-        gru_in_dim = hidden + 1 + 1 + (2 if include_tod else 0)
+        # GRU: [msg, x, mask, m_prop, (tod)]
+        gru_in_dim = hidden + 1 + 1 + 1 + (2 if include_tod else 0)  # +1 for m_prop_seq
         self.gru = nn.GRUCell(gru_in_dim, hidden)
         self.out = nn.Linear(hidden, 1)
         self.act = nn.Tanh()
@@ -419,6 +419,15 @@ class GraphCTHNodeV6Cell(nn.Module):
         N, T = x_seq.shape
         h = torch.zeros(N, self.hidden, device=x_seq.device)
         preds = []
+
+        # GRIN++ FIX #1: Propagate observation mask through graph
+        # Tell each node: "What % of my neighbors are observed?"
+        # v6 blind nodes don't know if neighbors are trustworthy
+        # GRIN++ propagates mask to give explicit context: "I'm surrounded by 80% observed"
+        A_prop = torch.tensor(adj_sym, dtype=torch.float32).to(x_seq.device)  # [N, N]
+        degree = A_prop.sum(dim=1, keepdim=True) + 1e-8  # [N, 1]
+        m_prop_seq = torch.mm(A_prop, m_seq) / degree  # [N, T] normalized by degree
+        # m_prop_seq[i, t] = fraction of node i's neighbors that are observed at time t
 
         for t in range(T):
             if self.include_tod and tod_free_seq is not None:
@@ -439,10 +448,14 @@ class GraphCTHNodeV6Cell(nn.Module):
 
             x_t = x_seq[:,t:t+1]
             if self.include_tod and tod_free_seq is not None:
-                inp = torch.cat([msg, x_t, m_seq[:,t:t+1],
+                inp = torch.cat([msg, x_t, m_seq[:,t:t+1], m_prop_seq[:,t:t+1],
                                 tod_free_seq[:,t:t+1], tod_jam_seq[:,t:t+1]], dim=-1)
+                #                             ^^^^^^^^^^^^^^
+                #                             NEW: mask propagation!
             else:
-                inp = torch.cat([msg, x_t, m_seq[:,t:t+1]], dim=-1)
+                inp = torch.cat([msg, x_t, m_seq[:,t:t+1], m_prop_seq[:,t:t+1]], dim=-1)
+                #                             ^^^^^^^^^^^^^^
+                #                             NEW: mask propagation!
 
             h_new = self.gru(inp, h)
             skip_weight = 0.1 + 0.05 * (1.0 - m_seq[:,t:t+1])
