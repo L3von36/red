@@ -483,15 +483,20 @@ class GraphCTHNodeV6(nn.Module):
         loss_free = torch.mean(((p - x) * m * free_flag) ** 2)
         loss_jam = torch.mean(torch.abs(p - x) * m * jam_flag) * 3.0
 
-        # Spatial smoothness loss: penalize sharp differences between neighbors
-        lam_spatial = 0.1
+        # Spatial smoothness loss: penalize sharp differences between neighbors (only on observed)
+        lam_spatial = 0.01
         A_spatial = torch.tensor(adj_sym, dtype=torch.float32).to(x.device)  # [N, N]
         spatial_diff = 0.0
         for i in range(p.shape[0]):
             neighbors = torch.where(A_spatial[i] > 1e-6)[0]
             if len(neighbors) > 0:
-                neighbor_diffs = torch.abs(p[i:i+1, :] - p[neighbors, :])  # [n_neighbors, T]
-                spatial_diff = spatial_diff + torch.mean(neighbor_diffs)
+                # Only penalize differences where BOTH nodes are observed
+                mask_i = m[i:i+1, :]  # [1, T]
+                mask_neighbors = m[neighbors, :]  # [n_neighbors, T]
+                mask_both = mask_i * mask_neighbors  # [n_neighbors, T]
+                neighbor_diffs = torch.abs(p[i:i+1, :] - p[neighbors, :]) * mask_both  # [n_neighbors, T]
+                if mask_both.sum() > 0:
+                    spatial_diff = spatial_diff + neighbor_diffs.sum() / (mask_both.sum() + 1e-8)
         spatial_diff = spatial_diff / (p.shape[0] + 1e-8)
         loss_spatial = lam_spatial * spatial_diff
 
