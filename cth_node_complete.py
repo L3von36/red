@@ -475,13 +475,29 @@ class GraphCTHNodeV6(nn.Module):
 
     def training_step(self, x, m, tod_free=None, tod_jam=None, epoch=1):
         p = self._run(x, m, tod_free, tod_jam)
+
+        # GRIN++ FIX #2: Only train on OBSERVED nodes (those with real ground truth)
+        # v6 was training on blind nodes (80%) which have no real data = fitting to noise
+        # GRIN++ trains only on observed nodes (20%) which have real sensor data = clean signal
+        mask_obs = node_mask[0, :, 0, 0] == 1  # [N] boolean: True for observed nodes
+
+        # Filter to only observed nodes
+        p_obs = p[mask_obs, :]  # [n_obs, T] predictions for observed nodes only
+        x_obs = x[mask_obs, :]  # [n_obs, T] targets for observed nodes only
+        m_obs = m[mask_obs, :]  # [n_obs, T] mask for observed nodes only
+
+        # Compute jam/free flags for observed nodes only
         node_means_t = torch.tensor(node_means, dtype=torch.float32).to(x.device)
         node_stds_t = torch.tensor(node_stds, dtype=torch.float32).to(x.device)
-        jt = (50.0 - node_means_t[torch.arange(x.shape[0]).long()]) / node_stds_t[torch.arange(x.shape[0]).long()]
-        jam_flag = (x < jt.unsqueeze(1)).float()
+        means_obs = node_means_t[mask_obs]  # [n_obs]
+        stds_obs = node_stds_t[mask_obs]    # [n_obs]
+        jt_obs = (50.0 - means_obs) / stds_obs  # [n_obs]
+        jam_flag = (x_obs < jt_obs.unsqueeze(1)).float()  # [n_obs, T]
         free_flag = 1.0 - jam_flag
-        loss_free = torch.mean(((p - x) * m * free_flag) ** 2)
-        loss_jam = torch.mean(torch.abs(p - x) * m * jam_flag) * 3.0
+
+        # Loss computed ONLY on observed nodes (clean training signal)
+        loss_free = torch.mean(((p_obs - x_obs) * m_obs * free_flag) ** 2)
+        loss_jam = torch.mean(torch.abs(p_obs - x_obs) * m_obs * jam_flag) * 3.0
 
         # Spatial smoothness loss: penalize sharp differences between neighbors (only on observed)
         lam_spatial = 0.01
