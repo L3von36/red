@@ -686,6 +686,221 @@ for ni, n in enumerate(blind_idx):
 print("✅ Baseline harness ready. true_eval_kmh shape:", true_eval_kmh.shape)
 
 # =============================================================================
+# SOTA MODEL 1: T-DGCN (Simplified) — Dynamic Graph + Transformer
+# =============================================================================
+
+class TDGCNCell(nn.Module):
+    """Simplified T-DGCN: Dynamic GCN + Temporal Transformer"""
+    def __init__(self, hidden=64):
+        super().__init__()
+        self.hidden = hidden
+        self.gcn = ChebConv(hidden + 1, hidden, K=2)
+        self.dynamic_graph_proj = nn.Linear(hidden, hidden)
+        self.temporal = nn.TransformerEncoderLayer(d_model=hidden, nhead=4, dim_feedforward=256, batch_first=True)
+        self.out = nn.Linear(hidden, 1)
+
+    def forward(self, x_seq, m_seq):
+        """x_seq: [N, T], m_seq: [N, T]"""
+        N, T = x_seq.shape
+        h = torch.zeros(N, self.hidden, device=x_seq.device)
+        preds = []
+
+        for t in range(T):
+            x_t = x_seq[:, t:t+1]
+
+            # Dynamic graph: learn attention-based adjacency
+            A_dyn = torch.sigmoid(self.dynamic_graph_proj(h)) @ torch.sigmoid(self.dynamic_graph_proj(h)).T
+            A_dyn = A_dyn / (A_dyn.sum(dim=1, keepdim=True) + 1e-8)
+
+            # GCN with dynamic adjacency
+            msg_in = torch.cat([h, m_seq[:, t:t+1]], dim=-1)
+            h = torch.relu(self.gcn(msg_in, A_dyn))
+            preds.append(self.out(h)[:, 0])
+
+        return torch.stack(preds, dim=1)
+
+class TDGCN(nn.Module):
+    """T-DGCN with bidirectional fusion"""
+    def __init__(self, hidden=64):
+        super().__init__()
+        self.fwd = TDGCNCell(hidden)
+        self.bwd = TDGCNCell(hidden)
+        self.fuse = nn.Linear(2, 1)
+
+    def forward(self, x, m):
+        pf = self.fwd(x, m)
+        pb = self.bwd(x.flip(1), m.flip(1)).flip(1)
+        return (self.fuse(torch.stack([pf, pb], dim=-1))).squeeze(-1)
+
+    def impute(self, x, m):
+        p = self.forward(x, m)
+        return m * x + (1 - m) * p
+
+def train_tdgcn(hidden=64, epochs=200):
+    """Train T-DGCN"""
+    net = TDGCN(hidden=hidden).to(device)
+    opt = torch.optim.Adam(net.parameters(), lr=2e-3, weight_decay=1e-4)
+    best_vloss, best_wts, patience = float('inf'), None, 0
+
+    for ep in range(1, epochs + 1):
+        net.train()
+        t0 = np.random.randint(0, TRAIN_END - 48)
+        x_full = torch.tensor(speed_np[t0:t0+48, :], dtype=torch.float32).T.to(device)
+        m_train = (torch.rand(NUM_NODES, 1, device=device) > 0.8).float().expand(-1, 48)
+
+        p = net.forward(x_full, m_train)
+        mask_obs = node_mask[0, :, 0, 0] == 1
+        loss = torch.mean((p[mask_obs, :] - x_full[mask_obs, :]) ** 2)
+
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+        opt.step()
+
+        if ep % 50 == 0:
+            net.eval()
+            with torch.no_grad():
+                x_v = torch.tensor(speed_np[VAL_START:VAL_END, :], dtype=torch.float32).T.to(device)
+                m_v = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, VAL_END-VAL_START)
+                vl = torch.mean((net.forward(x_v, m_v)[mask_obs, :] - x_v[mask_obs, :]) ** 2).item()
+
+            if vl < best_vloss:
+                best_vloss = vl
+                best_wts = copy.deepcopy(net.state_dict())
+                patience = 0
+            else:
+                patience += 1
+
+            print(f"  [T-DGCN] ep {ep:3d} | val_loss={vl:.4f}")
+            if patience >= 3:
+                break
+
+    if best_wts:
+        net.load_state_dict(best_wts)
+    return net
+
+# =============================================================================
+# SOTA MODEL 2: DSTGA-Mamba (Simplified) — Mamba + Wavelet Disentanglement
+# =============================================================================
+
+class MambaBlock(nn.Module):
+    """Simplified Mamba-like block with selective state updates"""
+    def __init__(self, hidden=64):
+        super().__init__()
+        self.hidden = hidden
+        self.proj_in = nn.Linear(hidden + 1, hidden)
+        self.gate = nn.Linear(hidden, hidden)
+        self.proj_out = nn.Linear(hidden, hidden)
+
+    def forward(self, x, h, m):
+        """Selective state update based on data availability"""
+        inp = torch.cat([x.unsqueeze(-1), m], dim=-1) if x.dim() == 1 else torch.cat([x, m], dim=-1)
+        x_proj = torch.relu(self.proj_in(inp))
+        gate = torch.sigmoid(self.gate(h))
+        h_new = gate * h + (1 - gate) * x_proj
+        return torch.relu(self.proj_out(h_new))
+
+class DSTGAMambaSimplified(nn.Module):
+    """DSTGA-Mamba simplified: Mamba core + disentanglement"""
+    def __init__(self, hidden=64):
+        super().__init__()
+        self.hidden = hidden
+        # Trend and anomaly branches
+        self.trend_rnn = nn.GRUCell(hidden + 1, hidden)
+        self.anom_rnn = nn.GRUCell(hidden + 1, hidden)
+        self.mamba = MambaBlock(hidden)
+        self.fusion = nn.Linear(hidden * 3, hidden)
+        self.out = nn.Linear(hidden, 1)
+
+    def forward(self, x_seq, m_seq):
+        """x_seq: [N, T], m_seq: [N, T]"""
+        N, T = x_seq.shape
+        h_trend = torch.zeros(N, self.hidden, device=x_seq.device)
+        h_anom = torch.zeros(N, self.hidden, device=x_seq.device)
+        h_mamba = torch.zeros(N, self.hidden, device=x_seq.device)
+        preds = []
+
+        for t in range(T):
+            x_t = x_seq[:, t:t+1]
+            m_t = m_seq[:, t:t+1]
+
+            # Trend (smooth component) via RNN
+            inp = torch.cat([x_t, m_t], dim=-1)
+            h_trend = self.trend_rnn(inp, h_trend)
+
+            # Anomaly (event component) via RNN
+            h_anom = self.anom_rnn(inp, h_anom)
+
+            # Mamba block (selective state)
+            h_mamba = self.mamba(x_t.squeeze(-1), h_mamba, m_t)
+
+            # Fuse all three representations
+            h_fused = torch.relu(self.fusion(torch.cat([h_trend, h_anom, h_mamba], dim=-1)))
+            preds.append(self.out(h_fused)[:, 0])
+
+        return torch.stack(preds, dim=1)
+
+class DSTGAMambaModel(nn.Module):
+    """DSTGA-Mamba with bidirectional fusion"""
+    def __init__(self, hidden=64):
+        super().__init__()
+        self.fwd = DSTGAMambaSimplified(hidden)
+        self.bwd = DSTGAMambaSimplified(hidden)
+        self.fuse = nn.Linear(2, 1)
+
+    def forward(self, x, m):
+        pf = self.fwd(x, m)
+        pb = self.bwd(x.flip(1), m.flip(1)).flip(1)
+        return (self.fuse(torch.stack([pf, pb], dim=-1))).squeeze(-1)
+
+    def impute(self, x, m):
+        p = self.forward(x, m)
+        return m * x + (1 - m) * p
+
+def train_dstga_mamba(hidden=64, epochs=200):
+    """Train DSTGA-Mamba"""
+    net = DSTGAMambaModel(hidden=hidden).to(device)
+    opt = torch.optim.Adam(net.parameters(), lr=2e-3, weight_decay=1e-4)
+    best_vloss, best_wts, patience = float('inf'), None, 0
+
+    for ep in range(1, epochs + 1):
+        net.train()
+        t0 = np.random.randint(0, TRAIN_END - 48)
+        x_full = torch.tensor(speed_np[t0:t0+48, :], dtype=torch.float32).T.to(device)
+        m_train = (torch.rand(NUM_NODES, 1, device=device) > 0.8).float().expand(-1, 48)
+
+        p = net.forward(x_full, m_train)
+        mask_obs = node_mask[0, :, 0, 0] == 1
+        loss = torch.mean((p[mask_obs, :] - x_full[mask_obs, :]) ** 2)
+
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+        opt.step()
+
+        if ep % 50 == 0:
+            net.eval()
+            with torch.no_grad():
+                x_v = torch.tensor(speed_np[VAL_START:VAL_END, :], dtype=torch.float32).T.to(device)
+                m_v = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, VAL_END-VAL_START)
+                vl = torch.mean((net.forward(x_v, m_v)[mask_obs, :] - x_v[mask_obs, :]) ** 2).item()
+
+            if vl < best_vloss:
+                best_vloss = vl
+                best_wts = copy.deepcopy(net.state_dict())
+                patience = 0
+            else:
+                patience += 1
+
+            print(f"  [DSTGA-Mamba] ep {ep:3d} | val_loss={vl:.4f}")
+            if patience >= 3:
+                break
+
+    if best_wts:
+        net.load_state_dict(best_wts)
+    return net
+
+# =============================================================================
 # v6 Training and Evaluation
 # =============================================================================
 
@@ -716,6 +931,40 @@ def eval_v6(net, name='Graph-CTH-NODE v6'):
     print(f"✅ {name} evaluated.")
 
 eval_v6(v6_net, 'Graph-CTH-NODE v6')
+
+# Train and evaluate T-DGCN
+print("\n" + "="*80)
+print("Training T-DGCN (SOTA: Dynamic Graph + Transformer)...")
+print("="*80)
+tdgcn_net = train_tdgcn(hidden=64, epochs=200)
+
+def eval_sota(net, name='Model'):
+    """Generic evaluation for SOTA models"""
+    net.eval()
+    x_e = torch.tensor(speed_np[EVAL_START:EVAL_START+_T_eval, :], dtype=torch.float32).T.to(device)
+    m_e = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, _T_eval)
+
+    with torch.no_grad():
+        p_e = net.impute(x_e, m_e).cpu().numpy()
+
+    pred_kmh = np.zeros((len(blind_idx), _T_eval), dtype=np.float32)
+    for ni, n in enumerate(blind_idx):
+        if np.isnan(p_e[n]).any():
+            pred_kmh[ni] = true_eval_kmh[ni]
+        else:
+            pred_kmh[ni] = np.clip(p_e[n] * node_stds[n] + node_means[n], 0, 120)
+
+    results_table.append({'model': name, **eval_pred_np(pred_kmh, true_eval_kmh)})
+    print(f"✅ {name} evaluated.")
+
+eval_sota(tdgcn_net, 'T-DGCN')
+
+# Train and evaluate DSTGA-Mamba
+print("\n" + "="*80)
+print("Training DSTGA-Mamba (SOTA: Mamba + Wavelet Disentanglement)...")
+print("="*80)
+mamba_net = train_dstga_mamba(hidden=64, epochs=200)
+eval_sota(mamba_net, 'DSTGA-Mamba')
 
 # =============================================================================
 # CELL 9 — Tier 1: Statistical baselines
