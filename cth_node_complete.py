@@ -690,14 +690,15 @@ print("✅ Baseline harness ready. true_eval_kmh shape:", true_eval_kmh.shape)
 # =============================================================================
 
 class TDGCNCell(nn.Module):
-    """Simplified T-DGCN: Dynamic GCN + Temporal Transformer"""
+    """Simplified T-DGCN: Dynamic GCN + Temporal attention"""
     def __init__(self, hidden=64):
         super().__init__()
         self.hidden = hidden
-        self.gcn = ChebConv(hidden + 1, hidden, K=2)
+        self.fc_in = nn.Linear(hidden + 1, hidden)
+        self.fc_gcn = nn.Linear(hidden, hidden)
         self.dynamic_graph_proj = nn.Linear(hidden, hidden)
-        self.temporal = nn.TransformerEncoderLayer(d_model=hidden, nhead=4, dim_feedforward=256, batch_first=True)
         self.out = nn.Linear(hidden, 1)
+        self.act = nn.ReLU()
 
     def forward(self, x_seq, m_seq):
         """x_seq: [N, T], m_seq: [N, T]"""
@@ -707,14 +708,21 @@ class TDGCNCell(nn.Module):
 
         for t in range(T):
             x_t = x_seq[:, t:t+1]
+            m_t = m_seq[:, t:t+1]
 
-            # Dynamic graph: learn attention-based adjacency
-            A_dyn = torch.sigmoid(self.dynamic_graph_proj(h)) @ torch.sigmoid(self.dynamic_graph_proj(h)).T
-            A_dyn = A_dyn / (A_dyn.sum(dim=1, keepdim=True) + 1e-8)
+            # Project to hidden
+            inp = torch.cat([x_t, m_t], dim=-1)
+            h_in = self.act(self.fc_in(inp))
 
-            # GCN with dynamic adjacency
-            msg_in = torch.cat([h, m_seq[:, t:t+1]], dim=-1)
-            h = torch.relu(self.gcn(msg_in, A_dyn))
+            # Dynamic graph: learn attention-based adjacency from hidden state
+            # A_dyn[i,j] = softmax(h_i @ h_j^T)
+            h_proj = self.dynamic_graph_proj(h)  # [N, hidden]
+            A_dyn = torch.softmax(h_proj @ h_proj.T / (self.hidden ** 0.5), dim=1)  # [N, N]
+
+            # Simple GCN: aggregate from neighbors via dynamic adjacency
+            msg = A_dyn @ h_in  # [N, hidden] — weighted sum from neighbors
+            h = self.act(self.fc_gcn(msg) + h_in)  # residual connection
+
             preds.append(self.out(h)[:, 0])
 
         return torch.stack(preds, dim=1)
@@ -788,17 +796,19 @@ class MambaBlock(nn.Module):
     def __init__(self, hidden=64):
         super().__init__()
         self.hidden = hidden
-        self.proj_in = nn.Linear(hidden + 1, hidden)
+        self.proj_in = nn.Linear(2, hidden)  # [x(1) + m(1)] -> hidden
         self.gate = nn.Linear(hidden, hidden)
         self.proj_out = nn.Linear(hidden, hidden)
 
     def forward(self, x, h, m):
-        """Selective state update based on data availability"""
-        inp = torch.cat([x.unsqueeze(-1), m], dim=-1) if x.dim() == 1 else torch.cat([x, m], dim=-1)
-        x_proj = torch.relu(self.proj_in(inp))
-        gate = torch.sigmoid(self.gate(h))
-        h_new = gate * h + (1 - gate) * x_proj
-        return torch.relu(self.proj_out(h_new))
+        """Selective state update based on data availability
+        x: [N, 1], h: [N, hidden], m: [N, 1]
+        """
+        inp = torch.cat([x, m], dim=-1)  # [N, 2]
+        x_proj = torch.relu(self.proj_in(inp))  # [N, hidden]
+        gate = torch.sigmoid(self.gate(h))  # [N, hidden]
+        h_new = gate * h + (1 - gate) * x_proj  # [N, hidden]
+        return torch.relu(self.proj_out(h_new))  # [N, hidden]
 
 class DSTGAMambaSimplified(nn.Module):
     """DSTGA-Mamba simplified: Mamba core + disentanglement"""
