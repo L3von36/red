@@ -158,12 +158,13 @@ jam_thresh_train_np = (JAM_KMH_TRAIN - node_means) / node_stds
 jam_thresh_eval_t   = torch.tensor(jam_thresh_eval_np,  dtype=torch.float32).to(device)
 jam_thresh_train_t  = torch.tensor(jam_thresh_train_np, dtype=torch.float32).to(device)
 
-# FIX #3: Per-node jam calibration — each node's 20th percentile as its jam threshold
-# Freeway node (mean=80 km/h): 20th pct ~55 km/h → jam starts higher
-# City node (mean=35 km/h): 20th pct ~22 km/h → jam starts lower
-# This captures each node's individual traffic regime instead of one-size-fits-all 50 km/h
-node_jam_thresh_kmh  = np.percentile(raw_speed[:TRAIN_END], 20, axis=0)  # [N] in km/h
-node_jam_thresh_norm = (node_jam_thresh_kmh - node_means) / node_stds    # [N] normalized
+# FIX #3: Per-node jam calibration — each node's mean minus half its std
+# Stable, smooth variation instead of sharp percentile-based thresholds
+# Freeway (mean=80, std=15): threshold = 72.5 km/h (jam at 72.5)
+# City (mean=35, std=8): threshold = 31 km/h (jam at 31)
+# This captures heterogeneity without noisy outliers
+node_jam_thresh_kmh  = node_means - 0.5 * node_stds  # [N] in km/h
+node_jam_thresh_norm = (node_jam_thresh_kmh - node_means) / node_stds  # [N] normalized
 node_jam_thresh_t    = torch.tensor(node_jam_thresh_norm, dtype=torch.float32).to(device)
 print(f"   Per-node jam thresh: min={node_jam_thresh_kmh.min():.1f} mean={node_jam_thresh_kmh.mean():.1f} max={node_jam_thresh_kmh.max():.1f} km/h")
 
