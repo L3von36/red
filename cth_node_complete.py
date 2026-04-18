@@ -158,6 +158,15 @@ jam_thresh_train_np = (JAM_KMH_TRAIN - node_means) / node_stds
 jam_thresh_eval_t   = torch.tensor(jam_thresh_eval_np,  dtype=torch.float32).to(device)
 jam_thresh_train_t  = torch.tensor(jam_thresh_train_np, dtype=torch.float32).to(device)
 
+# FIX #3: Per-node jam calibration — each node's 20th percentile as its jam threshold
+# Freeway node (mean=80 km/h): 20th pct ~55 km/h → jam starts higher
+# City node (mean=35 km/h): 20th pct ~22 km/h → jam starts lower
+# This captures each node's individual traffic regime instead of one-size-fits-all 50 km/h
+node_jam_thresh_kmh  = np.percentile(raw_speed[:TRAIN_END], 20, axis=0)  # [N] in km/h
+node_jam_thresh_norm = (node_jam_thresh_kmh - node_means) / node_stds    # [N] normalized
+node_jam_thresh_t    = torch.tensor(node_jam_thresh_norm, dtype=torch.float32).to(device)
+print(f"   Per-node jam thresh: min={node_jam_thresh_kmh.min():.1f} mean={node_jam_thresh_kmh.mean():.1f} max={node_jam_thresh_kmh.max():.1f} km/h")
+
 # Unconditional time-of-day prior
 STEPS_PER_DAY = 288
 slot_idx      = np.arange(TIME_STEPS) % STEPS_PER_DAY
@@ -499,12 +508,9 @@ class GraphCTHNodeV6(nn.Module):
         x_obs = x[mask_obs, :]  # [n_obs, T] targets for observed nodes only
         m_obs = m[mask_obs, :]  # [n_obs, T] mask for observed nodes only
 
-        # Compute jam/free flags for observed nodes only
-        node_means_t = torch.tensor(node_means, dtype=torch.float32).to(x.device)
-        node_stds_t = torch.tensor(node_stds, dtype=torch.float32).to(x.device)
-        means_obs = node_means_t[mask_obs]  # [n_obs]
-        stds_obs = node_stds_t[mask_obs]    # [n_obs]
-        jt_obs = (50.0 - means_obs) / stds_obs  # [n_obs]
+        # Compute jam/free flags using FIX #3: per-node calibrated thresholds
+        # Each node's 20th percentile is its individual jam threshold
+        jt_obs = node_jam_thresh_t[mask_obs]  # [n_obs] per-node normalized threshold
         jam_flag = (x_obs < jt_obs.unsqueeze(1)).float()  # [n_obs, T]
         free_flag = 1.0 - jam_flag
 
