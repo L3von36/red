@@ -409,8 +409,8 @@ class GraphCTHNodeV6Cell(nn.Module):
         self.path_bias = nn.Parameter(torch.randn(4) * 0.1)
         self.mix_w = nn.Linear(hidden, 4)
 
-        # GRU: [msg, x, mask, m_prop, (tod)]
-        gru_in_dim = hidden + 1 + 1 + 1 + (2 if include_tod else 0)  # +1 for m_prop_seq
+        # GRU: [msg, x, mask, (tod)]
+        gru_in_dim = hidden + 1 + 1 + (2 if include_tod else 0)
         self.gru = nn.GRUCell(gru_in_dim, hidden)
         self.out = nn.Linear(hidden, 1)
         self.act = nn.Tanh()
@@ -448,17 +448,17 @@ class GraphCTHNodeV6Cell(nn.Module):
 
             x_t = x_seq[:,t:t+1]
             if self.include_tod and tod_free_seq is not None:
-                inp = torch.cat([msg, x_t, m_seq[:,t:t+1], m_prop_seq[:,t:t+1],
+                inp = torch.cat([msg, x_t, m_seq[:,t:t+1],
                                 tod_free_seq[:,t:t+1], tod_jam_seq[:,t:t+1]], dim=-1)
-                #                             ^^^^^^^^^^^^^^
-                #                             NEW: mask propagation!
             else:
-                inp = torch.cat([msg, x_t, m_seq[:,t:t+1], m_prop_seq[:,t:t+1]], dim=-1)
-                #                             ^^^^^^^^^^^^^^
-                #                             NEW: mask propagation!
+                inp = torch.cat([msg, x_t, m_seq[:,t:t+1]], dim=-1)
 
             h_new = self.gru(inp, h)
-            skip_weight = 0.1 + 0.05 * (1.0 - m_seq[:,t:t+1])
+            # GRIN++ FIX #1: Modulate skip weight by neighbor observation (m_prop)
+            # If blind node has observed neighbors (high m_prop) → lower skip (trust neighbors)
+            # If blind node has no observed neighbors (low m_prop) → higher skip (use history)
+            base_skip = 0.1 + 0.05 * (1.0 - m_seq[:,t:t+1])
+            skip_weight = base_skip * (1.0 - 0.3 * m_prop_seq[:,t:t+1])
             h = h_new + skip_weight * h
             preds.append(self.out(h)[:,0])
 
