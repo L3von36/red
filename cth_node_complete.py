@@ -517,7 +517,19 @@ class GraphCTHNodeV6(nn.Module):
 
         # Loss computed ONLY on observed nodes (clean training signal)
         loss_free = torch.mean(((p_obs - x_obs) * m_obs * free_flag) ** 2)
-        loss_jam = torch.mean(torch.abs(p_obs - x_obs) * m_obs * jam_flag) * 3.0
+
+        # TECHNIQUE B: Class-balanced weighted sampling for jams
+        # SOTA models (DSTGA-Mamba, T-DGCN) oversample rare jam events
+        # Downweight jams that are 1-5% of data, upweight to ~50% for gradient
+        jam_freq = (jam_flag.sum() + 1e-8) / (jam_flag.numel() + 1e-8)
+        if jam_freq > 0 and jam_freq < 0.5:
+            # Class-balance weight: rare jams get upweighted
+            jam_weight = (1.0 - jam_freq) / jam_freq  # typically 10-100x
+            weighted_jam_loss = torch.abs(p_obs - x_obs) * m_obs * jam_flag * jam_weight
+            loss_jam = torch.mean(weighted_jam_loss) * 3.0
+        else:
+            # Fallback: uniform weighting
+            loss_jam = torch.mean(torch.abs(p_obs - x_obs) * m_obs * jam_flag) * 3.0
 
         # Spatial smoothness loss: penalize sharp differences between neighbors (only on observed)
         lam_spatial = 0.01
