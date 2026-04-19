@@ -715,9 +715,11 @@ class TDGCNCell(nn.Module):
             h_in = self.act(self.fc_in(inp))
 
             # Dynamic graph: learn attention-based adjacency from hidden state
-            # A_dyn[i,j] = softmax(h_i @ h_j^T)
+            # A_dyn[i,j] = softmax(h_i @ h_j^T) with numerical stability
             h_proj = self.dynamic_graph_proj(h)  # [N, hidden]
-            A_dyn = torch.softmax(h_proj @ h_proj.T / (self.hidden ** 0.5), dim=1)  # [N, N]
+            logits = h_proj @ h_proj.T / (self.hidden ** 0.5)  # [N, N]
+            logits = torch.clamp(logits, -10, 10)  # numerical stability
+            A_dyn = torch.softmax(logits, dim=1)  # [N, N]
 
             # Simple GCN: aggregate from neighbors via dynamic adjacency
             msg = A_dyn @ h_in  # [N, hidden] — weighted sum from neighbors
@@ -758,7 +760,28 @@ def train_tdgcn(hidden=64, epochs=200):
 
         p = net.forward(x_full, m_train)
         mask_obs = node_mask[0, :, 0, 0] == 1
-        loss = torch.mean((p[mask_obs, :] - x_full[mask_obs, :]) ** 2)
+
+        # Use same hybrid loss as v6 for fair comparison
+        p_obs = p[mask_obs, :]
+        x_obs = x_full[mask_obs, :]
+        m_obs = m_train[mask_obs, :]
+
+        # Jam/free classification
+        jt_obs = node_jam_thresh_t[mask_obs]
+        jam_flag = (x_obs < jt_obs.unsqueeze(1)).float()
+        free_flag = 1.0 - jam_flag
+
+        # Hybrid loss with class-balanced jam weighting
+        loss_free = torch.mean(((p_obs - x_obs) * m_obs * free_flag) ** 2)
+        jam_freq = (jam_flag.sum() + 1e-8) / (jam_flag.numel() + 1e-8)
+        if jam_freq > 0 and jam_freq < 0.5:
+            jam_weight = (1.0 - jam_freq) / jam_freq
+            weighted_jam_loss = torch.abs(p_obs - x_obs) * m_obs * jam_flag * jam_weight
+            loss_jam = torch.mean(weighted_jam_loss) * 3.0
+        else:
+            loss_jam = torch.mean(torch.abs(p_obs - x_obs) * m_obs * jam_flag) * 3.0
+
+        loss = loss_free + loss_jam
 
         opt.zero_grad()
         loss.backward()
@@ -881,7 +904,28 @@ def train_dstga_mamba(hidden=64, epochs=200):
 
         p = net.forward(x_full, m_train)
         mask_obs = node_mask[0, :, 0, 0] == 1
-        loss = torch.mean((p[mask_obs, :] - x_full[mask_obs, :]) ** 2)
+
+        # Use same hybrid loss as v6 for fair comparison
+        p_obs = p[mask_obs, :]
+        x_obs = x_full[mask_obs, :]
+        m_obs = m_train[mask_obs, :]
+
+        # Jam/free classification
+        jt_obs = node_jam_thresh_t[mask_obs]
+        jam_flag = (x_obs < jt_obs.unsqueeze(1)).float()
+        free_flag = 1.0 - jam_flag
+
+        # Hybrid loss with class-balanced jam weighting
+        loss_free = torch.mean(((p_obs - x_obs) * m_obs * free_flag) ** 2)
+        jam_freq = (jam_flag.sum() + 1e-8) / (jam_flag.numel() + 1e-8)
+        if jam_freq > 0 and jam_freq < 0.5:
+            jam_weight = (1.0 - jam_freq) / jam_freq
+            weighted_jam_loss = torch.abs(p_obs - x_obs) * m_obs * jam_flag * jam_weight
+            loss_jam = torch.mean(weighted_jam_loss) * 3.0
+        else:
+            loss_jam = torch.mean(torch.abs(p_obs - x_obs) * m_obs * jam_flag) * 3.0
+
+        loss = loss_free + loss_jam
 
         opt.zero_grad()
         loss.backward()
