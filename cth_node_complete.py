@@ -816,8 +816,8 @@ class DSTGAMambaSimplified(nn.Module):
         super().__init__()
         self.hidden = hidden
         # Trend and anomaly branches
-        self.trend_rnn = nn.GRUCell(hidden + 1, hidden)
-        self.anom_rnn = nn.GRUCell(hidden + 1, hidden)
+        self.trend_rnn = nn.GRUCell(2, hidden)  # input: [x(1) + m(1)]
+        self.anom_rnn = nn.GRUCell(2, hidden)   # input: [x(1) + m(1)]
         self.mamba = MambaBlock(hidden)
         self.fusion = nn.Linear(hidden * 3, hidden)
         self.out = nn.Linear(hidden, 1)
