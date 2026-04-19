@@ -694,7 +694,7 @@ class TDGCNCell(nn.Module):
     def __init__(self, hidden=64):
         super().__init__()
         self.hidden = hidden
-        self.fc_in = nn.Linear(hidden + 1, hidden)
+        self.fc_in = nn.Linear(2, hidden)  # [x(1) + m(1)] -> hidden
         self.fc_gcn = nn.Linear(hidden, hidden)
         self.dynamic_graph_proj = nn.Linear(hidden, hidden)
         self.out = nn.Linear(hidden, 1)
