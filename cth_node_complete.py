@@ -927,6 +927,279 @@ def train_v6_jam(hidden=64, epochs=300):
     return net
 
 # =============================================================================
+# IMPROVED T-DGCN: Thesis contribution combining dynamic graphs + transformer
+# =============================================================================
+
+class DynamicGraphConstructor(nn.Module):
+    """Learns per-timestep adjacency matrix from hidden state"""
+    def __init__(self, hidden=64, num_nodes=307):
+        super().__init__()
+        self.hidden = hidden
+        self.num_nodes = num_nodes
+        self.proj_q = nn.Linear(hidden, hidden)
+        self.proj_k = nn.Linear(hidden, hidden)
+
+    def forward(self, h):
+        """h: [N, hidden] -> A_dyn: [N, N]"""
+        q = self.proj_q(h)  # [N, hidden]
+        k = self.proj_k(h)  # [N, hidden]
+        logits = q @ k.T / (self.hidden ** 0.5)  # [N, N]
+        logits = torch.clamp(logits, -10, 10)  # numerical stability
+        A_dyn = torch.softmax(logits, dim=1)  # row-wise: [N, N]
+        return A_dyn
+
+class TransformerTemporalBlock(nn.Module):
+    """Multi-head self-attention over time dimension"""
+    def __init__(self, hidden=64, num_heads=4):
+        super().__init__()
+        self.hidden = hidden
+        self.num_heads = num_heads
+        self.attention = nn.MultiheadAttention(hidden, num_heads, batch_first=True)
+        self.norm1 = nn.LayerNorm(hidden)
+        self.norm2 = nn.LayerNorm(hidden)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden, hidden * 2),
+            nn.ReLU(),
+            nn.Linear(hidden * 2, hidden)
+        )
+
+    def forward(self, x):
+        """x: [N, T, hidden] -> [N, T, hidden]"""
+        N, T, D = x.shape
+        # Self-attention over time
+        x_norm = self.norm1(x)  # [N, T, hidden]
+        attn_out, _ = self.attention(x_norm, x_norm, x_norm)  # [N, T, hidden]
+        x = x + attn_out  # residual
+        # FFN
+        x_norm = self.norm2(x)  # [N, T, hidden]
+        x = x + self.ffn(x_norm)  # residual
+        return x
+
+class ImprovedTDGCNCell(nn.Module):
+    """Improved T-DGCN cell: dynamic graph + GCN + RNN"""
+    def __init__(self, hidden=64, include_tod=True):
+        super().__init__()
+        self.hidden = hidden
+        self.include_tod = include_tod
+
+        # Dynamic graph constructor
+        self.dynamic_graph = DynamicGraphConstructor(hidden, NUM_NODES)
+
+        # GCN with learnable weights
+        gcn_in_dim = hidden
+        self.gcn_w = nn.Linear(gcn_in_dim, hidden)
+
+        # GRU
+        gru_in_dim = hidden + 1 + 1 + (2 if include_tod else 0)  # [h_neighbors, x_t, m_t, tod_*]
+        self.gru = nn.GRUCell(gru_in_dim, hidden)
+
+        # Output projection
+        self.out = nn.Linear(hidden, 1)
+
+    def forward(self, x_seq, m_seq, tod_free_seq=None, tod_jam_seq=None):
+        """
+        x_seq: [N, T]
+        m_seq: [N, T]
+        tod_free_seq: [N, T] optional
+        tod_jam_seq: [N, T] optional
+        Returns: h_all [N, T, hidden], preds [N, T]
+        """
+        N, T = x_seq.shape
+        h = torch.zeros(N, self.hidden, device=x_seq.device)
+        h_all = []
+        preds = []
+
+        # Mask propagation (same as v6)
+        A_prop = torch.tensor(adj_sym, dtype=torch.float32).to(x_seq.device)
+        degree = A_prop.sum(dim=1, keepdim=True) + 1e-8
+        m_prop_seq = torch.mm(A_prop, m_seq) / degree  # [N, T]
+
+        for t in range(T):
+            # Construct dynamic adjacency from current hidden state
+            A_dyn = self.dynamic_graph(h)  # [N, N]
+
+            # GCN aggregation on dynamic adjacency
+            h_proj = torch.relu(self.gcn_w(h))  # [N, hidden]
+            h_neighbors = A_dyn @ h_proj  # [N, hidden]
+
+            # Prepare GRU input
+            gru_input_parts = [h_neighbors, x_seq[:, t:t+1], m_seq[:, t:t+1]]
+            if self.include_tod and tod_free_seq is not None:
+                gru_input_parts.append(tod_free_seq[:, t:t+1])
+                gru_input_parts.append(tod_jam_seq[:, t:t+1])
+            gru_input = torch.cat(gru_input_parts, dim=-1)  # [N, gru_in_dim]
+
+            # GRU step
+            h = self.gru(gru_input, h)
+
+            # Skip connection (context-dependent)
+            skip_weight = 0.1 + 0.05 * (1.0 - m_seq[:, t:t+1])
+            h = h + skip_weight * h
+
+            h_all.append(h.unsqueeze(1))
+            preds.append(self.out(h))
+
+        h_all = torch.cat(h_all, dim=1)  # [N, T, hidden]
+        preds = torch.cat(preds, dim=-1)  # [N, T]
+        return h_all, preds
+
+class ImprovedTDGCN(nn.Module):
+    """Improved T-DGCN: Bidirectional RNN + Transformer temporal fusion"""
+    def __init__(self, hidden=64, include_tod=True):
+        super().__init__()
+        self.hidden = hidden
+        self.include_tod = include_tod
+
+        # Bidirectional cells
+        self.cell_fwd = ImprovedTDGCNCell(hidden, include_tod)
+        self.cell_bwd = ImprovedTDGCNCell(hidden, include_tod)
+
+        # Temporal transformer for fusion
+        self.temporal_block = TransformerTemporalBlock(hidden, num_heads=4)
+
+        # Fusion projection
+        self.fusion = nn.Linear(hidden * 2, hidden)
+
+        # Output prediction
+        self.pred_out = nn.Linear(hidden, 1)
+
+    def forward(self, x_seq, m_seq, tod_free_seq=None, tod_jam_seq=None):
+        """
+        x_seq: [N, T]
+        m_seq: [N, T]
+        Returns: preds [N, T]
+        """
+        N, T = x_seq.shape
+
+        # Forward pass
+        h_fwd, _ = self.cell_fwd(x_seq, m_seq, tod_free_seq, tod_jam_seq)
+
+        # Backward pass (reverse time)
+        h_bwd, _ = self.cell_bwd(
+            torch.flip(x_seq, [1]),
+            torch.flip(m_seq, [1]),
+            torch.flip(tod_free_seq, [1]) if tod_free_seq is not None else None,
+            torch.flip(tod_jam_seq, [1]) if tod_jam_seq is not None else None
+        )
+        h_bwd = torch.flip(h_bwd, [1])  # flip back to original order
+
+        # Temporal fusion with transformer
+        h_fused = torch.cat([h_fwd, h_bwd], dim=-1)  # [N, T, 2*hidden]
+        h_fused = self.temporal_block(h_fused)  # [N, T, 2*hidden]
+        h_fused = self.fusion(h_fused)  # [N, T, hidden]
+
+        # Prediction from fused representation
+        preds = self.pred_out(h_fused).squeeze(-1)  # [N, T]
+        return preds
+
+    def impute(self, x_seq, m_seq, tod_free_seq=None, tod_jam_seq=None):
+        """Wrapper for compatibility with eval_v6_like"""
+        return self.forward(x_seq, m_seq, tod_free_seq, tod_jam_seq)
+
+def train_improved_tdgcn(hidden=64, epochs=300):
+    """Train Improved T-DGCN with jam-aware loss"""
+    print(f"Training Improved T-DGCN: {epochs} epochs")
+
+    net = ImprovedTDGCN(hidden=hidden, include_tod=True).to(device)
+    opt = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
+
+    best_loss = float('inf')
+    best_wts = None
+    patience_ctr = 0
+
+    for ep in range(epochs):
+        net.train()
+        loss_cum = 0.0
+        n_batch = 0
+
+        for batch_idx in range(len(train_indices)):
+            slot_idx = train_indices[batch_idx]
+            x_t = torch.tensor(speed_np[slot_idx:slot_idx+BATCH_TIME, :],
+                             dtype=torch.float32).T.to(device)  # [N, BATCH_TIME]
+            m_t = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, BATCH_TIME)
+            tod_free_t = torch.tensor(tod_free_np[:, slot_idx:slot_idx+BATCH_TIME],
+                                    dtype=torch.float32).to(device)
+            tod_jam_t = torch.tensor(tod_jam_np[:, slot_idx:slot_idx+BATCH_TIME],
+                                   dtype=torch.float32).to(device)
+
+            opt.zero_grad()
+            p_t = net(x_t, m_t, tod_free_t, tod_jam_t)  # [N, BATCH_TIME]
+
+            # Jam-aware loss (same as v6)
+            free_mask = x_t < (node_jam_thresh_norm[:, None])
+            jam_mask = ~free_mask
+
+            # Free-flow: MSE
+            loss_free = (free_mask.float() * (p_t - x_t) ** 2).mean()
+
+            # Jam events: class-balanced weighted MAE
+            freq_jam = jam_mask.float().mean() + 1e-8
+            jam_weight = torch.clamp((1.0 - freq_jam) / freq_jam, 1.0, 30.0)
+            loss_jam = (jam_mask.float() * torch.abs(p_t - x_t)).mean() * jam_weight * 5.0
+
+            # Spatial smoothness
+            diff_space = p_t[:, 1:] - p_t[:, :-1]
+            loss_smooth = (diff_space ** 2).mean() * 0.01
+
+            loss = loss_free + loss_jam + loss_smooth
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+            opt.step()
+
+            loss_cum += loss.item()
+            n_batch += 1
+
+        # Validation
+        net.eval()
+        val_loss = 0.0
+        n_val = 0
+        with torch.no_grad():
+            for batch_idx in range(len(val_indices)):
+                slot_idx = val_indices[batch_idx]
+                x_v = torch.tensor(speed_np[slot_idx:slot_idx+BATCH_TIME, :],
+                                 dtype=torch.float32).T.to(device)
+                m_v = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, BATCH_TIME)
+                tod_free_v = torch.tensor(tod_free_np[:, slot_idx:slot_idx+BATCH_TIME],
+                                        dtype=torch.float32).to(device)
+                tod_jam_v = torch.tensor(tod_jam_np[:, slot_idx:slot_idx+BATCH_TIME],
+                                       dtype=torch.float32).to(device)
+
+                p_v = net(x_v, m_v, tod_free_v, tod_jam_v)
+
+                free_mask_v = x_v < (node_jam_thresh_norm[:, None])
+                jam_mask_v = ~free_mask_v
+                loss_free_v = (free_mask_v.float() * (p_v - x_v) ** 2).mean()
+                freq_jam_v = jam_mask_v.float().mean() + 1e-8
+                jam_weight_v = torch.clamp((1.0 - freq_jam_v) / freq_jam_v, 1.0, 30.0)
+                loss_jam_v = (jam_mask_v.float() * torch.abs(p_v - x_v)).mean() * jam_weight_v * 5.0
+                diff_space_v = p_v[:, 1:] - p_v[:, :-1]
+                loss_smooth_v = (diff_space_v ** 2).mean() * 0.01
+
+                vl = loss_free_v + loss_jam_v + loss_smooth_v
+                val_loss += vl.item()
+                n_val += 1
+
+        avg_loss = loss_cum / max(1, n_batch)
+        avg_val_loss = val_loss / max(1, n_val)
+
+        if avg_val_loss < best_loss:
+            best_loss = avg_val_loss
+            best_wts = copy.deepcopy(net.state_dict())
+            patience_ctr = 0
+        else:
+            patience_ctr += 1
+
+        if ep % 10 == 0:
+            print(f"  [ImprovedTDGCN] ep {ep:3d} | train_loss={avg_loss:.4f} | val_loss={avg_val_loss:.4f}")
+        if patience_ctr >= 3:
+            print(f"  → Early stop at ep {ep}")
+            break
+
+    if best_wts:
+        net.load_state_dict(best_wts)
+    return net
+
+# =============================================================================
 # v6-NEXT: Graph-CTH-NODE v6 with Disentanglement + Dynamic Graphs
 # =============================================================================
 
@@ -1521,6 +1794,13 @@ print("Training Graph-CTH-NODE v6-Jam (Mamba-Inspired Jam Detection)...")
 print("="*80)
 v6jam_net = train_v6_jam(hidden=64, epochs=300)
 eval_v6_like(v6jam_net, 'Graph-CTH-NODE v6-Jam')
+
+# Train and evaluate Improved T-DGCN (Thesis Contribution)
+print("\n" + "="*80)
+print("Training Improved T-DGCN (Thesis Contribution: Dynamic Graphs + Transformer)...")
+print("="*80)
+improved_tdgcn_net = train_improved_tdgcn(hidden=64, epochs=300)
+eval_v6_like(improved_tdgcn_net, 'Improved T-DGCN (Thesis)')
 
 # =============================================================================
 # SOTA MODEL TRAINING
