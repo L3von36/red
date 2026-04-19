@@ -842,7 +842,7 @@ class DSTGAMambaSimplified(nn.Module):
             h_anom = self.anom_rnn(inp, h_anom)
 
             # Mamba block (selective state)
-            h_mamba = self.mamba(x_t.squeeze(-1), h_mamba, m_t)
+            h_mamba = self.mamba(x_t, h_mamba, m_t)  # keep x_t as [N, 1]
 
             # Fuse all three representations
             h_fused = torch.relu(self.fusion(torch.cat([h_trend, h_anom, h_mamba], dim=-1)))
