@@ -1030,11 +1030,12 @@ class ImprovedTDGCNCell(nn.Module):
             gru_input = torch.cat(gru_input_parts, dim=-1)  # [N, gru_in_dim]
 
             # GRU step
+            h_old = h
             h = self.gru(gru_input, h)
 
-            # Skip connection (context-dependent)
+            # Skip connection (context-dependent): modulate by mask
             skip_weight = 0.1 + 0.05 * (1.0 - m_seq[:, t:t+1])
-            h = h + skip_weight * h
+            h = h + skip_weight * h_old
 
             h_all.append(h.unsqueeze(1))
             preds.append(self.out(h))
@@ -1054,8 +1055,8 @@ class ImprovedTDGCN(nn.Module):
         self.cell_fwd = ImprovedTDGCNCell(hidden, include_tod)
         self.cell_bwd = ImprovedTDGCNCell(hidden, include_tod)
 
-        # Temporal transformer for fusion
-        self.temporal_block = TransformerTemporalBlock(hidden, num_heads=4)
+        # Temporal transformer for fusion (input is 2*hidden after concatenation)
+        self.temporal_block = TransformerTemporalBlock(hidden * 2, num_heads=4)
 
         # Fusion projection
         self.fusion = nn.Linear(hidden * 2, hidden)
