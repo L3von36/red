@@ -686,9 +686,250 @@ for ni, n in enumerate(blind_idx):
 print("✅ Baseline harness ready. true_eval_kmh shape:", true_eval_kmh.shape)
 
 # =============================================================================
-# v6-NEXT: Graph-CTH-NODE v6 with Disentanglement + Dynamic Graphs
-# Learns from DSTGA-Mamba (#1) and T-DGCN (#2)
+# v6-JAM: Graph-CTH-NODE v6 with Mamba-Inspired Jam Detection
+# Learnings from DSTGA-Mamba (A) + Proper Mamba study (C)
+#
+# Key innovations:
+# 1. Mamba-style selective state updates (input-dependent step size)
+# 2. Jam awareness gate: detects anomalous speed deviation from ToD prior
+# 3. Exponential loss sensitivity: penalizes large jam errors harder
 # =============================================================================
+
+class GraphCTHNodeV6JamCell(nn.Module):
+    """v6-Jam Cell: Mamba-inspired selective updates + jam awareness"""
+    def __init__(self, hidden=64, include_tod=True):
+        super().__init__()
+        self.hidden = hidden
+        self.include_tod = include_tod
+
+        # 4-path message passing (same as v6)
+        msg_in_dim = hidden + 1 + (2 if include_tod else 0)
+        self.msg_sym  = ChebConv(msg_in_dim, hidden, K=3)
+        self.msg_fwd  = ChebConv(msg_in_dim, hidden, K=3)
+        self.msg_bwd  = ChebConv(msg_in_dim, hidden, K=3)
+        self.msg_corr = ChebConv(msg_in_dim, hidden, K=3)
+
+        self.path_bias = nn.Parameter(torch.randn(4) * 0.1)
+        self.mix_w = nn.Linear(hidden, 4)
+
+        # GRU (same dims as v6)
+        gru_in_dim = hidden + 1 + 1 + (2 if include_tod else 0)
+        self.gru = nn.GRUCell(gru_in_dim, hidden)
+        self.out = nn.Linear(hidden, 1)
+        self.act = nn.Tanh()
+
+        # Mamba-inspired: input-dependent step size (delta)
+        # delta_t = softplus(fc(x_t)) tells model how much to update state
+        self.delta_proj = nn.Linear(1, 1)
+
+        # Jam awareness gate: detect anomalous deviation from ToD free-flow prior
+        # jam_conf = sigmoid(fc(|x - tod_free|)) — how likely is current step a jam?
+        self.jam_gate = nn.Linear(2, 1)  # [deviation, mask] -> jam confidence
+
+    def forward(self, x_seq, m_seq, tod_free_seq=None, tod_jam_seq=None):
+        N, T = x_seq.shape
+        h = torch.zeros(N, self.hidden, device=x_seq.device)
+        preds = []
+
+        # Mask propagation (from Fix #1)
+        A_prop = torch.tensor(adj_sym, dtype=torch.float32).to(x_seq.device)
+        degree = A_prop.sum(dim=1, keepdim=True) + 1e-8
+        m_prop_seq = torch.mm(A_prop, m_seq) / degree
+
+        for t in range(T):
+            x_t = x_seq[:, t:t+1]
+            m_t = m_seq[:, t:t+1]
+
+            # Message passing
+            if self.include_tod and tod_free_seq is not None:
+                msg_in = torch.cat([h, m_t,
+                                   tod_free_seq[:,t:t+1], tod_jam_seq[:,t:t+1]], dim=-1)
+            else:
+                msg_in = torch.cat([h, m_t], dim=-1)
+
+            m_sym  = self.act(self.msg_sym(msg_in))
+            m_fwd  = self.act(self.msg_fwd(msg_in))
+            m_bwd  = self.act(self.msg_bwd(msg_in))
+            m_corr = self.act(self.msg_corr(msg_in))
+
+            mix_logits = self.mix_w(h) + self.path_bias.unsqueeze(0)
+            mix_wt = torch.softmax(mix_logits, dim=1)
+            msg = (mix_wt[:,0:1]*m_sym + mix_wt[:,1:2]*m_fwd +
+                   mix_wt[:,2:3]*m_bwd + mix_wt[:,3:4]*m_corr)
+
+            # GRU update
+            if self.include_tod and tod_free_seq is not None:
+                inp = torch.cat([msg, x_t, m_t,
+                                tod_free_seq[:,t:t+1], tod_jam_seq[:,t:t+1]], dim=-1)
+            else:
+                inp = torch.cat([msg, x_t, m_t], dim=-1)
+
+            h_new = self.gru(inp, h)
+
+            # Mamba-inspired: input-dependent step size
+            # When x_t is extreme (jam), delta is large → bigger state update
+            delta = torch.sigmoid(self.delta_proj(x_t))  # [N, 1] in (0,1)
+
+            # Jam awareness gate: how anomalous is x_t from ToD free-flow?
+            if tod_free_seq is not None:
+                deviation = torch.abs(x_t - tod_free_seq[:,t:t+1])
+                jam_conf = torch.sigmoid(self.jam_gate(
+                    torch.cat([deviation, m_t], dim=-1)))  # [N, 1]
+            else:
+                jam_conf = torch.zeros(N, 1, device=x_t.device)
+
+            # Selective state update: jams get stronger update, free-flow is smoother
+            # High delta + high jam_conf → trust the new state more
+            gate = delta * (1.0 + 0.5 * jam_conf)  # [N, 1]
+            gate = torch.clamp(gate, 0, 1)
+
+            # Skip weight modulated by observation + neighbor propagation
+            base_skip = 0.1 + 0.05 * (1.0 - m_t)
+            skip_weight = base_skip * (1.0 - 0.3 * m_prop_seq[:,t:t+1])
+
+            # Combine: new state scaled by gate, old state by skip
+            h = gate * h_new + (1.0 - gate) * h + skip_weight * h
+            h = h / (h.norm(dim=-1, keepdim=True).clamp(min=1.0))  # layer norm
+
+            preds.append(self.out(h)[:,0])
+
+        return torch.stack(preds, dim=1)
+
+
+class GraphCTHNodeV6Jam(nn.Module):
+    """v6-Jam: Full model with Mamba-inspired jam awareness"""
+    def __init__(self, hidden=64, include_tod=True):
+        super().__init__()
+        self.include_tod = include_tod
+        self.fwd = GraphCTHNodeV6JamCell(hidden, include_tod)
+        self.bwd = GraphCTHNodeV6JamCell(hidden, include_tod)
+        self.fuse = nn.Sequential(
+            nn.Linear(2, hidden), nn.ReLU(),
+            nn.Linear(hidden, 2), nn.Softmax(dim=-1)
+        )
+
+    def _run(self, x, m, tod_free=None, tod_jam=None):
+        pf = self.fwd(x, m, tod_free, tod_jam)
+        pb = self.bwd(x.flip(1), m.flip(1),
+                      tod_free.flip(1) if tod_free is not None else None,
+                      tod_jam.flip(1) if tod_jam is not None else None).flip(1)
+        fuse_in = torch.stack([pf, pb], dim=-1)
+        w = self.fuse(fuse_in)
+        return (w[...,0:1]*pf.unsqueeze(-1) + w[...,1:2]*pb.unsqueeze(-1)).squeeze(-1)
+
+    def training_step(self, x, m, tod_free=None, tod_jam=None, epoch=1):
+        p = self._run(x, m, tod_free, tod_jam)
+
+        mask_obs = node_mask[0, :, 0, 0] == 1
+        p_obs = p[mask_obs, :]
+        x_obs = x[mask_obs, :]
+        m_obs = m[mask_obs, :]
+
+        jt_obs = node_jam_thresh_t[mask_obs]
+        jam_flag = (x_obs < jt_obs.unsqueeze(1)).float()
+        free_flag = 1.0 - jam_flag
+
+        # Free-flow: MSE
+        loss_free = torch.mean(((p_obs - x_obs) * m_obs * free_flag) ** 2)
+
+        # Jam: class-balanced + exponential penalty for large errors
+        jam_freq = (jam_flag.sum() + 1e-8) / (jam_flag.numel() + 1e-8)
+        jam_weight = (1.0 - jam_freq) / (jam_freq + 1e-8)
+        jam_weight = torch.clamp(torch.tensor(jam_weight), 1.0, 50.0).item()
+
+        jam_err = torch.abs(p_obs - x_obs) * m_obs * jam_flag
+        # Exponential sensitivity: larger errors penalized more (Mamba insight)
+        jam_err_exp = jam_err * (1.0 + torch.sigmoid(jam_err - 1.0))
+        loss_jam = torch.mean(jam_err_exp * jam_weight) * 3.0
+
+        # Spatial smoothness
+        lam_spatial = 0.01
+        A_spatial = torch.tensor(adj_sym, dtype=torch.float32).to(x.device)
+        spatial_diff = 0.0
+        for i in range(p.shape[0]):
+            neighbors = torch.where(A_spatial[i] > 1e-6)[0]
+            if len(neighbors) > 0:
+                mask_i = m[i:i+1, :]
+                mask_neighbors = m[neighbors, :]
+                mask_both = mask_i * mask_neighbors
+                neighbor_diffs = torch.abs(p[i:i+1, :] - p[neighbors, :]) * mask_both
+                if mask_both.sum() > 0:
+                    spatial_diff += neighbor_diffs.sum() / (mask_both.sum() + 1e-8)
+        spatial_diff = spatial_diff / (p.shape[0] + 1e-8)
+
+        return loss_free + loss_jam + lam_spatial * spatial_diff
+
+    def impute(self, x, m, tod_free=None, tod_jam=None):
+        p = self._run(x, m, tod_free, tod_jam)
+        return m * x + (1 - m) * p
+
+
+def train_v6_jam(hidden=64, epochs=300):
+    """Train v6-Jam"""
+    seed = abs(hash('GraphCTHNodeV6Jam')) % (2**31)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    net = GraphCTHNodeV6Jam(hidden=hidden, include_tod=True).to(device)
+    opt = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
+    best_vloss, best_wts, patience_ctr = float('inf'), None, 0
+
+    print(f"\n{'='*80}")
+    print(f"Training Graph-CTH-NODE v6-Jam: {epochs} epochs")
+    print(f"  Mamba-inspired selective updates + Jam awareness gate")
+    print(f"{'='*80}\n")
+
+    for ep in range(1, epochs + 1):
+        net.train()
+        t0 = np.random.randint(0, TRAIN_END - 48)
+        x_full = torch.tensor(speed_np[t0:t0+48, :], dtype=torch.float32).T.to(device)
+        m_train = (torch.rand(NUM_NODES, 1, device=device) > 0.8).float().expand(-1, 48)
+
+        slots = (np.arange(t0, t0+48) % 288).astype(int)
+        tod_free = torch.tensor(tod_free_np[:, slots], dtype=torch.float32).to(device)
+        tod_jam  = torch.tensor(tod_jam_np[:, slots],  dtype=torch.float32).to(device)
+
+        loss = net.training_step(x_full, m_train, tod_free, tod_jam, epoch=ep)
+
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"  ⚠️  NaN/Inf at ep {ep}, reinitializing...")
+            return train_v6_jam(hidden, epochs)
+
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+        opt.step()
+
+        if ep % 50 == 0:
+            net.eval()
+            with torch.no_grad():
+                x_v = torch.tensor(speed_np[VAL_START:VAL_END, :], dtype=torch.float32).T.to(device)
+                m_v = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, VAL_END-VAL_START)
+                slots_v = (np.arange(VAL_START, VAL_END) % 288).astype(int)
+                tod_fv = torch.tensor(tod_free_np[:, slots_v], dtype=torch.float32).to(device)
+                tod_jv = torch.tensor(tod_jam_np[:,  slots_v], dtype=torch.float32).to(device)
+                vl = net.training_step(x_v, m_v, tod_fv, tod_jv).item()
+
+            if vl < best_vloss:
+                best_vloss = vl
+                best_wts = copy.deepcopy(net.state_dict())
+                patience_ctr = 0
+            else:
+                patience_ctr += 1
+
+            print(f"  [v6-Jam] ep {ep:3d} | val_loss={vl:.4f}")
+            if patience_ctr >= 3:
+                print(f"  → Early stop at ep {ep}")
+                break
+
+    if best_wts:
+        net.load_state_dict(best_wts)
+    return net
+
+# =============================================================================
+# v6-NEXT: Graph-CTH-NODE v6 with Disentanglement + Dynamic Graphs
+# =============================================================================
+
 
 def decompose_trend_anomaly(x_seq, window=5):
     """Simple decomposition: trend (smooth) and anomaly (spikes)
@@ -1273,6 +1514,13 @@ def eval_v6_like(net, name='Model'):
     print(f"✅ {name} evaluated.")
 
 eval_v6_like(v6next_net, 'Graph-CTH-NODE v6-Next')
+
+# Train and evaluate v6-Jam
+print("\n" + "="*80)
+print("Training Graph-CTH-NODE v6-Jam (Mamba-Inspired Jam Detection)...")
+print("="*80)
+v6jam_net = train_v6_jam(hidden=64, epochs=300)
+eval_v6_like(v6jam_net, 'Graph-CTH-NODE v6-Jam')
 
 # =============================================================================
 # SOTA MODEL TRAINING
