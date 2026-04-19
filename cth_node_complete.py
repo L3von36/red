@@ -1098,71 +1098,72 @@ class ImprovedTDGCN(nn.Module):
 
 def train_improved_tdgcn(hidden=64, epochs=300):
     """Train Improved T-DGCN with jam-aware loss"""
-    print(f"Training Improved T-DGCN: {epochs} epochs")
+    seed = abs(hash('ImprovedTDGCN')) % (2**31)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
     net = ImprovedTDGCN(hidden=hidden, include_tod=True).to(device)
     opt = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
 
-    best_loss = float('inf')
+    best_vloss = float('inf')
     best_wts = None
     patience_ctr = 0
 
-    for ep in range(epochs):
+    print(f"\n{'='*80}")
+    print(f"Training Improved T-DGCN: {epochs} epochs")
+    print(f"  Dynamic Graph + Transformer Temporal Fusion + ToD priors")
+    print(f"  Jam-aware loss: MSE(free-flow) + 5×MAE(jams)")
+    print(f"{'='*80}\n")
+
+    for ep in range(1, epochs + 1):
         net.train()
-        loss_cum = 0.0
-        n_batch = 0
+        # Random training batch
+        t0 = np.random.randint(0, TRAIN_END - BATCH_TIME)
+        x_t = torch.tensor(speed_np[t0:t0+BATCH_TIME, :], dtype=torch.float32).T.to(device)
+        m_t = (torch.rand(NUM_NODES, 1, device=device) > 0.8).float().expand(-1, BATCH_TIME)
 
-        for batch_idx in range(len(train_indices)):
-            slot_idx = train_indices[batch_idx]
-            x_t = torch.tensor(speed_np[slot_idx:slot_idx+BATCH_TIME, :],
-                             dtype=torch.float32).T.to(device)  # [N, BATCH_TIME]
-            m_t = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, BATCH_TIME)
-            tod_free_t = torch.tensor(tod_free_np[:, slot_idx:slot_idx+BATCH_TIME],
-                                    dtype=torch.float32).to(device)
-            tod_jam_t = torch.tensor(tod_jam_np[:, slot_idx:slot_idx+BATCH_TIME],
-                                   dtype=torch.float32).to(device)
+        slots = (np.arange(t0, t0+BATCH_TIME) % 288).astype(int)
+        tod_free_t = torch.tensor(tod_free_np[:, slots], dtype=torch.float32).to(device)
+        tod_jam_t = torch.tensor(tod_jam_np[:, slots], dtype=torch.float32).to(device)
 
-            opt.zero_grad()
-            p_t = net(x_t, m_t, tod_free_t, tod_jam_t)  # [N, BATCH_TIME]
+        opt.zero_grad()
+        p_t = net(x_t, m_t, tod_free_t, tod_jam_t)  # [N, BATCH_TIME]
 
-            # Jam-aware loss (same as v6)
-            free_mask = x_t < (node_jam_thresh_norm[:, None])
-            jam_mask = ~free_mask
+        # Jam-aware loss (same as v6)
+        free_mask = x_t < (node_jam_thresh_norm[:, None])
+        jam_mask = ~free_mask
 
-            # Free-flow: MSE
-            loss_free = (free_mask.float() * (p_t - x_t) ** 2).mean()
+        # Free-flow: MSE
+        loss_free = (free_mask.float() * (p_t - x_t) ** 2).mean()
 
-            # Jam events: class-balanced weighted MAE
-            freq_jam = jam_mask.float().mean() + 1e-8
-            jam_weight = torch.clamp((1.0 - freq_jam) / freq_jam, 1.0, 30.0)
-            loss_jam = (jam_mask.float() * torch.abs(p_t - x_t)).mean() * jam_weight * 5.0
+        # Jam events: class-balanced weighted MAE
+        freq_jam = jam_mask.float().mean() + 1e-8
+        jam_weight = torch.clamp((1.0 - freq_jam) / freq_jam, 1.0, 30.0)
+        loss_jam = (jam_mask.float() * torch.abs(p_t - x_t)).mean() * jam_weight * 5.0
 
-            # Spatial smoothness
-            diff_space = p_t[:, 1:] - p_t[:, :-1]
-            loss_smooth = (diff_space ** 2).mean() * 0.01
+        # Spatial smoothness
+        diff_space = p_t[:, 1:] - p_t[:, :-1]
+        loss_smooth = (diff_space ** 2).mean() * 0.01
 
-            loss = loss_free + loss_jam + loss_smooth
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
-            opt.step()
+        loss = loss_free + loss_jam + loss_smooth
 
-            loss_cum += loss.item()
-            n_batch += 1
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"  ⚠️  NaN/Inf at ep {ep}, reinitializing...")
+            return train_improved_tdgcn(hidden, epochs)
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+        opt.step()
 
         # Validation
-        net.eval()
-        val_loss = 0.0
-        n_val = 0
-        with torch.no_grad():
-            for batch_idx in range(len(val_indices)):
-                slot_idx = val_indices[batch_idx]
-                x_v = torch.tensor(speed_np[slot_idx:slot_idx+BATCH_TIME, :],
-                                 dtype=torch.float32).T.to(device)
-                m_v = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, BATCH_TIME)
-                tod_free_v = torch.tensor(tod_free_np[:, slot_idx:slot_idx+BATCH_TIME],
-                                        dtype=torch.float32).to(device)
-                tod_jam_v = torch.tensor(tod_jam_np[:, slot_idx:slot_idx+BATCH_TIME],
-                                       dtype=torch.float32).to(device)
+        if ep % 10 == 0:
+            net.eval()
+            with torch.no_grad():
+                x_v = torch.tensor(speed_np[VAL_START:VAL_END, :], dtype=torch.float32).T.to(device)
+                m_v = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, VAL_END-VAL_START)
+                slots_v = (np.arange(VAL_START, VAL_END) % 288).astype(int)
+                tod_free_v = torch.tensor(tod_free_np[:, slots_v], dtype=torch.float32).to(device)
+                tod_jam_v = torch.tensor(tod_jam_np[:, slots_v], dtype=torch.float32).to(device)
 
                 p_v = net(x_v, m_v, tod_free_v, tod_jam_v)
 
@@ -1176,24 +1177,18 @@ def train_improved_tdgcn(hidden=64, epochs=300):
                 loss_smooth_v = (diff_space_v ** 2).mean() * 0.01
 
                 vl = loss_free_v + loss_jam_v + loss_smooth_v
-                val_loss += vl.item()
-                n_val += 1
 
-        avg_loss = loss_cum / max(1, n_batch)
-        avg_val_loss = val_loss / max(1, n_val)
+                if vl < best_vloss:
+                    best_vloss = vl
+                    best_wts = copy.deepcopy(net.state_dict())
+                    patience_ctr = 0
+                else:
+                    patience_ctr += 1
 
-        if avg_val_loss < best_loss:
-            best_loss = avg_val_loss
-            best_wts = copy.deepcopy(net.state_dict())
-            patience_ctr = 0
-        else:
-            patience_ctr += 1
-
-        if ep % 10 == 0:
-            print(f"  [ImprovedTDGCN] ep {ep:3d} | train_loss={avg_loss:.4f} | val_loss={avg_val_loss:.4f}")
-        if patience_ctr >= 3:
-            print(f"  → Early stop at ep {ep}")
-            break
+                print(f"  [ImprovedTDGCN] ep {ep:3d} | val_loss={vl:.4f}")
+                if patience_ctr >= 3:
+                    print(f"  → Early stop at ep {ep}")
+                    break
 
     if best_wts:
         net.load_state_dict(best_wts)
