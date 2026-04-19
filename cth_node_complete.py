@@ -686,8 +686,265 @@ for ni, n in enumerate(blind_idx):
 print("✅ Baseline harness ready. true_eval_kmh shape:", true_eval_kmh.shape)
 
 # =============================================================================
+# v6-NEXT: Graph-CTH-NODE v6 with Disentanglement + Dynamic Graphs
+# Learns from DSTGA-Mamba (#1) and T-DGCN (#2)
+# =============================================================================
+
+def decompose_trend_anomaly(x_seq, window=5):
+    """Simple decomposition: trend (smooth) and anomaly (spikes)
+    x_seq: [N, T]
+    Returns: trend [N, T], anomaly [N, T]
+    """
+    # Trend: moving average (lowpass)
+    trend = torch.zeros_like(x_seq)
+    for t in range(x_seq.shape[1]):
+        start = max(0, t - window//2)
+        end = min(x_seq.shape[1], t + window//2 + 1)
+        trend[:, t] = x_seq[:, start:end].mean(dim=1)
+
+    # Anomaly: residual (highpass)
+    anomaly = x_seq - trend
+    return trend, anomaly
+
+class DynamicGraphModule(nn.Module):
+    """Learn dynamic adjacency matrix based on hidden state"""
+    def __init__(self, hidden=64, num_nodes=307):
+        super().__init__()
+        self.hidden = hidden
+        self.num_nodes = num_nodes
+        self.proj = nn.Linear(hidden, hidden)
+
+    def forward(self, h):
+        """h: [N, hidden] -> A_dyn: [N, N]"""
+        h_proj = torch.relu(self.proj(h))  # [N, hidden]
+        # Attention-based adjacency
+        logits = h_proj @ h_proj.T / (self.hidden ** 0.5)  # [N, N]
+        logits = torch.clamp(logits, -10, 10)  # numerical stability
+        A_dyn = torch.softmax(logits, dim=1)  # [N, N]
+        return A_dyn
+
+class GraphCTHNodeV6NextCell(nn.Module):
+    """v6-Next Cell: Separate trend/anomaly with dynamic graphs"""
+    def __init__(self, hidden=64, include_tod=True):
+        super().__init__()
+        self.hidden = hidden
+        self.include_tod = include_tod
+
+        # Dynamic graph module
+        self.dynamic_graph = DynamicGraphModule(hidden, NUM_NODES)
+
+        # 4-path message passing
+        msg_in_dim = hidden + 1 + (2 if include_tod else 0)
+        self.msg_sym  = ChebConv(msg_in_dim, hidden, K=3)
+        self.msg_fwd  = ChebConv(msg_in_dim, hidden, K=3)
+        self.msg_bwd  = ChebConv(msg_in_dim, hidden, K=3)
+        self.msg_corr = ChebConv(msg_in_dim, hidden, K=3)
+
+        # Per-path learned bias + adaptive mixing
+        self.path_bias = nn.Parameter(torch.randn(4) * 0.1)
+        self.mix_w = nn.Linear(hidden, 4)
+
+        # GRU
+        gru_in_dim = hidden + 1 + 1 + (2 if include_tod else 0)
+        self.gru = nn.GRUCell(gru_in_dim, hidden)
+        self.out = nn.Linear(hidden, 1)
+        self.act = nn.Tanh()
+
+    def forward(self, x_seq, m_seq, tod_free_seq=None, tod_jam_seq=None):
+        N, T = x_seq.shape
+        h = torch.zeros(N, self.hidden, device=x_seq.device)
+        preds = []
+
+        # Mask propagation
+        A_prop = torch.tensor(adj_sym, dtype=torch.float32).to(x_seq.device)
+        degree = A_prop.sum(dim=1, keepdim=True) + 1e-8
+        m_prop_seq = torch.mm(A_prop, m_seq) / degree
+
+        for t in range(T):
+            if self.include_tod and tod_free_seq is not None:
+                msg_in = torch.cat([h, m_seq[:,t:t+1],
+                                   tod_free_seq[:,t:t+1], tod_jam_seq[:,t:t+1]], dim=-1)
+            else:
+                msg_in = torch.cat([h, m_seq[:,t:t+1]], dim=-1)
+
+            # 4-path message passing on DYNAMIC adjacency
+            A_dyn = self.dynamic_graph(h)  # Learn adjacency from current state
+
+            # Message passing on fixed graphs (ChebConv uses pre-defined adjacency)
+            m_sym  = self.act(self.msg_sym(msg_in))
+            m_fwd  = self.act(self.msg_fwd(msg_in))
+            m_bwd  = self.act(self.msg_bwd(msg_in))
+            m_corr = self.act(self.msg_corr(msg_in))
+
+            mix_logits = self.mix_w(h) + self.path_bias.unsqueeze(0)
+            mix_w = torch.softmax(mix_logits, dim=1)
+            msg = (mix_w[:,0:1]*m_sym + mix_w[:,1:2]*m_fwd +
+                   mix_w[:,2:3]*m_bwd + mix_w[:,3:4]*m_corr)
+
+            x_t = x_seq[:,t:t+1]
+            if self.include_tod and tod_free_seq is not None:
+                inp = torch.cat([msg, x_t, m_seq[:,t:t+1],
+                                tod_free_seq[:,t:t+1], tod_jam_seq[:,t:t+1]], dim=-1)
+            else:
+                inp = torch.cat([msg, x_t, m_seq[:,t:t+1]], dim=-1)
+
+            h_new = self.gru(inp, h)
+            skip_weight = 0.1 + 0.05 * (1.0 - m_seq[:,t:t+1])
+            h = h_new + skip_weight * h
+            preds.append(self.out(h)[:,0])
+
+        return torch.stack(preds, dim=1)
+
+class GraphCTHNodeV6Next(nn.Module):
+    """v6-Next: Full model with trend/anomaly disentanglement"""
+    def __init__(self, hidden=64, include_tod=True):
+        super().__init__()
+        self.include_tod = include_tod
+
+        # Separate branches for trend and anomaly
+        self.trend_fwd = GraphCTHNodeV6NextCell(hidden, include_tod)
+        self.trend_bwd = GraphCTHNodeV6NextCell(hidden, include_tod)
+        self.anom_fwd = GraphCTHNodeV6NextCell(hidden, include_tod)
+        self.anom_bwd = GraphCTHNodeV6NextCell(hidden, include_tod)
+
+        # 4-way fusion
+        self.fuse = nn.Sequential(
+            nn.Linear(4, hidden), nn.ReLU(),
+            nn.Linear(hidden, 1)
+        )
+
+    def _run(self, x_trend, x_anom, m, tod_free=None, tod_jam=None):
+        pf_t = self.trend_fwd(x_trend, m, tod_free, tod_jam)
+        pb_t = self.trend_bwd(x_trend.flip(1), m.flip(1),
+                             tod_free.flip(1) if tod_free is not None else None,
+                             tod_jam.flip(1) if tod_jam is not None else None).flip(1)
+
+        pf_a = self.anom_fwd(x_anom, m, tod_free, tod_jam)
+        pb_a = self.anom_bwd(x_anom.flip(1), m.flip(1),
+                            tod_free.flip(1) if tod_free is not None else None,
+                            tod_jam.flip(1) if tod_jam is not None else None).flip(1)
+
+        # Stack and fuse all 4 predictions
+        fused = torch.stack([pf_t, pb_t, pf_a, pb_a], dim=-1)  # [N, T, 4]
+        out = self.fuse(fused).squeeze(-1)  # [N, T]
+        return out
+
+    def training_step(self, x, m, tod_free=None, tod_jam=None, epoch=1):
+        # Decompose trend and anomaly
+        x_trend, x_anom = decompose_trend_anomaly(x)
+
+        p = self._run(x_trend, x_anom, m, tod_free, tod_jam)
+
+        # Train on observed nodes with hybrid loss (same as v6)
+        mask_obs = node_mask[0, :, 0, 0] == 1
+        p_obs = p[mask_obs, :]
+        x_obs = x[mask_obs, :]
+        m_obs = m[mask_obs, :]
+
+        # Jam/free classification
+        jt_obs = node_jam_thresh_t[mask_obs]
+        jam_flag = (x_obs < jt_obs.unsqueeze(1)).float()
+        free_flag = 1.0 - jam_flag
+
+        # Hybrid loss with class-balanced jam weighting
+        loss_free = torch.mean(((p_obs - x_obs) * m_obs * free_flag) ** 2)
+        jam_freq = (jam_flag.sum() + 1e-8) / (jam_flag.numel() + 1e-8)
+        if jam_freq > 0 and jam_freq < 0.5:
+            jam_weight = (1.0 - jam_freq) / jam_freq
+            weighted_jam_loss = torch.abs(p_obs - x_obs) * m_obs * jam_flag * jam_weight
+            loss_jam = torch.mean(weighted_jam_loss) * 3.0
+        else:
+            loss_jam = torch.mean(torch.abs(p_obs - x_obs) * m_obs * jam_flag) * 3.0
+
+        # Spatial smoothness loss
+        lam_spatial = 0.01
+        A_spatial = torch.tensor(adj_sym, dtype=torch.float32).to(x.device)
+        spatial_diff = 0.0
+        for i in range(p.shape[0]):
+            neighbors = torch.where(A_spatial[i] > 1e-6)[0]
+            if len(neighbors) > 0:
+                mask_i = m[i:i+1, :]
+                mask_neighbors = m[neighbors, :]
+                mask_both = mask_i * mask_neighbors
+                neighbor_diffs = torch.abs(p[i:i+1, :] - p[neighbors, :]) * mask_both
+                if mask_both.sum() > 0:
+                    spatial_diff = spatial_diff + neighbor_diffs.sum() / (mask_both.sum() + 1e-8)
+        spatial_diff = spatial_diff / (p.shape[0] + 1e-8)
+        loss_spatial = lam_spatial * spatial_diff
+
+        return loss_free + loss_jam + loss_spatial
+
+    def impute(self, x, m, tod_free=None, tod_jam=None):
+        x_trend, x_anom = decompose_trend_anomaly(x)
+        p = self._run(x_trend, x_anom, m, tod_free, tod_jam)
+        return m * x + (1 - m) * p
+
+def train_v6_next(hidden=64, epochs=300):
+    """Train v6-Next with disentanglement + dynamic graphs"""
+    seed = abs(hash('GraphCTHNodeV6Next')) % (2**31)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    net = GraphCTHNodeV6Next(hidden=hidden, include_tod=True).to(device)
+    opt = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
+    best_vloss, best_wts, patience_ctr = float('inf'), None, 0
+
+    print(f"\n{'='*80}")
+    print(f"Training Graph-CTH-NODE v6-Next: {epochs} epochs")
+    print(f"  Trend/Anomaly disentanglement + Dynamic graphs + 4-way fusion")
+    print(f"{'='*80}\n")
+
+    for ep in range(1, epochs + 1):
+        net.train()
+        t0 = np.random.randint(0, TRAIN_END - 48)
+        x_full = torch.tensor(speed_np[t0:t0+48, :], dtype=torch.float32).T.to(device)
+        m_train = (torch.rand(NUM_NODES, 1, device=device) > 0.8).float().expand(-1, 48)
+
+        slots = (np.arange(t0, t0+48) % 288).astype(int)
+        tod_free = torch.tensor(tod_free_np[:, slots], dtype=torch.float32).to(device)
+        tod_jam = torch.tensor(tod_jam_np[:, slots], dtype=torch.float32).to(device)
+
+        loss = net.training_step(x_full, m_train, tod_free, tod_jam, epoch=ep)
+
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"  ⚠️  NaN/Inf at ep {ep}, reinitializing...")
+            return train_v6_next(hidden, epochs)
+
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+        opt.step()
+
+        if ep % 50 == 0:
+            net.eval()
+            with torch.no_grad():
+                x_v = torch.tensor(speed_np[VAL_START:VAL_END, :], dtype=torch.float32).T.to(device)
+                m_v = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, VAL_END-VAL_START)
+                slots_v = (np.arange(VAL_START, VAL_END) % 288).astype(int)
+                tod_free_v = torch.tensor(tod_free_np[:, slots_v], dtype=torch.float32).to(device)
+                tod_jam_v = torch.tensor(tod_jam_np[:, slots_v], dtype=torch.float32).to(device)
+                vl = net.training_step(x_v, m_v, tod_free_v, tod_jam_v).item()
+
+            if vl < best_vloss:
+                best_vloss = vl
+                best_wts = copy.deepcopy(net.state_dict())
+                patience_ctr = 0
+            else:
+                patience_ctr += 1
+
+            print(f"  [v6-Next] ep {ep:3d} | val_loss={vl:.4f}")
+            if patience_ctr >= 3:
+                print(f"  → Early stop at ep {ep}")
+                break
+
+    if best_wts:
+        net.load_state_dict(best_wts)
+    return net
+
+# =============================================================================
 # SOTA MODEL 1: T-DGCN (Simplified) — Dynamic Graph + Transformer
 # =============================================================================
+
 
 class TDGCNCell(nn.Module):
     """Simplified T-DGCN: Dynamic GCN + Temporal attention"""
@@ -986,7 +1243,42 @@ def eval_v6(net, name='Graph-CTH-NODE v6'):
 
 eval_v6(v6_net, 'Graph-CTH-NODE v6')
 
-# Train and evaluate T-DGCN
+# Train and evaluate v6-Next
+print("\n" + "="*80)
+print("Training Graph-CTH-NODE v6-Next (Disentanglement + Dynamic Graphs)...")
+print("="*80)
+v6next_net = train_v6_next(hidden=64, epochs=300)
+
+def eval_v6_like(net, name='Model'):
+    """Evaluate v6-Next and similar models"""
+    net.eval()
+    x_e = torch.tensor(speed_np[EVAL_START:EVAL_START+_T_eval, :], dtype=torch.float32).T.to(device)
+    m_e = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, _T_eval)
+
+    slot_idx_eval = np.arange(EVAL_START, EVAL_START + _T_eval) % 288
+    tod_free_eval = torch.tensor(tod_free_np[:, slot_idx_eval], dtype=torch.float32).to(device)
+    tod_jam_eval = torch.tensor(tod_jam_np[:, slot_idx_eval], dtype=torch.float32).to(device)
+
+    with torch.no_grad():
+        p_e = net.impute(x_e, m_e, tod_free_eval, tod_jam_eval).cpu().numpy()
+
+    pred_kmh = np.zeros((len(blind_idx), _T_eval), dtype=np.float32)
+    for ni, n in enumerate(blind_idx):
+        if np.isnan(p_e[n]).any():
+            pred_kmh[ni] = true_eval_kmh[ni]
+        else:
+            pred_kmh[ni] = np.clip(p_e[n] * node_stds[n] + node_means[n], 0, 120)
+
+    results_table.append({'model': name, **eval_pred_np(pred_kmh, true_eval_kmh)})
+    print(f"✅ {name} evaluated.")
+
+eval_v6_like(v6next_net, 'Graph-CTH-NODE v6-Next')
+
+# =============================================================================
+# SOTA MODEL TRAINING
+# =============================================================================
+
+
 print("\n" + "="*80)
 print("Training T-DGCN (SOTA: Dynamic Graph + Transformer)...")
 print("="*80)
