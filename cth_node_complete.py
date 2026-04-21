@@ -1196,6 +1196,274 @@ def train_improved_tdgcn(hidden=64, epochs=300):
     return net
 
 # =============================================================================
+# Graph-CTH-NODE v7 "FreqDGT" — Frequency-Decomposed Dynamic Graph Transformer
+# THESIS CONTRIBUTION: Novel combination of wavelet-style decomposition +
+#                      dynamic graphs + expert gating
+# =============================================================================
+
+class FreqDecomposer(nn.Module):
+    """Decompose signal into low-freq (smooth trends) and high-freq (spikes/jams)
+    via learnable moving average filter."""
+    def __init__(self, window=5):
+        super().__init__()
+        self.window = window
+        self.kernel = nn.Parameter(torch.ones(1, 1, window) / window)
+
+    def forward(self, x):
+        """x: [N, T] -> (low [N, T], high [N, T])"""
+        x_in = x.unsqueeze(1)  # [N, 1, T]
+        pad = self.window // 2
+        x_pad = F.pad(x_in, (pad, pad), mode='replicate')
+        low = F.conv1d(x_pad, self.kernel).squeeze(1)  # [N, T]
+        high = x - low
+        return low, high
+
+
+class LowFreqBranch(nn.Module):
+    """v6-style processing for smooth trends (4-path ChebConv + bidirectional GRU)"""
+    def __init__(self, hidden=64, include_tod=True):
+        super().__init__()
+        self.hidden = hidden
+        self.include_tod = include_tod
+
+        msg_in_dim = hidden + 1 + (2 if include_tod else 0)
+        self.msg_sym = ChebConv(msg_in_dim, hidden, K=2)
+        self.msg_fwd = ChebConv(msg_in_dim, hidden, K=2)
+        self.msg_bwd = ChebConv(msg_in_dim, hidden, K=2)
+        self.msg_corr = ChebConv(msg_in_dim, hidden, K=2)
+
+        self.path_bias = nn.Parameter(torch.randn(4) * 0.1)
+        self.mix_w = nn.Linear(hidden, 4)
+
+        gru_in_dim = hidden + 1 + 1 + (2 if include_tod else 0)
+        self.gru_fwd = nn.GRUCell(gru_in_dim, hidden)
+        self.gru_bwd = nn.GRUCell(gru_in_dim, hidden)
+
+        self.out = nn.Linear(hidden * 2, 1)
+        self.act = nn.Tanh()
+
+    def _forward_dir(self, gru, x_seq, m_seq, tod_free, tod_jam):
+        N, T = x_seq.shape
+        h = torch.zeros(N, self.hidden, device=x_seq.device)
+        hs = []
+        for t in range(T):
+            if self.include_tod and tod_free is not None:
+                msg_in = torch.cat([h, m_seq[:,t:t+1],
+                                   tod_free[:,t:t+1], tod_jam[:,t:t+1]], dim=-1)
+            else:
+                msg_in = torch.cat([h, m_seq[:,t:t+1]], dim=-1)
+
+            m_sym = self.act(self.msg_sym(msg_in))
+            m_fwd_g = self.act(self.msg_fwd(msg_in))
+            m_bwd_g = self.act(self.msg_bwd(msg_in))
+            m_corr = self.act(self.msg_corr(msg_in))
+
+            mix = torch.softmax(self.mix_w(h) + self.path_bias, dim=-1)
+            msg = (mix[:, 0:1] * m_sym + mix[:, 1:2] * m_fwd_g +
+                   mix[:, 2:3] * m_bwd_g + mix[:, 3:4] * m_corr)
+
+            if self.include_tod and tod_free is not None:
+                gru_in = torch.cat([msg, x_seq[:,t:t+1], m_seq[:,t:t+1],
+                                   tod_free[:,t:t+1], tod_jam[:,t:t+1]], dim=-1)
+            else:
+                gru_in = torch.cat([msg, x_seq[:,t:t+1], m_seq[:,t:t+1]], dim=-1)
+
+            h_old = h
+            h = gru(gru_in, h)
+            skip_weight = 0.1 + 0.05 * (1.0 - m_seq[:,t:t+1])
+            h = h + skip_weight * h_old
+            hs.append(h)
+        return torch.stack(hs, dim=1)  # [N, T, hidden]
+
+    def forward(self, x_seq, m_seq, tod_free=None, tod_jam=None):
+        h_fwd = self._forward_dir(self.gru_fwd, x_seq, m_seq, tod_free, tod_jam)
+        x_r = x_seq.flip(1)
+        m_r = m_seq.flip(1)
+        tod_f_r = tod_free.flip(1) if tod_free is not None else None
+        tod_j_r = tod_jam.flip(1) if tod_jam is not None else None
+        h_bwd = self._forward_dir(self.gru_bwd, x_r, m_r, tod_f_r, tod_j_r).flip(1)
+        h = torch.cat([h_fwd, h_bwd], dim=-1)  # [N, T, 2*hidden]
+        pred = self.out(h).squeeze(-1)
+        return pred
+
+
+class HighFreqBranch(nn.Module):
+    """Dynamic graph + transformer for spikes/jams/transitions"""
+    def __init__(self, hidden=64):
+        super().__init__()
+        self.hidden = hidden
+        self.dynamic_graph = DynamicGraphConstructor(hidden, NUM_NODES)
+        self.gcn_w = nn.Linear(hidden, hidden)
+        self.in_proj = nn.Linear(2, hidden)  # [x_high, m]
+        self.transformer = TransformerTemporalBlock(hidden, num_heads=4)
+        self.out = nn.Linear(hidden, 1)
+
+    def forward(self, x_high, m_seq):
+        N, T = x_high.shape
+        inp = torch.stack([x_high, m_seq], dim=-1)  # [N, T, 2]
+        h_seq = self.in_proj(inp)  # [N, T, hidden]
+
+        # Dynamic graph propagation per timestep
+        h_new = []
+        for t in range(T):
+            h_t = h_seq[:, t, :]
+            A_dyn = self.dynamic_graph(h_t)
+            h_gcn = A_dyn @ torch.relu(self.gcn_w(h_t))
+            h_new.append((h_t + h_gcn).unsqueeze(1))
+        h_seq = torch.cat(h_new, dim=1)
+
+        # Temporal transformer
+        h_seq = self.transformer(h_seq)
+        pred = self.out(h_seq).squeeze(-1)
+        return pred
+
+
+class ExpertGate(nn.Module):
+    """Routes predictions between low-freq and high-freq experts based on context"""
+    def __init__(self, hidden=32):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(4, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 1)
+        )
+
+    def forward(self, x, m, tod_free, tod_jam):
+        """Returns gate [N, T] in [0, 1]: higher = more high-freq weight"""
+        feat = torch.stack([x, m, tod_free, tod_jam], dim=-1)
+        gate = torch.sigmoid(self.mlp(feat)).squeeze(-1)
+        return gate
+
+
+class FreqDGT(nn.Module):
+    """v7: Frequency-Decomposed Dynamic Graph Transformer (Thesis Contribution)
+
+    Novel combination of:
+      - Frequency decomposition (like DSTGA-Mamba's wavelet idea)
+      - Dynamic graph construction (like T-DGCN)
+      - 4-path graph convolution + ToD priors (like v6)
+      - Expert routing gate (novel)
+    """
+    def __init__(self, hidden=64, include_tod=True, freq_window=5):
+        super().__init__()
+        self.hidden = hidden
+        self.include_tod = include_tod
+        self.decomposer = FreqDecomposer(window=freq_window)
+        self.low_branch = LowFreqBranch(hidden, include_tod)
+        self.high_branch = HighFreqBranch(hidden)
+        self.gate = ExpertGate(hidden=32)
+
+    def forward(self, x_seq, m_seq, tod_free=None, tod_jam=None):
+        low_signal, high_signal = self.decomposer(x_seq)
+        low_pred = self.low_branch(low_signal, m_seq, tod_free, tod_jam)
+        high_pred = self.high_branch(high_signal, m_seq)
+
+        if tod_free is None:
+            tod_free = torch.zeros_like(x_seq)
+            tod_jam = torch.zeros_like(x_seq)
+        gate = self.gate(x_seq, m_seq, tod_free, tod_jam)
+
+        # low_pred reconstructs trend, high_pred adds spike/jam, gate modulates
+        final_pred = low_pred + gate * high_pred
+        return final_pred
+
+    def impute(self, x_seq, m_seq, tod_free=None, tod_jam=None):
+        return self.forward(x_seq, m_seq, tod_free, tod_jam)
+
+
+def train_freqdgt(hidden=64, epochs=400):
+    """Train FreqDGT (v7) with jam-aware hybrid loss"""
+    seed = abs(hash('FreqDGT')) % (2**31)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    net = FreqDGT(hidden=hidden, include_tod=True).to(device)
+    opt = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
+
+    best_vloss = float('inf')
+    best_wts = None
+    patience_ctr = 0
+
+    print(f"\n{'='*80}")
+    print(f"Training Graph-CTH-NODE v7 (FreqDGT): {epochs} epochs")
+    print(f"  Freq decomposition + Dynamic Graph + Expert Gating + ToD priors")
+    print(f"  Target: Beat DSTGA-Mamba (0.39 MAE)")
+    print(f"{'='*80}\n")
+
+    for ep in range(1, epochs + 1):
+        net.train()
+        t0 = np.random.randint(0, TRAIN_END - BATCH_TIME)
+        x_t = torch.tensor(speed_np[t0:t0+BATCH_TIME, :], dtype=torch.float32).T.to(device)
+        m_t = (torch.rand(NUM_NODES, 1, device=device) > 0.8).float().expand(-1, BATCH_TIME)
+
+        slots = (np.arange(t0, t0+BATCH_TIME) % 288).astype(int)
+        tod_free_t = torch.tensor(tod_free_np[:, slots], dtype=torch.float32).to(device)
+        tod_jam_t = torch.tensor(tod_jam_np[:, slots], dtype=torch.float32).to(device)
+
+        opt.zero_grad()
+        p_t = net(x_t, m_t, tod_free_t, tod_jam_t)
+
+        free_mask = x_t < (node_jam_thresh_norm[:, None])
+        jam_mask = ~free_mask
+
+        loss_free = (free_mask.float() * (p_t - x_t) ** 2).mean()
+        freq_jam = jam_mask.float().mean() + 1e-8
+        jam_weight = torch.clamp((1.0 - freq_jam) / freq_jam, 1.0, 30.0)
+        loss_jam = (jam_mask.float() * torch.abs(p_t - x_t)).mean() * jam_weight * 5.0
+
+        diff_space = p_t[:, 1:] - p_t[:, :-1]
+        loss_smooth = (diff_space ** 2).mean() * 0.01
+
+        loss = loss_free + loss_jam + loss_smooth
+
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"  ⚠️  NaN/Inf at ep {ep}, reinitializing...")
+            return train_freqdgt(hidden, epochs)
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+        opt.step()
+
+        if ep % 10 == 0:
+            net.eval()
+            with torch.no_grad():
+                x_v = torch.tensor(speed_np[VAL_START:VAL_END, :], dtype=torch.float32).T.to(device)
+                m_v = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, VAL_END-VAL_START)
+                slots_v = (np.arange(VAL_START, VAL_END) % 288).astype(int)
+                tod_free_v = torch.tensor(tod_free_np[:, slots_v], dtype=torch.float32).to(device)
+                tod_jam_v = torch.tensor(tod_jam_np[:, slots_v], dtype=torch.float32).to(device)
+
+                p_v = net(x_v, m_v, tod_free_v, tod_jam_v)
+
+                free_mask_v = x_v < (node_jam_thresh_norm[:, None])
+                jam_mask_v = ~free_mask_v
+                loss_free_v = (free_mask_v.float() * (p_v - x_v) ** 2).mean()
+                freq_jam_v = jam_mask_v.float().mean() + 1e-8
+                jam_weight_v = torch.clamp((1.0 - freq_jam_v) / freq_jam_v, 1.0, 30.0)
+                loss_jam_v = (jam_mask_v.float() * torch.abs(p_v - x_v)).mean() * jam_weight_v * 5.0
+                diff_space_v = p_v[:, 1:] - p_v[:, :-1]
+                loss_smooth_v = (diff_space_v ** 2).mean() * 0.01
+                vl = loss_free_v + loss_jam_v + loss_smooth_v
+
+                if vl < best_vloss:
+                    best_vloss = vl
+                    best_wts = copy.deepcopy(net.state_dict())
+                    patience_ctr = 0
+                else:
+                    patience_ctr += 1
+
+                print(f"  [v7-FreqDGT] ep {ep:3d} | val_loss={vl:.4f}")
+                if patience_ctr >= 4:
+                    print(f"  → Early stop at ep {ep}")
+                    break
+
+    if best_wts:
+        net.load_state_dict(best_wts)
+    return net
+
+# =============================================================================
 # v6-NEXT: Graph-CTH-NODE v6 with Disentanglement + Dynamic Graphs
 # =============================================================================
 
@@ -1798,12 +2066,21 @@ results_table.append({
 })
 print("✅ Graph-CTH-NODE v6-Jam (Cached) added.")
 
-# Train and evaluate Improved T-DGCN (Thesis Contribution)
+# Train and evaluate Improved T-DGCN (Thesis Contribution - v1)
 print("\n" + "="*80)
 print("Training Improved T-DGCN (Thesis Contribution: Dynamic Graphs + Transformer)...")
 print("="*80)
 improved_tdgcn_net = train_improved_tdgcn(hidden=64, epochs=300)
 eval_v6_like(improved_tdgcn_net, 'Improved T-DGCN (Thesis)')
+
+# Train and evaluate FreqDGT v7 (Main Thesis Contribution - targets SOTA)
+print("\n" + "="*80)
+print("Training Graph-CTH-NODE v7 FreqDGT (Main Thesis Contribution)...")
+print("  Freq Decomposition + Dynamic Graph + Expert Gating + ToD priors")
+print("  Target: Beat DSTGA-Mamba (0.39 MAE)")
+print("="*80)
+freqdgt_net = train_freqdgt(hidden=64, epochs=400)
+eval_v6_like(freqdgt_net, 'Graph-CTH-NODE v7 FreqDGT')
 
 # =============================================================================
 # SOTA MODEL RESULTS (Previously Trained — Using Cached Results)
