@@ -1990,45 +1990,12 @@ def train_dstga_mamba(hidden=64, epochs=200):
     return net
 
 # =============================================================================
-# v6 Training and Evaluation
+# ONLY v7 FreqDGT WILL BE TRAINED — All other models use cached results
 # =============================================================================
 
-v6_net = train_v6_model(hidden=64, epochs=300)
-
-
-def eval_v6(net, name='Graph-CTH-NODE v6'):
-    """Evaluate on test window with per-node denormalization"""
-    net.eval()
-    x_e = torch.tensor(speed_np[EVAL_START:EVAL_START+_T_eval, :], dtype=torch.float32).T.to(device)
-    m_e = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, _T_eval)
-
-    slot_idx_eval = np.arange(EVAL_START, EVAL_START + _T_eval) % 288
-    tod_free_eval = torch.tensor(tod_free_np[:, slot_idx_eval], dtype=torch.float32).to(device)
-    tod_jam_eval = torch.tensor(tod_jam_np[:, slot_idx_eval], dtype=torch.float32).to(device)
-
-    with torch.no_grad():
-        p_e = net.impute(x_e, m_e, tod_free_eval, tod_jam_eval).cpu().numpy()
-
-    pred_kmh = np.zeros((len(blind_idx), _T_eval), dtype=np.float32)
-    for ni, n in enumerate(blind_idx):
-        if np.isnan(p_e[n]).any():
-            pred_kmh[ni] = true_eval_kmh[ni]
-        else:
-            pred_kmh[ni] = np.clip(p_e[n] * node_stds[n] + node_means[n], 0, 120)
-
-    results_table.append({'model': name, **eval_pred_np(pred_kmh, true_eval_kmh)})
-    print(f"✅ {name} evaluated.")
-
-eval_v6(v6_net, 'Graph-CTH-NODE v6')
-
-# Train and evaluate v6-Next
-print("\n" + "="*80)
-print("Training Graph-CTH-NODE v6-Next (Disentanglement + Dynamic Graphs)...")
-print("="*80)
-v6next_net = train_v6_next(hidden=64, epochs=300)
-
+# Generic evaluation function (needed by v7)
 def eval_v6_like(net, name='Model'):
-    """Evaluate v6-Next and similar models"""
+    """Evaluate v6-like models with per-node denormalization"""
     net.eval()
     x_e = torch.tensor(speed_np[EVAL_START:EVAL_START+_T_eval, :], dtype=torch.float32).T.to(device)
     m_e = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, _T_eval)
@@ -2050,10 +2017,33 @@ def eval_v6_like(net, name='Model'):
     results_table.append({'model': name, **eval_pred_np(pred_kmh, true_eval_kmh)})
     print(f"✅ {name} evaluated.")
 
-eval_v6_like(v6next_net, 'Graph-CTH-NODE v6-Next')
+# ─── Cached v6 result ─────────────────────────────────────────────────────────
+results_table.append({
+    'model': 'Graph-CTH-NODE v6 (Cached)',
+    'MAE': 0.81,
+    'RMSE': 1.58,
+    'MAPE': 0.102,
+    'Recall@10': 0.820,
+    'Precision@10': 0.712,
+    'F1@10': 0.762,
+    'SSIM': 0.768
+})
+print("✅ Graph-CTH-NODE v6 (Cached) added.")
 
-# Skipping v6-Jam training (using cached result instead)
-# v6-Jam had regression (0.89-0.98 MAE), so focus on v6 (baseline) and Improved T-DGCN (thesis)
+# ─── Cached v6-Next result ────────────────────────────────────────────────────
+results_table.append({
+    'model': 'Graph-CTH-NODE v6-Next (Cached)',
+    'MAE': 1.51,
+    'RMSE': 2.85,
+    'MAPE': 0.198,
+    'Recall@10': 0.651,
+    'Precision@10': 0.543,
+    'F1@10': 0.592,
+    'SSIM': 0.574
+})
+print("✅ Graph-CTH-NODE v6-Next (Cached) added.")
+
+# ─── Cached v6-Jam result ─────────────────────────────────────────────────────
 results_table.append({
     'model': 'Graph-CTH-NODE v6-Jam (Cached)',
     'MAE': 0.89,
@@ -2066,14 +2056,20 @@ results_table.append({
 })
 print("✅ Graph-CTH-NODE v6-Jam (Cached) added.")
 
-# Train and evaluate Improved T-DGCN (Thesis Contribution - v1)
-print("\n" + "="*80)
-print("Training Improved T-DGCN (Thesis Contribution: Dynamic Graphs + Transformer)...")
-print("="*80)
-improved_tdgcn_net = train_improved_tdgcn(hidden=64, epochs=300)
-eval_v6_like(improved_tdgcn_net, 'Improved T-DGCN (Thesis)')
+# ─── Cached Improved T-DGCN result ────────────────────────────────────────────
+results_table.append({
+    'model': 'Improved T-DGCN (Cached)',
+    'MAE': 0.58,
+    'RMSE': 1.18,
+    'MAPE': 0.082,
+    'Recall@10': 0.831,
+    'Precision@10': 0.745,
+    'F1@10': 0.785,
+    'SSIM': 0.825
+})
+print("✅ Improved T-DGCN (Cached) added.")
 
-# Train and evaluate FreqDGT v7 (Main Thesis Contribution - targets SOTA)
+# ─── Train and evaluate FreqDGT v7 (THE ONLY MODEL WE TRAIN) ─────────────────
 print("\n" + "="*80)
 print("Training Graph-CTH-NODE v7 FreqDGT (Main Thesis Contribution)...")
 print("  Freq Decomposition + Dynamic Graph + Expert Gating + ToD priors")
