@@ -1131,7 +1131,8 @@ def train_improved_tdgcn(hidden=64, epochs=300):
         p_t = net(x_t, m_t, tod_free_t, tod_jam_t)  # [N, BATCH_TIME]
 
         # Jam-aware loss (same as v6)
-        free_mask = x_t < (node_jam_thresh_norm[:, None])
+        node_jam_thresh_t = torch.tensor(node_jam_thresh_norm, dtype=torch.float32).to(device)
+        free_mask = x_t < (node_jam_thresh_t[:, None])
         jam_mask = ~free_mask
 
         # Free-flow: MSE
@@ -1168,7 +1169,8 @@ def train_improved_tdgcn(hidden=64, epochs=300):
 
                 p_v = net(x_v, m_v, tod_free_v, tod_jam_v)
 
-                free_mask_v = x_v < (node_jam_thresh_norm[:, None])
+                node_jam_thresh_t = torch.tensor(node_jam_thresh_norm, dtype=torch.float32).to(device)
+                free_mask_v = x_v < (node_jam_thresh_t[:, None])
                 jam_mask_v = ~free_mask_v
                 loss_free_v = (free_mask_v.float() * (p_v - x_v) ** 2).mean()
                 freq_jam_v = jam_mask_v.float().mean() + 1e-8
@@ -1405,7 +1407,9 @@ def train_freqdgt(hidden=64, epochs=400):
         opt.zero_grad()
         p_t = net(x_t, m_t, tod_free_t, tod_jam_t)
 
-        free_mask = x_t < (node_jam_thresh_norm[:, None])
+        # Convert jam threshold to tensor for comparison
+        node_jam_thresh_t = torch.tensor(node_jam_thresh_norm, dtype=torch.float32).to(device)
+        free_mask = x_t < (node_jam_thresh_t[:, None])
         jam_mask = ~free_mask
 
         loss_free = (free_mask.float() * (p_t - x_t) ** 2).mean()
@@ -1437,7 +1441,8 @@ def train_freqdgt(hidden=64, epochs=400):
 
                 p_v = net(x_v, m_v, tod_free_v, tod_jam_v)
 
-                free_mask_v = x_v < (node_jam_thresh_norm[:, None])
+                node_jam_thresh_t = torch.tensor(node_jam_thresh_norm, dtype=torch.float32).to(device)
+                free_mask_v = x_v < (node_jam_thresh_t[:, None])
                 jam_mask_v = ~free_mask_v
                 loss_free_v = (free_mask_v.float() * (p_v - x_v) ** 2).mean()
                 freq_jam_v = jam_mask_v.float().mean() + 1e-8
