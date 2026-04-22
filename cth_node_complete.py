@@ -3229,11 +3229,12 @@ for ax, vals, title, ylabel in [
     ax.set_xticklabels(short_names, rotation=45, ha='right', fontsize=8)
     ax.set_title(title, fontsize=11, fontweight='bold')
     ax.set_ylabel(ylabel, fontsize=10)
-    # Highlight ours
-    our_idx = next(i for i, r in enumerate(results_table_sorted)
-                   if r['model'] == 'Graph-CTH-NODE v6')
-    bars[our_idx].set_edgecolor('black')
-    bars[our_idx].set_linewidth(2)
+    # Highlight ours (v7 FreqDGT — the thesis contribution)
+    our_idx = next((i for i, r in enumerate(results_table_sorted)
+                   if 'v7 FreqDGT' in r['model']), None)
+    if our_idx is not None:
+        bars[our_idx].set_edgecolor('black')
+        bars[our_idx].set_linewidth(2)
 
 from matplotlib.patches import Patch
 legend_els = [
