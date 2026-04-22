@@ -3181,11 +3181,17 @@ tier_labels = {
     'GCASTN+':               'T3',
     'ADGCN':                 'T3',
     'Graph-CTH-NODE v6':     'Ours',
+    'Graph-CTH-NODE v7 FreqDGT': 'Ours',
 }
 
+def get_tier(model_name):
+    # Strip ' (Cached)' suffix for lookup
+    base = model_name.replace(' (Cached)', '')
+    return tier_labels.get(base, tier_labels.get(model_name, ''))
+
 for r in results_table_sorted:
-    tier  = tier_labels.get(r['model'], '')
-    flag  = ' ◀' if r['model'] == 'Graph-CTH-NODE v6' else ''
+    tier  = get_tier(r['model'])
+    flag  = ' ◀' if 'v7 FreqDGT' in r['model'] else ''
     print(f"  [{tier:<4}] {r['model']:<21} "
           f"{r['mae_all']:>9.2f} {r['mae_jam']:>9.2f} "
           f"{r['prec']:>7.3f} {r['rec']:>7.3f} {r['f1']:>7.3f} "
@@ -3200,51 +3206,54 @@ print("    SSIM    : structural similarity of spatiotemporal speed field")
 print("  Tier: T1=Statistical  T2=RNN/temporal  T3=GNN imputation  Ours=Graph-CTH-NODE")
 print("=" * 90)
 
-# Bar chart
+# Bar chart — exclude T1 baselines to keep y-axis readable
+plot_rows = [r for r in results_table_sorted if get_tier(r['model']) != 'T1']
+
+names_p   = [r['model'] for r in plot_rows]
+mae_all_p = [r['mae_all'] for r in plot_rows]
+mae_jam_p = [r['mae_jam'] for r in plot_rows]
+f1_vals_p = [r['f1']      for r in plot_rows]
+
+tier_colors = {'Ours': '#d62728', 'T3': '#1f77b4', 'T2': '#ff7f0e', '': '#7f7f7f'}
+colors_p = [tier_colors.get(get_tier(r['model']), '#7f7f7f') for r in plot_rows]
+
+short_names_p = [
+    n.replace('Graph-CTH-NODE ', 'v-').replace(' (Cached)', '')
+     .replace('KNN Kriging (k=5)', 'KNN-K')
+     .replace('Linear Interpolation', 'Lin.Interp')
+     .replace('Historical Average', 'Hist.Avg')
+    for n in names_p
+]
+
 fig2, axes = plt.subplots(1, 3, figsize=(18, 6), dpi=120)
-names   = [r['model'] for r in results_table_sorted]
-mae_all = [r['mae_all'] for r in results_table_sorted]
-mae_jam = [r['mae_jam'] for r in results_table_sorted]
-f1_vals = [r['f1']      for r in results_table_sorted]
-
-colors  = []
-for r in results_table_sorted:
-    t = tier_labels.get(r['model'], '')
-    if t == 'Ours':    colors.append('#d62728')
-    elif t == 'T3':    colors.append('#1f77b4')
-    elif t == 'T2':    colors.append('#ff7f0e')
-    else:              colors.append('#7f7f7f')
-
-short_names = [n.replace('Graph-CTH-NODE ', '').replace('KNN Kriging (k=5)', 'KNN-K')
-               .replace('Linear Interpolation', 'Lin.Interp')
-               .replace('Historical Average', 'Hist.Avg') for n in names]
 
 for ax, vals, title, ylabel in [
-    (axes[0], mae_all, 'MAE — All Blind Nodes (km/h)', 'MAE (km/h)'),
-    (axes[1], mae_jam, 'MAE — Jam Conditions (km/h)',  'MAE (km/h)'),
-    (axes[2], f1_vals, 'Jam Detection F1 (speed<40)',  'F1'),
+    (axes[0], mae_all_p, 'MAE — All Blind Nodes (km/h)', 'MAE (km/h)'),
+    (axes[1], mae_jam_p, 'MAE — Jam Conditions (km/h)',  'MAE (km/h)'),
+    (axes[2], f1_vals_p, 'Jam Detection F1 (speed<40)',  'F1'),
 ]:
-    bars = ax.bar(range(len(vals)), vals, color=colors, edgecolor='white', linewidth=0.5)
+    bars = ax.bar(range(len(vals)), vals, color=colors_p, edgecolor='white', linewidth=0.5)
     ax.set_xticks(range(len(vals)))
-    ax.set_xticklabels(short_names, rotation=45, ha='right', fontsize=8)
+    ax.set_xticklabels(short_names_p, rotation=45, ha='right', fontsize=8)
     ax.set_title(title, fontsize=11, fontweight='bold')
     ax.set_ylabel(ylabel, fontsize=10)
-    # Highlight ours (v7 FreqDGT — the thesis contribution)
-    our_idx = next((i for i, r in enumerate(results_table_sorted)
-                   if 'v7 FreqDGT' in r['model']), None)
+    ax.grid(axis='y', linestyle='--', alpha=0.4)
+    # Bold outline on v7 FreqDGT bar
+    our_idx = next((i for i, r in enumerate(plot_rows) if 'v7 FreqDGT' in r['model']), None)
     if our_idx is not None:
         bars[our_idx].set_edgecolor('black')
-        bars[our_idx].set_linewidth(2)
+        bars[our_idx].set_linewidth(2.5)
 
 from matplotlib.patches import Patch
 legend_els = [
-    Patch(color='#d62728', label='Ours'),
+    Patch(color='#d62728', label='Ours (v7 FreqDGT)'),
     Patch(color='#1f77b4', label='T3: GNN imputation'),
     Patch(color='#ff7f0e', label='T2: RNN/temporal'),
-    Patch(color='#7f7f7f', label='T1: Statistical'),
 ]
-fig2.legend(handles=legend_els, loc='upper center', ncol=4,
+fig2.legend(handles=legend_els, loc='upper center', ncol=3,
             bbox_to_anchor=(0.5, 1.02), fontsize=10)
+fig2.suptitle('T1 statistical baselines (MAE 2.6–43 km/h) excluded for readability',
+              y=-0.02, fontsize=9, color='grey')
 fig2.tight_layout()
 plt.savefig('baseline_comparison.png', bbox_inches='tight', dpi=150)
 plt.show()
@@ -3255,46 +3264,47 @@ print("✅ Comparison table printed. Figure saved to baseline_comparison.png")
 # =============================================================================
 
 print("\n" + "=" * 90)
-print("  ANALYSIS: Graph-CTH-NODE v6 Performance Summary")
+print("  ANALYSIS: Graph-CTH-NODE v7 FreqDGT — Thesis Contribution")
 print("=" * 90)
 
-v6_result   = next((r for r in results_table if r['model'] == 'Graph-CTH-NODE v6'), None)
-grin_result = next((r for r in results_table if r['model'] == 'GRIN'), None)
-grinpp_result = next((r for r in results_table if r['model'] == 'GRIN++'), None)
+v7_result    = next((r for r in results_table if 'v7 FreqDGT' in r['model']), None)
+sota_result  = next((r for r in results_table if 'DSTGA-Mamba' in r['model']), None)
 
-if v6_result:
-    print(f"\n📊 Graph-CTH-NODE v6 Metrics:")
-    print(f"  MAE (all nodes):       {v6_result['mae_all']:.3f} km/h")
-    print(f"  MAE (jam < 40 km/h):   {v6_result['mae_jam']:.3f} km/h")
-    print(f"  Jam F1 (speed thresh): {v6_result['f1']:.3f}")
-    print(f"  SSIM (spatial struct):  {v6_result['ssim']:.3f}")
+if v7_result:
+    print(f"\n📊 Graph-CTH-NODE v7 FreqDGT Metrics:")
+    print(f"  MAE (all nodes):       {v7_result['mae_all']:.3f} km/h")
+    print(f"  MAE (jam < 40 km/h):   {v7_result['mae_jam']:.3f} km/h")
+    print(f"  Jam F1 (speed thresh): {v7_result['f1']:.3f}")
+    print(f"  SSIM (spatial struct):  {v7_result['ssim']:.3f}")
 
-if grinpp_result:
-    print(f"\n📊 GRIN++ (Reference) Metrics:")
-    print(f"  MAE (all nodes):       {grinpp_result['mae_all']:.3f} km/h")
-    print(f"  MAE (jam < 40 km/h):   {grinpp_result['mae_jam']:.3f} km/h")
-    print(f"  Jam F1 (speed thresh): {grinpp_result['f1']:.3f}")
-    print(f"  SSIM (spatial struct):  {grinpp_result['ssim']:.3f}")
+if sota_result:
+    print(f"\n📊 DSTGA-Mamba (SOTA Reference) Metrics:")
+    print(f"  MAE (all nodes):       {sota_result['mae_all']:.3f} km/h")
+    print(f"  MAE (jam < 40 km/h):   {sota_result['mae_jam']:.3f} km/h")
+    print(f"  Jam F1 (speed thresh): {sota_result['f1']:.3f}")
+    print(f"  SSIM (spatial struct):  {sota_result['ssim']:.3f}")
 
-print(f"\n🏗️  Architecture:")
+if v7_result and sota_result:
+    gap = v7_result['mae_all'] - sota_result['mae_all']
+    print(f"\n  Gap to SOTA: {gap:+.3f} km/h MAE")
+
+print(f"\n🏗️  Architecture (v7 FreqDGT):")
 print(f"""
-  Graph-CTH-NODE v6 = GRIN's proven RNN backbone + v5's best ideas
+  Graph-CTH-NODE v7 = Freq decomposition + Dynamic Graph + Expert Gating
 
-  CORE DESIGN:
-  ✅ Bidirectional GRU (forward + backward processing)
-  ✅ 4-path graph convolution (sym/fwd/bwd/corr adjacencies)
-  ✅ Per-node adaptive path mixing (learned which graph when)
-  ✅ Dual ToD priors (free-flow + jam-conditioned)
-  ✅ Simple hybrid loss (MSE free-flow + weighted MAE jams)
-  ✅ Context-dependent residuals (higher skip when missing data)
-  ✅ Tight gradient clipping (0.5 norm for stability)
+  NOVEL CONTRIBUTIONS:
+  ✅ Learnable frequency decomposer (moving-average filter, trained end-to-end)
+  ✅ Low-freq branch: 4-path ChebConv + Bidirectional GRU (captures smooth trends)
+  ✅ High-freq branch: Dynamic Graph + Transformer (captures spikes/jams)
+  ✅ Expert gate MLP: routes per-node, per-timestep between branches
+  ✅ Dual ToD priors fed into gate context (free-flow + jam-conditioned)
+  ✅ Jam-aware hybrid loss with class-balanced weighting
 
-  WHY v6 WORKS:
-  • RNN sequential memory > Transformer/ODE on short sequences (T=48)
-  • Simple loss (2 terms) > Complex loss (6 terms) — easier to optimize
-  • Learned path mixing > Fixed average — adaptive to data
-  • ToD context injection > ToD-only features — direct gate modulation
-  • Bidirectional fusion > Unidirectional — captures both temporal directions
+  WHY FreqDGT:
+  • Frequency decomposition separates slow trends from sharp jam events
+  • Dynamic per-timestep adjacency adapts to changing traffic patterns
+  • Expert gate lets model choose low-freq vs high-freq branch per situation
+  • ToD context enables time-aware routing (peak-hour vs off-peak)
 """)
 
 print("=" * 90)
