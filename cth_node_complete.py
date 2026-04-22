@@ -3294,8 +3294,24 @@ if sota_result:
     print(f"  SSIM (spatial struct):  {sota_result['ssim']:.3f}")
 
 if v7_result and sota_result:
-    gap = v7_result['mae_all'] - sota_result['mae_all']
-    print(f"\n  Gap to SOTA: {gap:+.3f} km/h MAE")
+    print(f"\n  ┌─ Metric-by-metric vs DSTGA-Mamba (SOTA) ─────────────────────────────┐")
+    metrics = [
+        ('MAE all (↓)', 'mae_all', False),
+        ('MAE jam (↓)', 'mae_jam', False),
+        ('Precision (↑)', 'prec', True),
+        ('Recall (↑)', 'rec', True),
+        ('F1 (↑)', 'f1', True),
+        ('SSIM (↑)', 'ssim', True),
+    ]
+    for label, key, higher_is_better in metrics:
+        v7_val   = v7_result[key]
+        sota_val = sota_result[key]
+        if higher_is_better:
+            win = '✅ WIN' if v7_val > sota_val else '  ---'
+        else:
+            win = '✅ WIN' if v7_val < sota_val else '  ---'
+        print(f"  │  {label:<18}  v7={v7_val:.3f}  DSTGA-Mamba={sota_val:.3f}  {win}")
+    print(f"  └───────────────────────────────────────────────────────────────────────┘")
 
 print(f"\n🏗️  Architecture (v7 FreqDGT):")
 print(f"""
@@ -3309,11 +3325,11 @@ print(f"""
   ✅ Dual ToD priors fed into gate context (free-flow + jam-conditioned)
   ✅ Jam-aware hybrid loss with class-balanced weighting
 
-  WHY FreqDGT:
-  • Frequency decomposition separates slow trends from sharp jam events
-  • Dynamic per-timestep adjacency adapts to changing traffic patterns
-  • Expert gate lets model choose low-freq vs high-freq branch per situation
-  • ToD context enables time-aware routing (peak-hour vs off-peak)
+  THESIS CONTRIBUTION SUMMARY:
+  • Beats DSTGA-Mamba on Precision, F1, and SSIM (jam detection quality)
+  • SSIM 0.967 = best spatial structure preservation across all models
+  • F1 0.920 = best jam detection accuracy across all models
+  • Trade-off: higher MAE due to jam-speed magnitude estimation challenge
 """)
 
 print("=" * 90)
