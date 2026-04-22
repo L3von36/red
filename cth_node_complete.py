@@ -3164,34 +3164,36 @@ print(f"  {'Model':<26} {'MAE all':>9} {'MAE jam':>9} {'Prec':>7} {'Rec':>7} {'F
 print("  " + "-"*86)
 
 tier_labels = {
-    'Global Mean':           'T1',
-    'Historical Average':    'T1',
-    'IDW':                   'T1',
-    'Linear Interpolation':  'T1',
-    'KNN Kriging (k=5)':     'T1',
-    'GRU-D':                 'T2',
-    'BRITS':                 'T2',
-    'SAITS':                 'T2',
-    'IGNNK':                 'T3',
-    'GRIN':                  'T3',
-    'GRIN++':                'T3',
-    'SPIN':                  'T3',
-    'DGCRIN':                'T3',
-    'GCASTN':                'T3',
-    'GCASTN+':               'T3',
-    'ADGCN':                 'T3',
-    'Graph-CTH-NODE v6':     'Ours',
+    # T1 — statistical
+    'Global Mean': 'T1', 'Historical Average': 'T1', 'IDW': 'T1',
+    'Linear Interpolation': 'T1', 'KNN Kriging (k=5)': 'T1',
+    # T2 — RNN (with and without Cached suffix)
+    'GRU-D': 'T2', 'GRU-D (Cached)': 'T2',
+    'BRITS': 'T2', 'BRITS (Cached)': 'T2',
+    'SAITS': 'T2', 'SAITS (Cached)': 'T2',
+    # T3 — GNN
+    'IGNNK': 'T3', 'IGNNK (Cached)': 'T3',
+    'GRIN': 'T3', 'GRIN (Cached)': 'T3',
+    'GRIN++': 'T3', 'GRIN++ (Cached)': 'T3',
+    'SPIN': 'T3', 'SPIN (Cached)': 'T3',
+    'DGCRIN': 'T3', 'DGCRIN (Cached)': 'T3',
+    'GCASTN': 'T3', 'GCASTN (Cached)': 'T3',
+    'GCASTN+': 'T3', 'GCASTN+ (Cached)': 'T3',
+    'ADGCN': 'T3', 'ADGCN (Cached)': 'T3',
+    # SOTA references
+    'T-DGCN': 'SOTA', 'T-DGCN (Cached)': 'SOTA',
+    'Improved T-DGCN': 'SOTA', 'Improved T-DGCN (Cached)': 'SOTA',
+    'DSTGA-Mamba': 'SOTA', 'DSTGA-Mamba (Cached)': 'SOTA',
+    # Ours
+    'Graph-CTH-NODE v6': 'Ours', 'Graph-CTH-NODE v6 (Cached)': 'Ours',
+    'Graph-CTH-NODE v6-Jam': 'Ours', 'Graph-CTH-NODE v6-Jam (Cached)': 'Ours',
+    'Graph-CTH-NODE v6-Next': 'Ours', 'Graph-CTH-NODE v6-Next (Cached)': 'Ours',
     'Graph-CTH-NODE v7 FreqDGT': 'Ours',
 }
 
-def get_tier(model_name):
-    # Strip ' (Cached)' suffix for lookup
-    base = model_name.replace(' (Cached)', '')
-    return tier_labels.get(base, tier_labels.get(model_name, ''))
-
 for r in results_table_sorted:
-    tier  = get_tier(r['model'])
-    flag  = ' ◀' if 'v7 FreqDGT' in r['model'] else ''
+    tier = tier_labels.get(r['model'], '')
+    flag = ' ◀◀ THESIS' if 'v7 FreqDGT' in r['model'] else ''
     print(f"  [{tier:<4}] {r['model']:<21} "
           f"{r['mae_all']:>9.2f} {r['mae_jam']:>9.2f} "
           f"{r['prec']:>7.3f} {r['rec']:>7.3f} {r['f1']:>7.3f} "
@@ -3206,27 +3208,29 @@ print("    SSIM    : structural similarity of spatiotemporal speed field")
 print("  Tier: T1=Statistical  T2=RNN/temporal  T3=GNN imputation  Ours=Graph-CTH-NODE")
 print("=" * 90)
 
-# Bar chart — exclude T1 baselines to keep y-axis readable
-plot_rows = [r for r in results_table_sorted if get_tier(r['model']) != 'T1']
+# Bar chart — exclude T1 statistical baselines (MAE 2.6–43 km/h)
+_tier_colors = {
+    'Ours': '#d62728',   # red
+    'SOTA': '#2ca02c',   # green
+    'T3':   '#1f77b4',   # blue
+    'T2':   '#ff7f0e',   # orange
+}
+plot_rows = [r for r in results_table_sorted
+             if tier_labels.get(r['model'], '') not in ('T1', '')]
 
-names_p   = [r['model'] for r in plot_rows]
+names_p   = [r['model']   for r in plot_rows]
 mae_all_p = [r['mae_all'] for r in plot_rows]
 mae_jam_p = [r['mae_jam'] for r in plot_rows]
 f1_vals_p = [r['f1']      for r in plot_rows]
-
-tier_colors = {'Ours': '#d62728', 'T3': '#1f77b4', 'T2': '#ff7f0e', '': '#7f7f7f'}
-colors_p = [tier_colors.get(get_tier(r['model']), '#7f7f7f') for r in plot_rows]
+colors_p  = [_tier_colors.get(tier_labels.get(r['model'], ''), '#9467bd')
+             for r in plot_rows]
 
 short_names_p = [
-    n.replace('Graph-CTH-NODE ', 'v-').replace(' (Cached)', '')
-     .replace('KNN Kriging (k=5)', 'KNN-K')
-     .replace('Linear Interpolation', 'Lin.Interp')
-     .replace('Historical Average', 'Hist.Avg')
+    n.replace('Graph-CTH-NODE ', '').replace(' (Cached)', '').replace('Improved ', 'Imp.')
     for n in names_p
 ]
 
-fig2, axes = plt.subplots(1, 3, figsize=(18, 6), dpi=120)
-
+fig2, axes = plt.subplots(1, 3, figsize=(20, 6), dpi=120)
 for ax, vals, title, ylabel in [
     (axes[0], mae_all_p, 'MAE — All Blind Nodes (km/h)', 'MAE (km/h)'),
     (axes[1], mae_jam_p, 'MAE — Jam Conditions (km/h)',  'MAE (km/h)'),
@@ -3238,26 +3242,31 @@ for ax, vals, title, ylabel in [
     ax.set_title(title, fontsize=11, fontweight='bold')
     ax.set_ylabel(ylabel, fontsize=10)
     ax.grid(axis='y', linestyle='--', alpha=0.4)
-    # Bold outline on v7 FreqDGT bar
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    # Bold outline + star annotation on v7 FreqDGT
     our_idx = next((i for i, r in enumerate(plot_rows) if 'v7 FreqDGT' in r['model']), None)
     if our_idx is not None:
         bars[our_idx].set_edgecolor('black')
         bars[our_idx].set_linewidth(2.5)
+        ax.annotate('★', (our_idx, vals[our_idx]),
+                    ha='center', va='bottom', fontsize=12, fontweight='bold')
 
 from matplotlib.patches import Patch
 legend_els = [
-    Patch(color='#d62728', label='Ours (v7 FreqDGT)'),
+    Patch(color='#d62728', label='Ours (Graph-CTH-NODE)'),
+    Patch(color='#2ca02c', label='SOTA references'),
     Patch(color='#1f77b4', label='T3: GNN imputation'),
     Patch(color='#ff7f0e', label='T2: RNN/temporal'),
 ]
-fig2.legend(handles=legend_els, loc='upper center', ncol=3,
+fig2.legend(handles=legend_els, loc='upper center', ncol=4,
             bbox_to_anchor=(0.5, 1.02), fontsize=10)
 fig2.suptitle('T1 statistical baselines (MAE 2.6–43 km/h) excluded for readability',
-              y=-0.02, fontsize=9, color='grey')
+              y=-0.02, fontsize=9, color='grey', style='italic')
 fig2.tight_layout()
 plt.savefig('baseline_comparison.png', bbox_inches='tight', dpi=150)
 plt.show()
-print("✅ Comparison table printed. Figure saved to baseline_comparison.png")
+print("✅ Comparison chart saved to baseline_comparison.png")
 
 # =============================================================================
 # CELL 13 — Analysis: Graph-CTH-NODE v6 vs Baselines
