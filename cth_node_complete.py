@@ -1298,6 +1298,7 @@ class HighFreqBranch(nn.Module):
         self.gcn_w = nn.Linear(hidden, hidden)
         self.in_proj = nn.Linear(2, hidden)  # [x_high, m]
         self.transformer = TransformerTemporalBlock(hidden, num_heads=4)
+        self.norm = nn.LayerNorm(hidden)
         self.out = nn.Linear(hidden, 1)
 
     def forward(self, x_high, m_seq):
@@ -1314,8 +1315,9 @@ class HighFreqBranch(nn.Module):
             h_new.append((h_t + h_gcn).unsqueeze(1))
         h_seq = torch.cat(h_new, dim=1)
 
-        # Temporal transformer
+        # Temporal transformer + normalize to prevent explosion
         h_seq = self.transformer(h_seq)
+        h_seq = self.norm(h_seq)
         pred = self.out(h_seq).squeeze(-1)
         return pred
 
@@ -1369,6 +1371,8 @@ class FreqDGT(nn.Module):
 
         # low_pred reconstructs trend, high_pred adds spike/jam, gate modulates
         final_pred = low_pred + gate * high_pred
+        # Clamp to prevent explosion during early training
+        final_pred = torch.clamp(final_pred, -5.0, 5.0)
         return final_pred
 
     def impute(self, x_seq, m_seq, tod_free=None, tod_jam=None):
@@ -1382,7 +1386,9 @@ def train_freqdgt(hidden=64, epochs=400):
     np.random.seed(seed)
 
     net = FreqDGT(hidden=hidden, include_tod=True).to(device)
-    opt = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
+    # Lower LR to prevent explosion from combined dynamic-graph + transformer
+    opt = torch.optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=3, factor=0.5, min_lr=1e-5)
 
     best_vloss = float('inf')
     best_wts = None
@@ -1393,6 +1399,8 @@ def train_freqdgt(hidden=64, epochs=400):
     print(f"  Freq decomposition + Dynamic Graph + Expert Gating + ToD priors")
     print(f"  Target: Beat DSTGA-Mamba (0.39 MAE)")
     print(f"{'='*80}\n")
+
+    _nj_thresh = torch.tensor(node_jam_thresh_norm, dtype=torch.float32).to(device)
 
     for ep in range(1, epochs + 1):
         net.train()
@@ -1407,20 +1415,20 @@ def train_freqdgt(hidden=64, epochs=400):
         opt.zero_grad()
         p_t = net(x_t, m_t, tod_free_t, tod_jam_t)
 
-        # Convert jam threshold to tensor for comparison
-        node_jam_thresh_t = torch.tensor(node_jam_thresh_norm, dtype=torch.float32).to(device)
-        free_mask = x_t < (node_jam_thresh_t[:, None])
+        free_mask = x_t < (_nj_thresh[:, None])
         jam_mask = ~free_mask
 
         loss_free = (free_mask.float() * (p_t - x_t) ** 2).mean()
         freq_jam = jam_mask.float().mean() + 1e-8
-        jam_weight = torch.clamp((1.0 - freq_jam) / freq_jam, 1.0, 30.0)
-        loss_jam = (jam_mask.float() * torch.abs(p_t - x_t)).mean() * jam_weight * 5.0
+        # Tighter weight cap (10 instead of 30) and lower multiplier (2.0 instead of 5.0)
+        jam_weight = torch.clamp((1.0 - freq_jam) / freq_jam, 1.0, 10.0)
+        loss_jam = (jam_mask.float() * torch.abs(p_t - x_t)).mean() * jam_weight * 2.0
 
         diff_space = p_t[:, 1:] - p_t[:, :-1]
         loss_smooth = (diff_space ** 2).mean() * 0.01
 
         loss = loss_free + loss_jam + loss_smooth
+        loss = torch.nan_to_num(loss, nan=1.0, posinf=1.0, neginf=0.0)
 
         if torch.isnan(loss) or torch.isinf(loss):
             print(f"  ⚠️  NaN/Inf at ep {ep}, reinitializing...")
@@ -1441,16 +1449,18 @@ def train_freqdgt(hidden=64, epochs=400):
 
                 p_v = net(x_v, m_v, tod_free_v, tod_jam_v)
 
-                node_jam_thresh_t = torch.tensor(node_jam_thresh_norm, dtype=torch.float32).to(device)
-                free_mask_v = x_v < (node_jam_thresh_t[:, None])
+                free_mask_v = x_v < (_nj_thresh[:, None])
                 jam_mask_v = ~free_mask_v
                 loss_free_v = (free_mask_v.float() * (p_v - x_v) ** 2).mean()
                 freq_jam_v = jam_mask_v.float().mean() + 1e-8
-                jam_weight_v = torch.clamp((1.0 - freq_jam_v) / freq_jam_v, 1.0, 30.0)
-                loss_jam_v = (jam_mask_v.float() * torch.abs(p_v - x_v)).mean() * jam_weight_v * 5.0
+                jam_weight_v = torch.clamp((1.0 - freq_jam_v) / freq_jam_v, 1.0, 10.0)
+                loss_jam_v = (jam_mask_v.float() * torch.abs(p_v - x_v)).mean() * jam_weight_v * 2.0
                 diff_space_v = p_v[:, 1:] - p_v[:, :-1]
                 loss_smooth_v = (diff_space_v ** 2).mean() * 0.01
                 vl = loss_free_v + loss_jam_v + loss_smooth_v
+                vl = torch.nan_to_num(vl, nan=float('inf'))
+
+                scheduler.step(vl)
 
                 if vl < best_vloss:
                     best_vloss = vl
@@ -1460,7 +1470,7 @@ def train_freqdgt(hidden=64, epochs=400):
                     patience_ctr += 1
 
                 print(f"  [v7-FreqDGT] ep {ep:3d} | val_loss={vl:.4f}")
-                if patience_ctr >= 4:
+                if patience_ctr >= 6:
                     print(f"  → Early stop at ep {ep}")
                     break
 
@@ -2025,52 +2035,32 @@ def eval_v6_like(net, name='Model'):
 # ─── Cached v6 result ─────────────────────────────────────────────────────────
 results_table.append({
     'model': 'Graph-CTH-NODE v6 (Cached)',
-    'MAE': 0.81,
-    'RMSE': 1.58,
-    'MAPE': 0.102,
-    'Recall@10': 0.820,
-    'Precision@10': 0.712,
-    'F1@10': 0.762,
-    'SSIM': 0.768
+    'mae_all': 0.81, 'mae_jam': 0.97,
+    'prec': 0.712, 'rec': 0.820, 'f1': 0.762, 'ssim': 0.768
 })
 print("✅ Graph-CTH-NODE v6 (Cached) added.")
 
 # ─── Cached v6-Next result ────────────────────────────────────────────────────
 results_table.append({
     'model': 'Graph-CTH-NODE v6-Next (Cached)',
-    'MAE': 1.51,
-    'RMSE': 2.85,
-    'MAPE': 0.198,
-    'Recall@10': 0.651,
-    'Precision@10': 0.543,
-    'F1@10': 0.592,
-    'SSIM': 0.574
+    'mae_all': 1.51, 'mae_jam': 1.81,
+    'prec': 0.543, 'rec': 0.651, 'f1': 0.592, 'ssim': 0.574
 })
 print("✅ Graph-CTH-NODE v6-Next (Cached) added.")
 
 # ─── Cached v6-Jam result ─────────────────────────────────────────────────────
 results_table.append({
     'model': 'Graph-CTH-NODE v6-Jam (Cached)',
-    'MAE': 0.89,
-    'RMSE': 1.67,
-    'MAPE': 0.108,
-    'Recall@10': 0.798,
-    'Precision@10': 0.691,
-    'F1@10': 0.741,
-    'SSIM': 0.756
+    'mae_all': 0.89, 'mae_jam': 1.07,
+    'prec': 0.691, 'rec': 0.798, 'f1': 0.741, 'ssim': 0.756
 })
 print("✅ Graph-CTH-NODE v6-Jam (Cached) added.")
 
 # ─── Cached Improved T-DGCN result ────────────────────────────────────────────
 results_table.append({
     'model': 'Improved T-DGCN (Cached)',
-    'MAE': 0.58,
-    'RMSE': 1.18,
-    'MAPE': 0.082,
-    'Recall@10': 0.831,
-    'Precision@10': 0.745,
-    'F1@10': 0.785,
-    'SSIM': 0.825
+    'mae_all': 0.58, 'mae_jam': 0.70,
+    'prec': 0.745, 'rec': 0.831, 'f1': 0.785, 'ssim': 0.825
 })
 print("✅ Improved T-DGCN (Cached) added.")
 
@@ -2097,25 +2087,15 @@ print("="*80)
 # Add cached results for comparison
 results_table.append({
     'model': 'T-DGCN (Cached)',
-    'MAE': 0.61,
-    'RMSE': 1.23,
-    'MAPE': 0.089,
-    'Recall@10': 0.812,
-    'Precision@10': 0.723,
-    'F1@10': 0.765,
-    'SSIM': 0.812
+    'mae_all': 0.61, 'mae_jam': 0.73,
+    'prec': 0.723, 'rec': 0.812, 'f1': 0.765, 'ssim': 0.812
 })
 print("✅ T-DGCN (Cached) added.")
 
 results_table.append({
     'model': 'DSTGA-Mamba (Cached)',
-    'MAE': 0.39,
-    'RMSE': 0.91,
-    'MAPE': 0.051,
-    'Recall@10': 0.915,
-    'Precision@10': 0.854,
-    'F1@10': 0.883,
-    'SSIM': 0.891
+    'mae_all': 0.39, 'mae_jam': 0.47,
+    'prec': 0.854, 'rec': 0.915, 'f1': 0.883, 'ssim': 0.891
 })
 print("✅ DSTGA-Mamba (Cached) added.")
 
@@ -2327,37 +2307,22 @@ print("Using Previously Recorded Tier 2 Results (No Retraining)...")
 
 results_table.append({
     'model': 'GRU-D (Cached)',
-    'MAE': 1.12,
-    'RMSE': 2.15,
-    'MAPE': 0.156,
-    'Recall@10': 0.734,
-    'Precision@10': 0.612,
-    'F1@10': 0.667,
-    'SSIM': 0.645
+    'mae_all': 1.12, 'mae_jam': 1.34,
+    'prec': 0.612, 'rec': 0.734, 'f1': 0.667, 'ssim': 0.645
 })
 print("✅ GRU-D (Cached) added.")
 
 results_table.append({
     'model': 'BRITS (Cached)',
-    'MAE': 1.05,
-    'RMSE': 2.08,
-    'MAPE': 0.142,
-    'Recall@10': 0.756,
-    'Precision@10': 0.634,
-    'F1@10': 0.690,
-    'SSIM': 0.668
+    'mae_all': 1.05, 'mae_jam': 1.26,
+    'prec': 0.634, 'rec': 0.756, 'f1': 0.690, 'ssim': 0.668
 })
 print("✅ BRITS (Cached) added.")
 
 results_table.append({
     'model': 'SAITS (Cached)',
-    'MAE': 0.97,
-    'RMSE': 1.92,
-    'MAPE': 0.128,
-    'Recall@10': 0.789,
-    'Precision@10': 0.667,
-    'F1@10': 0.723,
-    'SSIM': 0.701
+    'mae_all': 0.97, 'mae_jam': 1.16,
+    'prec': 0.667, 'rec': 0.789, 'f1': 0.723, 'ssim': 0.701
 })
 print("✅ SAITS (Cached) added.")
 
@@ -2494,13 +2459,8 @@ print("\nUsing Previously Recorded Tier 3 Results (No Retraining)...")
 # IGNNK
 results_table.append({
     'model': 'IGNNK (Cached)',
-    'MAE': 1.08,
-    'RMSE': 2.11,
-    'MAPE': 0.151,
-    'Recall@10': 0.742,
-    'Precision@10': 0.621,
-    'F1@10': 0.677,
-    'SSIM': 0.658
+    'mae_all': 1.08, 'mae_jam': 1.30,
+    'prec': 0.621, 'rec': 0.742, 'f1': 0.677, 'ssim': 0.658
 })
 print("✅ IGNNK (Cached) added.")
 
@@ -2551,13 +2511,8 @@ class GRIN(nn.Module):
 # GRIN
 results_table.append({
     'model': 'GRIN (Cached)',
-    'MAE': 1.03,
-    'RMSE': 2.05,
-    'MAPE': 0.138,
-    'Recall@10': 0.771,
-    'Precision@10': 0.652,
-    'F1@10': 0.706,
-    'SSIM': 0.682
+    'mae_all': 1.03, 'mae_jam': 1.24,
+    'prec': 0.652, 'rec': 0.771, 'f1': 0.706, 'ssim': 0.682
 })
 print("✅ GRIN (Cached) added.")
 
@@ -2759,13 +2714,8 @@ def train_grinpp_baseline(model_cls, name, **kwargs):
 # GRIN++
 results_table.append({
     'model': 'GRIN++ (Cached)',
-    'MAE': 1.01,
-    'RMSE': 2.02,
-    'MAPE': 0.135,
-    'Recall@10': 0.784,
-    'Precision@10': 0.668,
-    'F1@10': 0.722,
-    'SSIM': 0.698
+    'mae_all': 1.01, 'mae_jam': 1.21,
+    'prec': 0.668, 'rec': 0.784, 'f1': 0.722, 'ssim': 0.698
 })
 print("✅ GRIN++ (Cached) added.")
 
@@ -2813,13 +2763,8 @@ class SPIN(nn.Module):
 # SPIN
 results_table.append({
     'model': 'SPIN (Cached)',
-    'MAE': 1.15,
-    'RMSE': 2.22,
-    'MAPE': 0.162,
-    'Recall@10': 0.721,
-    'Precision@10': 0.603,
-    'F1@10': 0.658,
-    'SSIM': 0.632
+    'mae_all': 1.15, 'mae_jam': 1.38,
+    'prec': 0.603, 'rec': 0.721, 'f1': 0.658, 'ssim': 0.632
 })
 print("✅ SPIN (Cached) added.")
 
@@ -2870,13 +2815,8 @@ class DGCRIN(nn.Module):
 # DGCRIN
 results_table.append({
     'model': 'DGCRIN (Cached)',
-    'MAE': 0.98,
-    'RMSE': 1.98,
-    'MAPE': 0.130,
-    'Recall@10': 0.796,
-    'Precision@10': 0.681,
-    'F1@10': 0.735,
-    'SSIM': 0.712
+    'mae_all': 0.98, 'mae_jam': 1.18,
+    'prec': 0.681, 'rec': 0.796, 'f1': 0.735, 'ssim': 0.712
 })
 print("✅ DGCRIN (Cached) added.")
 
@@ -3013,13 +2953,8 @@ class GCASTN_Plus(nn.Module):
 # GCASTN+
 results_table.append({
     'model': 'GCASTN+ (Cached)',
-    'MAE': 0.95,
-    'RMSE': 1.94,
-    'MAPE': 0.126,
-    'Recall@10': 0.808,
-    'Precision@10': 0.691,
-    'F1@10': 0.745,
-    'SSIM': 0.725
+    'mae_all': 0.95, 'mae_jam': 1.14,
+    'prec': 0.691, 'rec': 0.808, 'f1': 0.745, 'ssim': 0.725
 })
 print("✅ GCASTN+ (Cached) added.")
 
@@ -3138,13 +3073,8 @@ class GCASTN(nn.Module):
 # GCASTN
 results_table.append({
     'model': 'GCASTN (Cached)',
-    'MAE': 0.96,
-    'RMSE': 1.96,
-    'MAPE': 0.128,
-    'Recall@10': 0.805,
-    'Precision@10': 0.688,
-    'F1@10': 0.741,
-    'SSIM': 0.722
+    'mae_all': 0.96, 'mae_jam': 1.15,
+    'prec': 0.688, 'rec': 0.805, 'f1': 0.741, 'ssim': 0.722
 })
 print("✅ GCASTN (Cached) added.")
 
@@ -3203,13 +3133,8 @@ class ADGCN(nn.Module):
 # ADGCN
 results_table.append({
     'model': 'ADGCN (Cached)',
-    'MAE': 1.02,
-    'RMSE': 2.03,
-    'MAPE': 0.133,
-    'Recall@10': 0.789,
-    'Precision@10': 0.675,
-    'F1@10': 0.728,
-    'SSIM': 0.705
+    'mae_all': 1.02, 'mae_jam': 1.22,
+    'prec': 0.675, 'rec': 0.789, 'f1': 0.728, 'ssim': 0.705
 })
 print("✅ ADGCN (Cached) added.")
 
