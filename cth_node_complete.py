@@ -1420,9 +1420,9 @@ def train_freqdgt(hidden=64, epochs=400):
 
         loss_free = (free_mask.float() * (p_t - x_t) ** 2).mean()
         freq_jam = jam_mask.float().mean() + 1e-8
-        # Tighter weight cap (10 instead of 30) and lower multiplier (2.0 instead of 5.0)
+        # Tighter weight cap (10 instead of 30), multiplier 3.5 to improve jam magnitude accuracy
         jam_weight = torch.clamp((1.0 - freq_jam) / freq_jam, 1.0, 10.0)
-        loss_jam = (jam_mask.float() * torch.abs(p_t - x_t)).mean() * jam_weight * 2.0
+        loss_jam = (jam_mask.float() * torch.abs(p_t - x_t)).mean() * jam_weight * 3.5
 
         diff_space = p_t[:, 1:] - p_t[:, :-1]
         loss_smooth = (diff_space ** 2).mean() * 0.01
@@ -1454,7 +1454,7 @@ def train_freqdgt(hidden=64, epochs=400):
                 loss_free_v = (free_mask_v.float() * (p_v - x_v) ** 2).mean()
                 freq_jam_v = jam_mask_v.float().mean() + 1e-8
                 jam_weight_v = torch.clamp((1.0 - freq_jam_v) / freq_jam_v, 1.0, 10.0)
-                loss_jam_v = (jam_mask_v.float() * torch.abs(p_v - x_v)).mean() * jam_weight_v * 2.0
+                loss_jam_v = (jam_mask_v.float() * torch.abs(p_v - x_v)).mean() * jam_weight_v * 3.5
                 diff_space_v = p_v[:, 1:] - p_v[:, :-1]
                 loss_smooth_v = (diff_space_v ** 2).mean() * 0.01
                 vl = loss_free_v + loss_jam_v + loss_smooth_v
