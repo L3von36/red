@@ -1,19 +1,64 @@
+```
+# Compiled and build artifacts
+*.html
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Dependencies
+node_modules/
+.venv/
+venv/
 __pycache__/
-*.pyc
-*.pyo
+.mypy_cache/
+.pytest_cache/
+dist/
+build/
+target/
+.gradle/
 
-# Dataset files (large, downloaded automatically)
-PEMS04.npz
-PEMS04.csv
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
 
-# Trained model checkpoints
-*.pth
+# Logs and temp files
+*.log
+*.tmp
 
-# Generated figures
-*.png
-
-# Jupyter
-.ipynb_checkpoints/
-
-# OS
+# System files
 .DS_Store
+Thumbs.db
+
+# Coverage
+coverage/
+htmlcov/
+.coverage
+
+# Compressed files
+*.zip
+*.gz
+*.tar
+*.tgz
+*.bz2
+*.xz
+*.7z
+*.rar
+*.zst
+*.lz4
+*.lzh
+*.cab
+*.arj
+*.rpm
+*.deb
+*.Z
+*.lz
+*.lzo
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.tar.zst
+```
