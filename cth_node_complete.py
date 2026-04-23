@@ -639,7 +639,7 @@ def plot_loss_curves(loss_history_train, loss_history_val):
     # Left: Full loss history
     ax1.plot(epochs, loss_history_train, 'o-', label='Training Loss',
              linewidth=2, markersize=4, color='#0277bd')
-    if loss_history_val:
+    if len(loss_history_val) > 0:
         ax1.plot([i*50 for i in range(1, len(loss_history_val)+1)],
                 loss_history_val, 's-', label='Validation Loss',
                 linewidth=2, markersize=6, color='#d32f2f')
