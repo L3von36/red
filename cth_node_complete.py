@@ -703,7 +703,12 @@ def eval_v7(net, name='Graph-CTH-NODE v7'):
 # =============================================================================
 
 class GraphCTHNodeV8Cell(nn.Module):
-    """Enhanced cell with multi-step diffusion and learned adjacency."""
+    """Enhanced cell with multi-step diffusion and learned adjacency.
+
+    The multi-step diffusion is the key architectural improvement — it replaces
+    deeper ChebConv (K=4) with more flexible K-step graph diffusion using learned
+    adjacency, which is more expressive and stable.
+    """
     def __init__(self, hidden=128, include_tod=True, K_diffusion=3):
         super().__init__()
         self.hidden = hidden
@@ -714,12 +719,12 @@ class GraphCTHNodeV8Cell(nn.Module):
         # Shape [NUM_NODES, NUM_NODES] — will be softmaxed then blended with A_road
         self.A_learn = nn.Parameter(torch.randn(NUM_NODES, NUM_NODES) * 0.001)
 
-        # 4-path message passing with deeper Chebyshev (K=4 vs K=3 in v6)
+        # 4-path message passing with K=3 (keep same as v7, diffusion does the extra depth)
         msg_in_dim = hidden + 1 + (2 if include_tod else 0)
-        self.msg_sym  = ChebConv(msg_in_dim, hidden, K=4)
-        self.msg_fwd  = ChebConv(msg_in_dim, hidden, K=4)
-        self.msg_bwd  = ChebConv(msg_in_dim, hidden, K=4)
-        self.msg_corr = ChebConv(msg_in_dim, hidden, K=4)
+        self.msg_sym  = ChebConv(msg_in_dim, hidden, K=3)
+        self.msg_fwd  = ChebConv(msg_in_dim, hidden, K=3)
+        self.msg_bwd  = ChebConv(msg_in_dim, hidden, K=3)
+        self.msg_corr = ChebConv(msg_in_dim, hidden, K=3)
 
         self.path_bias = nn.Parameter(torch.randn(4) * 0.1)
         self.mix_w = nn.Linear(hidden, 4)
@@ -763,7 +768,7 @@ class GraphCTHNodeV8Cell(nn.Module):
             else:
                 msg_in = torch.cat([h, m_seq[:,t:t+1]], dim=-1)
 
-            # 4-path message passing (deeper K=4)
+            # 4-path message passing (K=3 ChebConv)
             m_sym  = self.act(self.msg_sym(msg_in))
             m_fwd  = self.act(self.msg_fwd(msg_in))
             m_bwd  = self.act(self.msg_bwd(msg_in))
@@ -794,14 +799,15 @@ class GraphCTHNodeV8Cell(nn.Module):
 
 class GraphCTHNodeV8(nn.Module):
     """
-    Graph-CTH-NODE v8 — closing the gap with GRIN++:
+    Graph-CTH-NODE v8 — closing the gap with GRIN++ via information flow:
 
-    1. Multi-step diffusion (K=3): information flows K hops through the graph
-    2. Learned adjacency: 80% road + 20% learnable correction (adaptation)
-    3. Deeper architecture: K=4 ChebConv (vs K=3), hidden=128 (vs 96)
-    4. Better training: warmup LR, 500 epochs, longer patience
+    1. Multi-step diffusion (K=3): information propagates through learned adjacency
+       for K steps after message aggregation (more flexible than deeper ChebConv)
+    2. Learned adjacency: A = 80% road + 20% learnable (adaptive graph topology)
+    3. Larger capacity: hidden=128 (vs v7's 96)
+    4. Better training: warmup LR + cosine decay, 500 epochs, longer patience
 
-    Also keeps v7's critical fixes: random-mask loss + two-pass imputation.
+    Keeps v7's critical fixes: random-mask loss + two-pass imputation.
     """
     def __init__(self, hidden=128, include_tod=True, K_diffusion=3):
         super().__init__()
@@ -869,9 +875,9 @@ def train_v8_model(hidden=128, epochs=500, K_diffusion=3):
 
     print(f"\n{'='*80}")
     print(f"Training Graph-CTH-NODE v8: {epochs} epochs")
-    print(f"  Multi-step diffusion (K={K_diffusion}) + learned adjacency")
-    print(f"  Deeper architecture: K=4 ChebConv, hidden={hidden}")
-    print(f"  Better training: warmup LR + cosine annealing, {epochs} epochs")
+    print(f"  Multi-step diffusion (K={K_diffusion}) on learned adjacency")
+    print(f"  Learned topology + larger hidden={hidden}")
+    print(f"  Training: warmup LR + cosine decay, {epochs} epochs")
     print(f"{'='*80}\n")
 
     for ep in range(1, epochs + 1):
