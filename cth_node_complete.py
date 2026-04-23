@@ -504,7 +504,7 @@ class GraphCTHNodeV6(nn.Module):
         node_stds_t = torch.tensor(node_stds, dtype=torch.float32).to(x.device)
         means_obs = node_means_t[mask_obs]  # [n_obs]
         stds_obs = node_stds_t[mask_obs]    # [n_obs]
-        jt_obs = (50.0 - means_obs) / stds_obs  # [n_obs]
+        jt_obs = (JAM_KMH_TRAIN - means_obs) / stds_obs  # [n_obs]
         jam_flag = (x_obs < jt_obs.unsqueeze(1)).float()  # [n_obs, T]
         free_flag = 1.0 - jam_flag
 
