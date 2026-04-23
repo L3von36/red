@@ -590,12 +590,10 @@ class GraphCTHNodeV7(nn.Module):
         loss_free    = torch.mean(((p - x) * m * free_flag) ** 2)
         loss_jam     = torch.mean(torch.abs(p - x) * m * jam_flag) * 3.0
 
-        # Fast spatial smoothness: one matrix multiply (O(N²) but vectorised)
-        A_sp         = self._adj(x.device)
-        p_smooth     = torch.mm(A_sp, p)
-        loss_spatial = 0.005 * torch.mean((p - p_smooth.detach()) ** 2)
+        # Spatial smoothness disabled in v7 — 4-path message passing provides implicit smoothing
+        # (add back if needed: degree-normalized A @ p, very light weight)
 
-        return loss_free + loss_jam + loss_spatial
+        return loss_free + loss_jam
 
     def impute(self, x, m, tod_free=None, tod_jam=None):
         # Pass 1: standard imputation
@@ -621,17 +619,16 @@ def train_v7_model(hidden=96, epochs=300):
 
     print(f"\n{'='*80}")
     print(f"Training Graph-CTH-NODE v7: {epochs} epochs")
-    print(f"  Random-mask loss + two-pass impute + curriculum masking + cosine LR")
+    print(f"  Random-mask loss (like GRIN/GRIN++) + two-pass impute + cosine LR")
     print(f"  hidden={hidden}, K=3 ChebConv, 4-path BiGRU, ToD priors")
     print(f"{'='*80}\n")
 
     for ep in range(1, epochs + 1):
         net.train()
-        # Curriculum: sparsity ramps from 60 % → 85 % over training
-        sparsity = 0.60 + 0.25 * (ep / epochs)
+        # Fixed 20% masking like GRIN (80% missing, 20% observed)
         t0      = np.random.randint(0, TRAIN_END - BATCH_TIME)
         x_full  = torch.tensor(speed_np[t0:t0+BATCH_TIME, :], dtype=torch.float32).T.to(device)
-        m_train = (torch.rand(NUM_NODES, 1, device=device) > sparsity).float().expand(-1, BATCH_TIME)
+        m_train = (torch.rand(NUM_NODES, 1, device=device) > 0.8).float().expand(-1, BATCH_TIME)
 
         slots    = (np.arange(t0, t0+BATCH_TIME) % 288).astype(int)
         tod_free = torch.tensor(tod_free_np[:, slots], dtype=torch.float32).to(device)
