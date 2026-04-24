@@ -152,11 +152,17 @@ data_norm_all = raw_all.copy()
 data_norm_all[:, :, 2] = data_norm_speed
 
 JAM_KMH_EVAL  = 40.0
-JAM_KMH_TRAIN = 40.0  # [IMPROVED] Changed from 50.0 to align with eval threshold
-jam_thresh_eval_np  = (JAM_KMH_EVAL  - node_means) / node_stds
-jam_thresh_train_np = (JAM_KMH_TRAIN - node_means) / node_stds
+JAM_KMH_TRAIN = 40.0  # Used by v6/v7/v8/v9 (strict, causes over-prediction)
+# GRIN++ uses 50 km/h for training, 40 km/h for eval — this "soft margin" approach
+# actually generalizes better because it reduces gradient pressure on rare jam events.
+# v9c and beyond use this softer training threshold.
+JAM_KMH_TRAIN_SOFT = 50.0  # Match GRIN++'s training threshold
+jam_thresh_eval_np  = (JAM_KMH_EVAL       - node_means) / node_stds
+jam_thresh_train_np = (JAM_KMH_TRAIN      - node_means) / node_stds
+jam_thresh_soft_np  = (JAM_KMH_TRAIN_SOFT - node_means) / node_stds  # GRIN++-style
 jam_thresh_eval_t   = torch.tensor(jam_thresh_eval_np,  dtype=torch.float32).to(device)
 jam_thresh_train_t  = torch.tensor(jam_thresh_train_np, dtype=torch.float32).to(device)
+jam_thresh_soft_t   = torch.tensor(jam_thresh_soft_np,  dtype=torch.float32).to(device)
 
 # Unconditional time-of-day prior
 STEPS_PER_DAY = 288
@@ -1238,7 +1244,7 @@ class GraphCTHNodeV9c(nn.Module):
     v9c: GRIN++ cell + aligned loss (40 km/h × jam_loss_weight) ONLY (no learned fusion, no two-pass).
     Parameterized jam loss weight to tune jam vs overall MAE tradeoff.
     """
-    def __init__(self, hidden=64, include_tod=True, jam_loss_weight=3.0):
+    def __init__(self, hidden=64, include_tod=True, jam_loss_weight=2.0):
         super().__init__()
         self.include_tod = include_tod
         self.jam_loss_weight = jam_loss_weight
@@ -1254,7 +1260,9 @@ class GraphCTHNodeV9c(nn.Module):
 
     def training_step(self, x, m, tod_free=None, tod_jam=None, epoch=1):
         p = self._run(x, m, tod_free, tod_jam)
-        jt       = torch.tensor(jam_thresh_train_np, dtype=torch.float32, device=x.device)
+        # Use GRIN++'s soft 50 km/h threshold for training — fewer jam timesteps flagged
+        # means less gradient pressure, better generalization to eval's 40 km/h threshold.
+        jt       = torch.tensor(jam_thresh_soft_np, dtype=torch.float32, device=x.device)
         jam_flag = (x < jt.unsqueeze(1)).float()
         free_flag = 1.0 - jam_flag
         loss_free = torch.mean(((p - x) * m * free_flag) ** 2)
@@ -1373,7 +1381,7 @@ def train_v9b_model(hidden=64, epochs=300):
     return net, loss_history_train, loss_history_val
 
 
-def train_v9c_model(hidden=64, epochs=300, jam_loss_weight=3.0):
+def train_v9c_model(hidden=64, epochs=300, jam_loss_weight=2.0):
     seed = abs(hash(f'GraphCTHNodeV9c_{jam_loss_weight}')) % (2**31)
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -1383,7 +1391,7 @@ def train_v9c_model(hidden=64, epochs=300, jam_loss_weight=3.0):
     loss_history_train, loss_history_val = [], []
     print(f"\n{'='*80}")
     print(f"Training Graph-CTH-NODE v9c: {epochs} epochs, jam_loss_weight={jam_loss_weight}")
-    print(f"  GRIN++ cell + aligned loss (40 km/h × {jam_loss_weight}) ONLY")
+    print(f"  GRIN++ cell + GRIN++ loss formula (50 km/h train, 40 km/h eval, {jam_loss_weight}x weight)")
     print(f"{'='*80}\n")
     for ep in range(1, epochs + 1):
         net.train()
@@ -1500,7 +1508,7 @@ def tune_v9c_jam_loss_weight():
     Hypothesis: 3.0 may be too aggressive (high recall, low precision)
                 Lower weight (1.5-2.5) might balance better.
     """
-    jam_weights = [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0]
+    jam_weights = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]
     results = []
 
     print("\n" + "=" * 90)
