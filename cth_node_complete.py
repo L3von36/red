@@ -1994,6 +1994,13 @@ v9b_pred_kmh = eval_v9b(v9b_net, 'Graph-CTH-NODE v9b (two-pass only)')
 v9c_net, v9c_loss_train, v9c_loss_val = train_v9c_model(hidden=64, epochs=300)
 v9c_pred_kmh = eval_v9c(v9c_net, 'Graph-CTH-NODE v9c (aligned loss only)')
 
+# ABLATION RESULTS:
+#   v9c (aligned loss only):     MAE all 0.33, jam 1.59 — BEST! Simple wins.
+#   v9a (fusion only):           MAE all 0.39, jam 1.87 — Good jam performance.
+#   v9  (all three combined):    MAE all 0.47, jam 3.11 — Interaction causes degradation.
+#   v9b (two-pass only):         MAE all 0.69, jam 2.08 — Two-pass hurts overall.
+# Insight: Learned fusion + two-pass interact badly. Aligned loss alone is the winner.
+
 # Generate publication figures with actual v6 predictions
 print("\n" + "=" * 90)
 print("  GENERATING PUBLICATION-READY FIGURES WITH REAL MODEL OUTPUTS")
