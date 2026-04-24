@@ -2163,77 +2163,56 @@ for ni, n in enumerate(blind_idx):
 print("✅ Baseline harness ready. true_eval_kmh shape:", true_eval_kmh.shape)
 
 # =============================================================================
-# v6 Training and Evaluation
-# =============================================================================
+# SKIP v6, v7, v8, v9, v9b: Commented out to save training time
+# Only v9a (winner) and v9c (runner-up) are trained in production
+# Uncomment below to compare with previous iterations
 
-v6_net, v6_loss_train, v6_loss_val = train_v6_model(hidden=64, epochs=300)
-
-# Generate loss curves with actual training history
-print("\nGenerating loss curves...")
-plot_loss_curves(np.array(v6_loss_train), np.array(v6_loss_val))
-
-
-def eval_v6(net, name='Graph-CTH-NODE v6'):
-    """Evaluate on test window with per-node denormalization"""
-    net.eval()
-    x_e = torch.tensor(speed_np[EVAL_START:EVAL_START+_T_eval, :], dtype=torch.float32).T.to(device)
-    m_e = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, _T_eval)
-
-    slot_idx_eval = np.arange(EVAL_START, EVAL_START + _T_eval) % 288
-    tod_free_eval = torch.tensor(tod_free_np[:, slot_idx_eval], dtype=torch.float32).to(device)
-    tod_jam_eval = torch.tensor(tod_jam_np[:, slot_idx_eval], dtype=torch.float32).to(device)
-
-    with torch.no_grad():
-        p_e = net.impute(x_e, m_e, tod_free_eval, tod_jam_eval).cpu().numpy()
-
-    pred_kmh = np.zeros((len(blind_idx), _T_eval), dtype=np.float32)
-    for ni, n in enumerate(blind_idx):
-        if np.isnan(p_e[n]).any():
-            pred_kmh[ni] = true_eval_kmh[ni]
-        else:
-            pred_kmh[ni] = np.clip(p_e[n] * node_stds[n] + node_means[n], 0, 120)
-
-    results_table.append({'model': name, **eval_pred_np(pred_kmh, true_eval_kmh)})
-    print(f"✅ {name} evaluated.")
-    return pred_kmh  # Return for visualization
-
-v6_pred_kmh = eval_v6(v6_net, 'Graph-CTH-NODE v6')
-
-# =============================================================================
-# v7 Training and Evaluation
-# =============================================================================
-
-v7_net, v7_loss_train, v7_loss_val = train_v7_model(hidden=96, epochs=300)
-v7_pred_kmh = eval_v7(v7_net, 'Graph-CTH-NODE v7')
-
-# =============================================================================
-# v8 Training and Evaluation
-# =============================================================================
-
-v8_net, v8_loss_train, v8_loss_val = train_v8_model(hidden=128, epochs=500, K_diffusion=3)
-v8_pred_kmh = eval_v8(v8_net, 'Graph-CTH-NODE v8')
-
-# =============================================================================
-# v9 Training and Evaluation — GRIN++ simplicity + our innovations
-# =============================================================================
-
-v9_net, v9_loss_train, v9_loss_val = train_v9_model(hidden=64, epochs=300)
-v9_pred_kmh = eval_v9(v9_net, 'Graph-CTH-NODE v9')
+# # =============================================================================
+# # v6 Training and Evaluation
+# # =============================================================================
+#
+# v6_net, v6_loss_train, v6_loss_val = train_v6_model(hidden=64, epochs=300)
+# plot_loss_curves(np.array(v6_loss_train), np.array(v6_loss_val))
+# v6_pred_kmh = eval_v6(v6_net, 'Graph-CTH-NODE v6')
+#
+# # =============================================================================
+# # v7 Training and Evaluation
+# # =============================================================================
+#
+# v7_net, v7_loss_train, v7_loss_val = train_v7_model(hidden=96, epochs=300)
+# v7_pred_kmh = eval_v7(v7_net, 'Graph-CTH-NODE v7')
+#
+# # =============================================================================
+# # v8 Training and Evaluation
+# # =============================================================================
+#
+# v8_net, v8_loss_train, v8_loss_val = train_v8_model(hidden=128, epochs=500, K_diffusion=3)
+# v8_pred_kmh = eval_v8(v8_net, 'Graph-CTH-NODE v8')
+#
+# # =============================================================================
+# # v9 Training and Evaluation — GRIN++ simplicity + our innovations
+# # =============================================================================
+#
+# v9_net, v9_loss_train, v9_loss_val = train_v9_model(hidden=64, epochs=300)
+# v9_pred_kmh = eval_v9(v9_net, 'Graph-CTH-NODE v9')
 
 # =============================================================================
 # v9 ABLATION STUDIES: Isolate which innovation hurts jam performance
 # =============================================================================
 
 print("\n" + "=" * 90)
-print("  v9 ABLATION STUDIES: Which innovation causes jam MAE degradation?")
-print("  v9 jam MAE: 3.31 (bad) vs GRIN++ 2.53, v7 2.09")
+print("  FINAL TRAINING: v9a (WINNER) and v9c (Runner-up)")
+print("  v9a: MAE all 0.30, jam 1.41 — BEST")
+print("  v9c: MAE all 0.34, jam 1.60 — Backup")
 print("=" * 90)
 
+# ─────────────────────────────────────────────────────────────────────────────
 v9a_net, v9a_loss_train, v9a_loss_val = train_v9a_model(hidden=64, epochs=300)
 v9a_pred_kmh = eval_v9a(v9a_net, 'Graph-CTH-NODE v9a (fusion only)')
 
-v9b_net, v9b_loss_train, v9b_loss_val = train_v9b_model(hidden=64, epochs=300)
-v9b_pred_kmh = eval_v9b(v9b_net, 'Graph-CTH-NODE v9b (two-pass only)')
+# Skip v9b (underperforms)
+# v9b_net, v9b_loss_train, v9b_loss_val = train_v9b_model(hidden=64, epochs=300)
+# v9b_pred_kmh = eval_v9b(v9b_net, 'Graph-CTH-NODE v9b (two-pass only)')
 
 v9c_net, v9c_loss_train, v9c_loss_val = train_v9c_model(hidden=64, epochs=300)
 v9c_pred_kmh = eval_v9c(v9c_net, 'Graph-CTH-NODE v9c (aligned loss only)')
