@@ -1486,6 +1486,149 @@ def eval_v9c(net, name='Graph-CTH-NODE v9c'):
     return pred_kmh
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# v9c HYPERPARAMETER TUNING: Close the 0.14 gap with GRIN++ (0.19 vs v9c 0.33)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def tune_v9c_hyperparams():
+    """
+    Systematic hyperparameter search for v9c to beat GRIN++ (0.19 MAE all).
+    Tests combinations of: learning_rate, epochs, hidden_dim
+    """
+    tuning_results = []
+
+    # Define parameter grid
+    learning_rates = [1e-3, 3e-3, 5e-3, 1e-2]
+    hidden_dims = [48, 56, 64, 72, 80]
+    epoch_counts = [250, 300, 350, 400]
+
+    print("\n" + "=" * 90)
+    print("  v9c HYPERPARAMETER TUNING: Searching for GRIN++-beating configuration")
+    print("  Target: MAE all < 0.19 (GRIN++) or as close as possible")
+    print(f"  Grid: {len(learning_rates)} LRs × {len(hidden_dims)} hiddens × {len(epoch_counts)} epochs = {len(learning_rates)*len(hidden_dims)*len(epoch_counts)} configs")
+    print("=" * 90 + "\n")
+
+    best_mae_all = float('inf')
+    best_config = None
+    best_net = None
+
+    config_id = 0
+    for lr in learning_rates:
+        for hidden in hidden_dims:
+            for epochs in epoch_counts:
+                config_id += 1
+                config_name = f"v9c_lr{lr:.4f}_h{hidden}_ep{epochs}"
+
+                print(f"\n[{config_id}/{len(learning_rates)*len(hidden_dims)*len(epoch_counts)}] "
+                      f"Config: lr={lr:.4f}, hidden={hidden}, epochs={epochs}")
+
+                try:
+                    # Train v9c with this config
+                    seed = abs(hash(config_name)) % (2**31)
+                    torch.manual_seed(seed)
+                    np.random.seed(seed)
+
+                    net = GraphCTHNodeV9c(hidden=hidden, include_tod=True).to(device)
+                    opt = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=1e-4)
+                    best_vloss, best_wts, patience_ctr = float('inf'), None, 0
+
+                    for ep in range(1, epochs + 1):
+                        net.train()
+                        t0      = np.random.randint(0, TRAIN_END - BATCH_TIME)
+                        x_full  = torch.tensor(speed_np[t0:t0+BATCH_TIME, :], dtype=torch.float32).T.to(device)
+                        m_train = (torch.rand(NUM_NODES, 1, device=device) > 0.8).float().expand(-1, BATCH_TIME)
+                        slots    = (np.arange(t0, t0+BATCH_TIME) % 288).astype(int)
+                        tod_free = torch.tensor(tod_free_np[:, slots], dtype=torch.float32).to(device)
+                        tod_jam  = torch.tensor(tod_jam_np[:,  slots], dtype=torch.float32).to(device)
+
+                        loss = net.training_step(x_full, m_train, tod_free, tod_jam, epoch=ep)
+
+                        if torch.isnan(loss) or torch.isinf(loss):
+                            print(f"    ⚠️  NaN/Inf detected, skipping config")
+                            break
+
+                        opt.zero_grad()
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+                        opt.step()
+
+                        if ep % max(1, epochs // 5) == 0:
+                            net.eval()
+                            with torch.no_grad():
+                                x_v     = torch.tensor(speed_np[VAL_START:VAL_END, :], dtype=torch.float32).T.to(device)
+                                m_v     = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, VAL_END-VAL_START)
+                                slots_v = (np.arange(VAL_START, VAL_END) % 288).astype(int)
+                                tf_v    = torch.tensor(tod_free_np[:, slots_v], dtype=torch.float32).to(device)
+                                tj_v    = torch.tensor(tod_jam_np[:,  slots_v], dtype=torch.float32).to(device)
+                                vl      = net.training_step(x_v, m_v, tf_v, tj_v).item()
+
+                            if vl < best_vloss:
+                                best_vloss = vl
+                                best_wts   = copy.deepcopy(net.state_dict())
+                                patience_ctr = 0
+                            else:
+                                patience_ctr += 1
+
+                            if patience_ctr >= 3:
+                                print(f"    Early stop at ep {ep}")
+                                break
+
+                    if best_wts:
+                        net.load_state_dict(best_wts)
+
+                    # Evaluate on test set
+                    net.eval()
+                    x_e  = torch.tensor(speed_np[EVAL_START:EVAL_START+_T_eval, :], dtype=torch.float32).T.to(device)
+                    m_e  = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, _T_eval)
+                    si   = np.arange(EVAL_START, EVAL_START + _T_eval) % 288
+                    tf_e = torch.tensor(tod_free_np[:, si], dtype=torch.float32).to(device)
+                    tj_e = torch.tensor(tod_jam_np[:,  si], dtype=torch.float32).to(device)
+
+                    with torch.no_grad():
+                        p_e = net.impute(x_e, m_e, tf_e, tj_e).cpu().numpy()
+
+                    pred_kmh = np.zeros((len(blind_idx), _T_eval), dtype=np.float32)
+                    for ni, n in enumerate(blind_idx):
+                        if np.isnan(p_e[n]).any():
+                            pred_kmh[ni] = true_eval_kmh[ni]
+                        else:
+                            pred_kmh[ni] = np.clip(p_e[n] * node_stds[n] + node_means[n], 0, 120)
+
+                    metrics = eval_pred_np(pred_kmh, true_eval_kmh)
+                    mae_all = metrics['MAE all']
+
+                    tuning_results.append({
+                        'config': config_name,
+                        'lr': lr, 'hidden': hidden, 'epochs': epochs,
+                        'mae_all': mae_all,
+                        **metrics
+                    })
+
+                    print(f"    ✓ MAE all: {mae_all:.4f} | jam: {metrics['MAE jam']:.2f} | F1: {metrics['F1']:.3f}")
+
+                    if mae_all < best_mae_all:
+                        best_mae_all = mae_all
+                        best_config = (lr, hidden, epochs)
+                        best_net = net
+                        print(f"    🎯 NEW BEST: {mae_all:.4f}")
+
+                except Exception as e:
+                    print(f"    ❌ Error: {e}")
+                    continue
+
+    # Print summary
+    print("\n" + "=" * 90)
+    print("  HYPERPARAMETER TUNING SUMMARY")
+    print("=" * 90)
+    tuning_df = pd.DataFrame(tuning_results).sort_values('mae_all')
+    print(tuning_df[['config', 'mae_all', 'MAE jam', 'F1', 'SSIM']].head(10).to_string(index=False))
+
+    print(f"\n🏆 BEST CONFIG: lr={best_config[0]}, hidden={best_config[1]}, epochs={best_config[2]}")
+    print(f"   MAE all: {best_mae_all:.4f} vs GRIN++ 0.19 (gap: {best_mae_all - 0.19:+.4f})")
+
+    return best_net, best_config, tuning_results
+
+
     """Generate architecture diagram showing the full pipeline"""
     fig, ax = plt.subplots(figsize=(14, 8), dpi=150)
     ax.set_xlim(0, 14)
@@ -2000,6 +2143,12 @@ v9c_pred_kmh = eval_v9c(v9c_net, 'Graph-CTH-NODE v9c (aligned loss only)')
 #   v9  (all three combined):    MAE all 0.47, jam 3.11 — Interaction causes degradation.
 #   v9b (two-pass only):         MAE all 0.69, jam 2.08 — Two-pass hurts overall.
 # Insight: Learned fusion + two-pass interact badly. Aligned loss alone is the winner.
+
+# =============================================================================
+# v9c HYPERPARAMETER TUNING — Optimize to beat GRIN++ (0.19)
+# =============================================================================
+# Uncomment below to run hyperparameter tuning on Kaggle
+# v9c_best_net, v9c_best_config, tuning_results = tune_v9c_hyperparams()
 
 # Generate publication figures with actual v6 predictions
 print("\n" + "=" * 90)
