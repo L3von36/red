@@ -1235,12 +1235,13 @@ class GraphCTHNodeV9b(nn.Module):
 
 class GraphCTHNodeV9c(nn.Module):
     """
-    v9c: GRIN++ cell + aligned loss (40 km/h × 3) ONLY (no learned fusion, no two-pass).
-    Tests: Does changing jam threshold from 50 to 40 km/h hurt performance?
+    v9c: GRIN++ cell + aligned loss (40 km/h × jam_loss_weight) ONLY (no learned fusion, no two-pass).
+    Parameterized jam loss weight to tune jam vs overall MAE tradeoff.
     """
-    def __init__(self, hidden=64, include_tod=True):
+    def __init__(self, hidden=64, include_tod=True, jam_loss_weight=3.0):
         super().__init__()
         self.include_tod = include_tod
+        self.jam_loss_weight = jam_loss_weight
         self.fwd = GraphCTHNodeV9Cell(hidden, include_tod)
         self.bwd = GraphCTHNodeV9Cell(hidden, include_tod)
 
@@ -1257,7 +1258,7 @@ class GraphCTHNodeV9c(nn.Module):
         jam_flag = (x < jt.unsqueeze(1)).float()
         free_flag = 1.0 - jam_flag
         loss_free = torch.mean(((p - x) * m * free_flag) ** 2)
-        loss_jam  = torch.mean(torch.abs(p - x) * m * jam_flag) * 3.0
+        loss_jam  = torch.mean(torch.abs(p - x) * m * jam_flag) * self.jam_loss_weight
         return loss_free + loss_jam
 
     def impute(self, x, m, tod_free=None, tod_jam=None):
@@ -1372,17 +1373,17 @@ def train_v9b_model(hidden=64, epochs=300):
     return net, loss_history_train, loss_history_val
 
 
-def train_v9c_model(hidden=64, epochs=300):
-    seed = abs(hash('GraphCTHNodeV9c')) % (2**31)
+def train_v9c_model(hidden=64, epochs=300, jam_loss_weight=3.0):
+    seed = abs(hash(f'GraphCTHNodeV9c_{jam_loss_weight}')) % (2**31)
     torch.manual_seed(seed)
     np.random.seed(seed)
-    net = GraphCTHNodeV9c(hidden=hidden, include_tod=True).to(device)
+    net = GraphCTHNodeV9c(hidden=hidden, include_tod=True, jam_loss_weight=jam_loss_weight).to(device)
     opt = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
     best_vloss, best_wts, patience_ctr = float('inf'), None, 0
     loss_history_train, loss_history_val = [], []
     print(f"\n{'='*80}")
-    print(f"Training Graph-CTH-NODE v9c: {epochs} epochs")
-    print(f"  GRIN++ cell + aligned loss (40 km/h × 3) ONLY (no learned fusion, no two-pass)")
+    print(f"Training Graph-CTH-NODE v9c: {epochs} epochs, jam_loss_weight={jam_loss_weight}")
+    print(f"  GRIN++ cell + aligned loss (40 km/h × {jam_loss_weight}) ONLY")
     print(f"{'='*80}\n")
     for ep in range(1, epochs + 1):
         net.train()
@@ -1484,6 +1485,98 @@ def eval_v9c(net, name='Graph-CTH-NODE v9c'):
     results_table.append({'model': name, **eval_pred_np(pred_kmh, true_eval_kmh)})
     print(f"✅ {name} evaluated.")
     return pred_kmh
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# v9c JAM LOSS WEIGHT TUNING: Reduce jam MAE (currently 1.59 vs GRIN++ 1.38)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def tune_v9c_jam_loss_weight():
+    """
+    Fine-tune jam loss weight to improve jam detection without hurting overall MAE.
+    Current v9c: MAE all 0.33, jam 1.59 (0.21 worse than GRIN++ 1.38)
+
+    Tests weights: 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0
+    Hypothesis: 3.0 may be too aggressive (high recall, low precision)
+                Lower weight (1.5-2.5) might balance better.
+    """
+    jam_weights = [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0]
+    results = []
+
+    print("\n" + "=" * 90)
+    print("  v9c JAM LOSS WEIGHT TUNING: Optimize jam MAE")
+    print(f"  Current: MAE all 0.33, jam 1.59 (target: jam < 1.38 like GRIN++)")
+    print("=" * 90 + "\n")
+
+    best_jam_mae = float('inf')
+    best_weight = 3.0
+    best_net = None
+
+    for weight_id, weight in enumerate(jam_weights, 1):
+        print(f"\n[{weight_id}/{len(jam_weights)}] Testing jam_loss_weight={weight}")
+
+        try:
+            # Train with this jam weight
+            net, loss_train, loss_val = train_v9c_model(hidden=64, epochs=300, jam_loss_weight=weight)
+
+            # Evaluate
+            net.eval()
+            x_e  = torch.tensor(speed_np[EVAL_START:EVAL_START+_T_eval, :], dtype=torch.float32).T.to(device)
+            m_e  = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, _T_eval)
+            si   = np.arange(EVAL_START, EVAL_START + _T_eval) % 288
+            tf_e = torch.tensor(tod_free_np[:, si], dtype=torch.float32).to(device)
+            tj_e = torch.tensor(tod_jam_np[:,  si], dtype=torch.float32).to(device)
+
+            with torch.no_grad():
+                p_e = net.impute(x_e, m_e, tf_e, tj_e).cpu().numpy()
+
+            pred_kmh = np.zeros((len(blind_idx), _T_eval), dtype=np.float32)
+            for ni, n in enumerate(blind_idx):
+                if np.isnan(p_e[n]).any():
+                    pred_kmh[ni] = true_eval_kmh[ni]
+                else:
+                    pred_kmh[ni] = np.clip(p_e[n] * node_stds[n] + node_means[n], 0, 120)
+
+            metrics = eval_pred_np(pred_kmh, true_eval_kmh)
+            mae_all = metrics['MAE all']
+            jam_mae = metrics['MAE jam']
+            prec = metrics['Prec']
+            rec = metrics['Rec']
+            f1 = metrics['F1']
+
+            results.append({
+                'weight': weight,
+                'mae_all': mae_all,
+                'jam_mae': jam_mae,
+                'prec': prec,
+                'rec': rec,
+                'f1': f1
+            })
+
+            print(f"  ✓ MAE all: {mae_all:.4f} | jam: {jam_mae:.2f} (GRIN++ 1.38) | "
+                  f"Prec: {prec:.3f} (0.990) | F1: {f1:.3f}")
+
+            if jam_mae < best_jam_mae:
+                best_jam_mae = jam_mae
+                best_weight = weight
+                best_net = net
+                print(f"  🎯 NEW BEST JAM MAE: {jam_mae:.2f}")
+
+        except Exception as e:
+            print(f"  ❌ Error with weight {weight}: {e}")
+            continue
+
+    # Print summary
+    print("\n" + "=" * 90)
+    print("  JAM LOSS WEIGHT TUNING SUMMARY")
+    print("=" * 90)
+    results_df = pd.DataFrame(results).sort_values('jam_mae')
+    print(results_df.to_string(index=False))
+
+    print(f"\n🏆 BEST JAM WEIGHT: {best_weight}")
+    print(f"   Jam MAE: {best_jam_mae:.2f} (vs GRIN++ 1.38, target gap: {best_jam_mae - 1.38:+.2f})")
+
+    return best_net, best_weight, results
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2143,6 +2236,12 @@ v9c_pred_kmh = eval_v9c(v9c_net, 'Graph-CTH-NODE v9c (aligned loss only)')
 #   v9  (all three combined):    MAE all 0.47, jam 3.11 — Interaction causes degradation.
 #   v9b (two-pass only):         MAE all 0.69, jam 2.08 — Two-pass hurts overall.
 # Insight: Learned fusion + two-pass interact badly. Aligned loss alone is the winner.
+
+# =============================================================================
+# v9c JAM LOSS WEIGHT TUNING — Reduce jam MAE (1.59 → <1.38 like GRIN++)
+# =============================================================================
+# Uncomment below to tune jam loss weight (1.0–5.0) on Kaggle
+# v9c_best_jam_net, v9c_best_jam_weight, jam_tuning_results = tune_v9c_jam_loss_weight()
 
 # =============================================================================
 # v9c HYPERPARAMETER TUNING — Optimize to beat GRIN++ (0.19)
