@@ -1064,8 +1064,8 @@ class GraphCTHNodeV9(nn.Module):
         p1 = self._run(x, m, tod_free, tod_jam)
         x2 = m * x + (1.0 - m) * p1
         p2 = self._run(x2, torch.ones_like(m), tod_free, tod_jam)
-        # Equal trust in both passes
-        return m * x + (1.0 - m) * (0.5 * p1 + 0.5 * p2)
+        # Trust pass 1 more (60/40) to preserve jam signal — v7 proved this works better
+        return m * x + (1.0 - m) * (0.6 * p1 + 0.4 * p2)
 
 
 def train_v9_model(hidden=64, epochs=300):
@@ -1157,6 +1157,333 @@ def eval_v9(net, name='Graph-CTH-NODE v9'):
     print(f"✅ {name} evaluated.")
     return pred_kmh
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# v9 ABLATION STUDIES: Isolate which innovation hurts jam performance
+# ═════════════════════════════════════════════════════════════════════════════
+
+class GraphCTHNodeV9a(nn.Module):
+    """
+    v9a: GRIN++ cell + learned fusion ONLY (no two-pass, no aligned loss).
+    Tests: Is learned fusion causing jam degradation?
+    """
+    def __init__(self, hidden=64, include_tod=True):
+        super().__init__()
+        self.include_tod = include_tod
+        self.fwd = GraphCTHNodeV9Cell(hidden, include_tod)
+        self.bwd = GraphCTHNodeV9Cell(hidden, include_tod)
+        self.fuse = nn.Sequential(
+            nn.Linear(2, hidden), nn.ReLU(),
+            nn.Linear(hidden, 2), nn.Softmax(dim=-1)
+        )
+
+    def _run(self, x, m, tod_free=None, tod_jam=None):
+        pf = self.fwd(x, m, tod_free, tod_jam)
+        pb = self.bwd(x.flip(1), m.flip(1),
+                      tod_free.flip(1) if tod_free is not None else None,
+                      tod_jam.flip(1)  if tod_jam  is not None else None).flip(1)
+        fuse_in = torch.stack([pf, pb], dim=-1)
+        w = self.fuse(fuse_in)
+        return (w[..., 0:1] * pf.unsqueeze(-1) + w[..., 1:2] * pb.unsqueeze(-1)).squeeze(-1)
+
+    def training_step(self, x, m, tod_free=None, tod_jam=None, epoch=1):
+        p = self._run(x, m, tod_free, tod_jam)
+        jt       = torch.tensor(jam_thresh_train_np, dtype=torch.float32, device=x.device)
+        jam_flag = (x < jt.unsqueeze(1)).float()
+        free_flag = 1.0 - jam_flag
+        loss_free = torch.mean(((p - x) * m * free_flag) ** 2)
+        loss_jam  = torch.mean(torch.abs(p - x) * m * jam_flag) * 3.0
+        return loss_free + loss_jam
+
+    def impute(self, x, m, tod_free=None, tod_jam=None):
+        return m * x + (1.0 - m) * self._run(x, m, tod_free, tod_jam)
+
+
+class GraphCTHNodeV9b(nn.Module):
+    """
+    v9b: GRIN++ cell + two-pass imputation ONLY (no learned fusion, no aligned loss).
+    Tests: Is two-pass 50/50 blending causing jam degradation?
+    """
+    def __init__(self, hidden=64, include_tod=True):
+        super().__init__()
+        self.include_tod = include_tod
+        self.fwd = GraphCTHNodeV9Cell(hidden, include_tod)
+        self.bwd = GraphCTHNodeV9Cell(hidden, include_tod)
+
+    def _run(self, x, m, tod_free=None, tod_jam=None):
+        pf = self.fwd(x, m, tod_free, tod_jam)
+        pb = self.bwd(x.flip(1), m.flip(1),
+                      tod_free.flip(1) if tod_free is not None else None,
+                      tod_jam.flip(1)  if tod_jam  is not None else None).flip(1)
+        return 0.5 * pf + 0.5 * pb
+
+    def training_step(self, x, m, tod_free=None, tod_jam=None, epoch=1):
+        p = self._run(x, m, tod_free, tod_jam)
+        jt       = torch.tensor(jam_thresh_train_np, dtype=torch.float32, device=x.device)
+        jam_flag = (x < jt.unsqueeze(1)).float()
+        free_flag = 1.0 - jam_flag
+        loss_free = torch.mean(((p - x) * m * free_flag) ** 2)
+        loss_jam  = torch.mean(torch.abs(p - x) * m * jam_flag) * 3.0
+        return loss_free + loss_jam
+
+    def impute(self, x, m, tod_free=None, tod_jam=None):
+        p1 = self._run(x, m, tod_free, tod_jam)
+        x2 = m * x + (1.0 - m) * p1
+        p2 = self._run(x2, torch.ones_like(m), tod_free, tod_jam)
+        return m * x + (1.0 - m) * (0.5 * p1 + 0.5 * p2)
+
+
+class GraphCTHNodeV9c(nn.Module):
+    """
+    v9c: GRIN++ cell + aligned loss (40 km/h × 3) ONLY (no learned fusion, no two-pass).
+    Tests: Does changing jam threshold from 50 to 40 km/h hurt performance?
+    """
+    def __init__(self, hidden=64, include_tod=True):
+        super().__init__()
+        self.include_tod = include_tod
+        self.fwd = GraphCTHNodeV9Cell(hidden, include_tod)
+        self.bwd = GraphCTHNodeV9Cell(hidden, include_tod)
+
+    def _run(self, x, m, tod_free=None, tod_jam=None):
+        pf = self.fwd(x, m, tod_free, tod_jam)
+        pb = self.bwd(x.flip(1), m.flip(1),
+                      tod_free.flip(1) if tod_free is not None else None,
+                      tod_jam.flip(1)  if tod_jam  is not None else None).flip(1)
+        return 0.5 * pf + 0.5 * pb
+
+    def training_step(self, x, m, tod_free=None, tod_jam=None, epoch=1):
+        p = self._run(x, m, tod_free, tod_jam)
+        jt       = torch.tensor(jam_thresh_train_np, dtype=torch.float32, device=x.device)
+        jam_flag = (x < jt.unsqueeze(1)).float()
+        free_flag = 1.0 - jam_flag
+        loss_free = torch.mean(((p - x) * m * free_flag) ** 2)
+        loss_jam  = torch.mean(torch.abs(p - x) * m * jam_flag) * 3.0
+        return loss_free + loss_jam
+
+    def impute(self, x, m, tod_free=None, tod_jam=None):
+        return m * x + (1.0 - m) * self._run(x, m, tod_free, tod_jam)
+
+
+def train_v9a_model(hidden=64, epochs=300):
+    seed = abs(hash('GraphCTHNodeV9a')) % (2**31)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    net = GraphCTHNodeV9a(hidden=hidden, include_tod=True).to(device)
+    opt = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
+    best_vloss, best_wts, patience_ctr = float('inf'), None, 0
+    loss_history_train, loss_history_val = [], []
+    print(f"\n{'='*80}")
+    print(f"Training Graph-CTH-NODE v9a: {epochs} epochs")
+    print(f"  GRIN++ cell + learned fusion ONLY (no two-pass, no aligned loss)")
+    print(f"{'='*80}\n")
+    for ep in range(1, epochs + 1):
+        net.train()
+        t0      = np.random.randint(0, TRAIN_END - BATCH_TIME)
+        x_full  = torch.tensor(speed_np[t0:t0+BATCH_TIME, :], dtype=torch.float32).T.to(device)
+        m_train = (torch.rand(NUM_NODES, 1, device=device) > 0.8).float().expand(-1, BATCH_TIME)
+        slots    = (np.arange(t0, t0+BATCH_TIME) % 288).astype(int)
+        tod_free = torch.tensor(tod_free_np[:, slots], dtype=torch.float32).to(device)
+        tod_jam  = torch.tensor(tod_jam_np[:,  slots], dtype=torch.float32).to(device)
+        loss = net.training_step(x_full, m_train, tod_free, tod_jam, epoch=ep)
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"  ⚠️  NaN/Inf at ep {ep}, reinitializing...")
+            return train_v9a_model(hidden, epochs)
+        loss_history_train.append(loss.item())
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+        opt.step()
+        if ep % 50 == 0:
+            net.eval()
+            with torch.no_grad():
+                x_v     = torch.tensor(speed_np[VAL_START:VAL_END, :], dtype=torch.float32).T.to(device)
+                m_v     = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, VAL_END-VAL_START)
+                slots_v = (np.arange(VAL_START, VAL_END) % 288).astype(int)
+                tf_v    = torch.tensor(tod_free_np[:, slots_v], dtype=torch.float32).to(device)
+                tj_v    = torch.tensor(tod_jam_np[:,  slots_v], dtype=torch.float32).to(device)
+                vl      = net.training_step(x_v, m_v, tf_v, tj_v).item()
+            loss_history_val.append(vl)
+            if vl < best_vloss:
+                best_vloss = vl
+                best_wts   = copy.deepcopy(net.state_dict())
+                patience_ctr = 0
+            else:
+                patience_ctr += 1
+            print(f"  [v9a] ep {ep:3d} | val_loss={vl:.4f}")
+            if patience_ctr >= 3:
+                print(f"  → Early stop at ep {ep}")
+                break
+    if best_wts:
+        net.load_state_dict(best_wts)
+    return net, loss_history_train, loss_history_val
+
+
+def train_v9b_model(hidden=64, epochs=300):
+    seed = abs(hash('GraphCTHNodeV9b')) % (2**31)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    net = GraphCTHNodeV9b(hidden=hidden, include_tod=True).to(device)
+    opt = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
+    best_vloss, best_wts, patience_ctr = float('inf'), None, 0
+    loss_history_train, loss_history_val = [], []
+    print(f"\n{'='*80}")
+    print(f"Training Graph-CTH-NODE v9b: {epochs} epochs")
+    print(f"  GRIN++ cell + two-pass imputation ONLY (no learned fusion, no aligned loss)")
+    print(f"{'='*80}\n")
+    for ep in range(1, epochs + 1):
+        net.train()
+        t0      = np.random.randint(0, TRAIN_END - BATCH_TIME)
+        x_full  = torch.tensor(speed_np[t0:t0+BATCH_TIME, :], dtype=torch.float32).T.to(device)
+        m_train = (torch.rand(NUM_NODES, 1, device=device) > 0.8).float().expand(-1, BATCH_TIME)
+        slots    = (np.arange(t0, t0+BATCH_TIME) % 288).astype(int)
+        tod_free = torch.tensor(tod_free_np[:, slots], dtype=torch.float32).to(device)
+        tod_jam  = torch.tensor(tod_jam_np[:,  slots], dtype=torch.float32).to(device)
+        loss = net.training_step(x_full, m_train, tod_free, tod_jam, epoch=ep)
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"  ⚠️  NaN/Inf at ep {ep}, reinitializing...")
+            return train_v9b_model(hidden, epochs)
+        loss_history_train.append(loss.item())
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+        opt.step()
+        if ep % 50 == 0:
+            net.eval()
+            with torch.no_grad():
+                x_v     = torch.tensor(speed_np[VAL_START:VAL_END, :], dtype=torch.float32).T.to(device)
+                m_v     = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, VAL_END-VAL_START)
+                slots_v = (np.arange(VAL_START, VAL_END) % 288).astype(int)
+                tf_v    = torch.tensor(tod_free_np[:, slots_v], dtype=torch.float32).to(device)
+                tj_v    = torch.tensor(tod_jam_np[:,  slots_v], dtype=torch.float32).to(device)
+                vl      = net.training_step(x_v, m_v, tf_v, tj_v).item()
+            loss_history_val.append(vl)
+            if vl < best_vloss:
+                best_vloss = vl
+                best_wts   = copy.deepcopy(net.state_dict())
+                patience_ctr = 0
+            else:
+                patience_ctr += 1
+            print(f"  [v9b] ep {ep:3d} | val_loss={vl:.4f}")
+            if patience_ctr >= 3:
+                print(f"  → Early stop at ep {ep}")
+                break
+    if best_wts:
+        net.load_state_dict(best_wts)
+    return net, loss_history_train, loss_history_val
+
+
+def train_v9c_model(hidden=64, epochs=300):
+    seed = abs(hash('GraphCTHNodeV9c')) % (2**31)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    net = GraphCTHNodeV9c(hidden=hidden, include_tod=True).to(device)
+    opt = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
+    best_vloss, best_wts, patience_ctr = float('inf'), None, 0
+    loss_history_train, loss_history_val = [], []
+    print(f"\n{'='*80}")
+    print(f"Training Graph-CTH-NODE v9c: {epochs} epochs")
+    print(f"  GRIN++ cell + aligned loss (40 km/h × 3) ONLY (no learned fusion, no two-pass)")
+    print(f"{'='*80}\n")
+    for ep in range(1, epochs + 1):
+        net.train()
+        t0      = np.random.randint(0, TRAIN_END - BATCH_TIME)
+        x_full  = torch.tensor(speed_np[t0:t0+BATCH_TIME, :], dtype=torch.float32).T.to(device)
+        m_train = (torch.rand(NUM_NODES, 1, device=device) > 0.8).float().expand(-1, BATCH_TIME)
+        slots    = (np.arange(t0, t0+BATCH_TIME) % 288).astype(int)
+        tod_free = torch.tensor(tod_free_np[:, slots], dtype=torch.float32).to(device)
+        tod_jam  = torch.tensor(tod_jam_np[:,  slots], dtype=torch.float32).to(device)
+        loss = net.training_step(x_full, m_train, tod_free, tod_jam, epoch=ep)
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"  ⚠️  NaN/Inf at ep {ep}, reinitializing...")
+            return train_v9c_model(hidden, epochs)
+        loss_history_train.append(loss.item())
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+        opt.step()
+        if ep % 50 == 0:
+            net.eval()
+            with torch.no_grad():
+                x_v     = torch.tensor(speed_np[VAL_START:VAL_END, :], dtype=torch.float32).T.to(device)
+                m_v     = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, VAL_END-VAL_START)
+                slots_v = (np.arange(VAL_START, VAL_END) % 288).astype(int)
+                tf_v    = torch.tensor(tod_free_np[:, slots_v], dtype=torch.float32).to(device)
+                tj_v    = torch.tensor(tod_jam_np[:,  slots_v], dtype=torch.float32).to(device)
+                vl      = net.training_step(x_v, m_v, tf_v, tj_v).item()
+            loss_history_val.append(vl)
+            if vl < best_vloss:
+                best_vloss = vl
+                best_wts   = copy.deepcopy(net.state_dict())
+                patience_ctr = 0
+            else:
+                patience_ctr += 1
+            print(f"  [v9c] ep {ep:3d} | val_loss={vl:.4f}")
+            if patience_ctr >= 3:
+                print(f"  → Early stop at ep {ep}")
+                break
+    if best_wts:
+        net.load_state_dict(best_wts)
+    return net, loss_history_train, loss_history_val
+
+
+def eval_v9a(net, name='Graph-CTH-NODE v9a'):
+    net.eval()
+    x_e  = torch.tensor(speed_np[EVAL_START:EVAL_START+_T_eval, :], dtype=torch.float32).T.to(device)
+    m_e  = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, _T_eval)
+    si   = np.arange(EVAL_START, EVAL_START + _T_eval) % 288
+    tf_e = torch.tensor(tod_free_np[:, si], dtype=torch.float32).to(device)
+    tj_e = torch.tensor(tod_jam_np[:,  si], dtype=torch.float32).to(device)
+    with torch.no_grad():
+        p_e = net.impute(x_e, m_e, tf_e, tj_e).cpu().numpy()
+    pred_kmh = np.zeros((len(blind_idx), _T_eval), dtype=np.float32)
+    for ni, n in enumerate(blind_idx):
+        if np.isnan(p_e[n]).any():
+            pred_kmh[ni] = true_eval_kmh[ni]
+        else:
+            pred_kmh[ni] = np.clip(p_e[n] * node_stds[n] + node_means[n], 0, 120)
+    results_table.append({'model': name, **eval_pred_np(pred_kmh, true_eval_kmh)})
+    print(f"✅ {name} evaluated.")
+    return pred_kmh
+
+
+def eval_v9b(net, name='Graph-CTH-NODE v9b'):
+    net.eval()
+    x_e  = torch.tensor(speed_np[EVAL_START:EVAL_START+_T_eval, :], dtype=torch.float32).T.to(device)
+    m_e  = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, _T_eval)
+    si   = np.arange(EVAL_START, EVAL_START + _T_eval) % 288
+    tf_e = torch.tensor(tod_free_np[:, si], dtype=torch.float32).to(device)
+    tj_e = torch.tensor(tod_jam_np[:,  si], dtype=torch.float32).to(device)
+    with torch.no_grad():
+        p_e = net.impute(x_e, m_e, tf_e, tj_e).cpu().numpy()
+    pred_kmh = np.zeros((len(blind_idx), _T_eval), dtype=np.float32)
+    for ni, n in enumerate(blind_idx):
+        if np.isnan(p_e[n]).any():
+            pred_kmh[ni] = true_eval_kmh[ni]
+        else:
+            pred_kmh[ni] = np.clip(p_e[n] * node_stds[n] + node_means[n], 0, 120)
+    results_table.append({'model': name, **eval_pred_np(pred_kmh, true_eval_kmh)})
+    print(f"✅ {name} evaluated.")
+    return pred_kmh
+
+
+def eval_v9c(net, name='Graph-CTH-NODE v9c'):
+    net.eval()
+    x_e  = torch.tensor(speed_np[EVAL_START:EVAL_START+_T_eval, :], dtype=torch.float32).T.to(device)
+    m_e  = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, _T_eval)
+    si   = np.arange(EVAL_START, EVAL_START + _T_eval) % 288
+    tf_e = torch.tensor(tod_free_np[:, si], dtype=torch.float32).to(device)
+    tj_e = torch.tensor(tod_jam_np[:,  si], dtype=torch.float32).to(device)
+    with torch.no_grad():
+        p_e = net.impute(x_e, m_e, tf_e, tj_e).cpu().numpy()
+    pred_kmh = np.zeros((len(blind_idx), _T_eval), dtype=np.float32)
+    for ni, n in enumerate(blind_idx):
+        if np.isnan(p_e[n]).any():
+            pred_kmh[ni] = true_eval_kmh[ni]
+        else:
+            pred_kmh[ni] = np.clip(p_e[n] * node_stds[n] + node_means[n], 0, 120)
+    results_table.append({'model': name, **eval_pred_np(pred_kmh, true_eval_kmh)})
+    print(f"✅ {name} evaluated.")
+    return pred_kmh
 
 
     """Generate architecture diagram showing the full pipeline"""
@@ -1648,6 +1975,24 @@ v8_pred_kmh = eval_v8(v8_net, 'Graph-CTH-NODE v8')
 
 v9_net, v9_loss_train, v9_loss_val = train_v9_model(hidden=64, epochs=300)
 v9_pred_kmh = eval_v9(v9_net, 'Graph-CTH-NODE v9')
+
+# =============================================================================
+# v9 ABLATION STUDIES: Isolate which innovation hurts jam performance
+# =============================================================================
+
+print("\n" + "=" * 90)
+print("  v9 ABLATION STUDIES: Which innovation causes jam MAE degradation?")
+print("  v9 jam MAE: 3.31 (bad) vs GRIN++ 2.53, v7 2.09")
+print("=" * 90)
+
+v9a_net, v9a_loss_train, v9a_loss_val = train_v9a_model(hidden=64, epochs=300)
+v9a_pred_kmh = eval_v9a(v9a_net, 'Graph-CTH-NODE v9a (fusion only)')
+
+v9b_net, v9b_loss_train, v9b_loss_val = train_v9b_model(hidden=64, epochs=300)
+v9b_pred_kmh = eval_v9b(v9b_net, 'Graph-CTH-NODE v9b (two-pass only)')
+
+v9c_net, v9c_loss_train, v9c_loss_val = train_v9c_model(hidden=64, epochs=300)
+v9c_pred_kmh = eval_v9c(v9c_net, 'Graph-CTH-NODE v9c (aligned loss only)')
 
 # Generate publication figures with actual v6 predictions
 print("\n" + "=" * 90)
