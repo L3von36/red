@@ -321,7 +321,6 @@ def build_input_features(mask, data_tensor_all, tod_prior,
         tod_free_feat, tod_jam_feat,
     ], dim=-1)  # [1, N, T, 13]
 
-
 SPARSITY = 0.80
 K_MASKS  = 5
 masks_list, features_list = [], []
@@ -390,581 +389,6 @@ class ChebConv(nn.Module):
 #
 # Expected: 0.20-0.22 MAE on PEMS04 (vs GRIN++ 0.27, v5 4.95)
 
-class GraphCTHNodeV6Cell(nn.Module):
-    """
-    Enhanced RNN Cell: 4-path graph + ToD priors + adaptive mixing
-    Per timestep:
-    1. Message passing on 4 graphs (sym, fwd, bwd, corr)
-    2. Adaptive path mixing (per-node learned weights)
-    3. GRU update with ToD context
-    4. Context-dependent residual skip
-    """
-    def __init__(self, hidden=64, include_tod=True):
-        super().__init__()
-        self.hidden = hidden
-        self.include_tod = include_tod
-
-        # 4-path message passing with Chebyshev convolution
-        msg_in_dim = hidden + 1 + (2 if include_tod else 0)
-        self.msg_sym  = ChebConv(msg_in_dim, hidden, K=3)
-        self.msg_fwd  = ChebConv(msg_in_dim, hidden, K=3)
-        self.msg_bwd  = ChebConv(msg_in_dim, hidden, K=3)
-        self.msg_corr = ChebConv(msg_in_dim, hidden, K=3)
-
-        # Per-path learned bias + adaptive mixing
-        self.path_bias = nn.Parameter(torch.randn(4) * 0.1)
-        self.mix_w = nn.Linear(hidden, 4)
-
-        # GRU: [msg, x, mask, m_prop, (tod)]
-        gru_in_dim = hidden + 1 + 1 + 1 + (2 if include_tod else 0)  # +1 for m_prop_seq
-        self.gru = nn.GRUCell(gru_in_dim, hidden)
-        self.out = nn.Linear(hidden, 1)
-        self.act = nn.Tanh()
-
-    def forward(self, x_seq, m_seq, tod_free_seq=None, tod_jam_seq=None):
-        N, T = x_seq.shape
-        h = torch.zeros(N, self.hidden, device=x_seq.device)
-        preds = []
-
-        # GRIN++ FIX #1: Propagate observation mask through graph
-        # Tell each node: "What % of my neighbors are observed?"
-        # v6 blind nodes don't know if neighbors are trustworthy
-        # GRIN++ propagates mask to give explicit context: "I'm surrounded by 80% observed"
-        A_prop = torch.tensor(adj_sym, dtype=torch.float32).to(x_seq.device)  # [N, N]
-        degree = A_prop.sum(dim=1, keepdim=True) + 1e-8  # [N, 1]
-        m_prop_seq = torch.mm(A_prop, m_seq) / degree  # [N, T] normalized by degree
-        # m_prop_seq[i, t] = fraction of node i's neighbors that are observed at time t
-
-        for t in range(T):
-            if self.include_tod and tod_free_seq is not None:
-                msg_in = torch.cat([h, m_seq[:,t:t+1],
-                                   tod_free_seq[:,t:t+1], tod_jam_seq[:,t:t+1]], dim=-1)
-            else:
-                msg_in = torch.cat([h, m_seq[:,t:t+1]], dim=-1)
-
-            m_sym  = self.act(self.msg_sym(msg_in))
-            m_fwd  = self.act(self.msg_fwd(msg_in))
-            m_bwd  = self.act(self.msg_bwd(msg_in))
-            m_corr = self.act(self.msg_corr(msg_in))
-
-            mix_logits = self.mix_w(h) + self.path_bias.unsqueeze(0)
-            mix_w = torch.softmax(mix_logits, dim=1)
-            msg = (mix_w[:,0:1]*m_sym + mix_w[:,1:2]*m_fwd +
-                   mix_w[:,2:3]*m_bwd + mix_w[:,3:4]*m_corr)
-
-            x_t = x_seq[:,t:t+1]
-            if self.include_tod and tod_free_seq is not None:
-                inp = torch.cat([msg, x_t, m_seq[:,t:t+1], m_prop_seq[:,t:t+1],
-                                tod_free_seq[:,t:t+1], tod_jam_seq[:,t:t+1]], dim=-1)
-                #                             ^^^^^^^^^^^^^^
-                #                             NEW: mask propagation!
-            else:
-                inp = torch.cat([msg, x_t, m_seq[:,t:t+1], m_prop_seq[:,t:t+1]], dim=-1)
-                #                             ^^^^^^^^^^^^^^
-                #                             NEW: mask propagation!
-
-            h_new = self.gru(inp, h)
-            skip_weight = 0.1 + 0.05 * (1.0 - m_seq[:,t:t+1])
-            h = h_new + skip_weight * h
-            preds.append(self.out(h)[:,0])
-
-        return torch.stack(preds, dim=1)
-
-
-class GraphCTHNodeV6(nn.Module):
-    """Full bidirectional model with learned forward/backward fusion"""
-    def __init__(self, hidden=64, include_tod=True):
-        super().__init__()
-        self.include_tod = include_tod
-        self.fwd = GraphCTHNodeV6Cell(hidden, include_tod)
-        self.bwd = GraphCTHNodeV6Cell(hidden, include_tod)
-        self.fuse = nn.Sequential(
-            nn.Linear(2, hidden), nn.ReLU(),
-            nn.Linear(hidden, 2), nn.Softmax(dim=-1)
-        )
-
-    def _run(self, x, m, tod_free=None, tod_jam=None):
-        pf = self.fwd(x, m, tod_free, tod_jam)
-        pb = self.bwd(x.flip(1), m.flip(1),
-                      tod_free.flip(1) if tod_free is not None else None,
-                      tod_jam.flip(1) if tod_jam is not None else None).flip(1)
-        fuse_in = torch.stack([pf, pb], dim=-1)
-        w = self.fuse(fuse_in)
-        return (w[...,0:1]*pf.unsqueeze(-1) + w[...,1:2]*pb.unsqueeze(-1)).squeeze(-1)
-
-    def training_step(self, x, m, tod_free=None, tod_jam=None, epoch=1):
-        p = self._run(x, m, tod_free, tod_jam)
-
-        # GRIN++ FIX #2: Only train on OBSERVED nodes (those with real ground truth)
-        # v6 was training on blind nodes (80%) which have no real data = fitting to noise
-        # GRIN++ trains only on observed nodes (20%) which have real sensor data = clean signal
-        mask_obs = node_mask[0, :, 0, 0] == 1  # [N] boolean: True for observed nodes
-
-        # Filter to only observed nodes
-        p_obs = p[mask_obs, :]  # [n_obs, T] predictions for observed nodes only
-        x_obs = x[mask_obs, :]  # [n_obs, T] targets for observed nodes only
-        m_obs = m[mask_obs, :]  # [n_obs, T] mask for observed nodes only
-
-        # Compute jam/free flags for observed nodes only
-        node_means_t = torch.tensor(node_means, dtype=torch.float32).to(x.device)
-        node_stds_t = torch.tensor(node_stds, dtype=torch.float32).to(x.device)
-        means_obs = node_means_t[mask_obs]  # [n_obs]
-        stds_obs = node_stds_t[mask_obs]    # [n_obs]
-        jt_obs = (JAM_KMH_TRAIN - means_obs) / stds_obs  # [n_obs]
-        jam_flag = (x_obs < jt_obs.unsqueeze(1)).float()  # [n_obs, T]
-        free_flag = 1.0 - jam_flag
-
-        # Loss computed ONLY on observed nodes (clean training signal)
-        loss_free = torch.mean(((p_obs - x_obs) * m_obs * free_flag) ** 2)
-        loss_jam = torch.mean(torch.abs(p_obs - x_obs) * m_obs * jam_flag) * 3.0
-
-        # Spatial smoothness loss: penalize sharp differences between neighbors (only on observed)
-        lam_spatial = 0.01
-        A_spatial = torch.tensor(adj_sym, dtype=torch.float32).to(x.device)  # [N, N]
-        spatial_diff = 0.0
-        for i in range(p.shape[0]):
-            neighbors = torch.where(A_spatial[i] > 1e-6)[0]
-            if len(neighbors) > 0:
-                # Only penalize differences where BOTH nodes are observed
-                mask_i = m[i:i+1, :]  # [1, T]
-                mask_neighbors = m[neighbors, :]  # [n_neighbors, T]
-                mask_both = mask_i * mask_neighbors  # [n_neighbors, T]
-                neighbor_diffs = torch.abs(p[i:i+1, :] - p[neighbors, :]) * mask_both  # [n_neighbors, T]
-                if mask_both.sum() > 0:
-                    spatial_diff = spatial_diff + neighbor_diffs.sum() / (mask_both.sum() + 1e-8)
-        spatial_diff = spatial_diff / (p.shape[0] + 1e-8)
-        loss_spatial = lam_spatial * spatial_diff
-
-        return loss_free + loss_jam + loss_spatial
-
-    def impute(self, x, m, tod_free=None, tod_jam=None):
-        p = self._run(x, m, tod_free, tod_jam)
-        return m*x + (1-m)*p
-
-
-# =============================================================================
-# Graph-CTH-NODE v7: Fixed training + two-pass imputation + curriculum masking
-# =============================================================================
-
-class GraphCTHNodeV7(nn.Module):
-    """
-    Graph-CTH-NODE v7 — three critical improvements over v6:
-
-    1. Random-mask loss: trains loss on randomly observed nodes (like GRIN/GRIN++),
-       not the fixed node_mask. Teaches the model to impute ANY node position.
-    2. Two-pass imputation: first pass estimates blind nodes, second pass refines
-       using those estimates as additional context.
-    3. Fast spatial smoothness: single matrix multiply A@p instead of per-node loop.
-
-    Architecture is identical to v6 (4-path ChebConv K=3, BiGRU, ToD priors),
-    with hidden=96 for extra capacity.
-    """
-    def __init__(self, hidden=96, include_tod=True):
-        super().__init__()
-        self.include_tod = include_tod
-        self.fwd  = GraphCTHNodeV6Cell(hidden, include_tod)
-        self.bwd  = GraphCTHNodeV6Cell(hidden, include_tod)
-        self.fuse = nn.Sequential(
-            nn.Linear(2, hidden), nn.ReLU(),
-            nn.Linear(hidden, 2), nn.Softmax(dim=-1)
-        )
-        self._A_sp = None  # cached adjacency tensor
-
-    def _adj(self, device):
-        if self._A_sp is None or self._A_sp.device != device:
-            self._A_sp = torch.tensor(adj_sym, dtype=torch.float32, device=device)
-        return self._A_sp
-
-    def _run(self, x, m, tod_free=None, tod_jam=None):
-        pf = self.fwd(x, m, tod_free, tod_jam)
-        pb = self.bwd(x.flip(1), m.flip(1),
-                      tod_free.flip(1) if tod_free is not None else None,
-                      tod_jam.flip(1)  if tod_jam  is not None else None).flip(1)
-        fuse_in = torch.stack([pf, pb], dim=-1)
-        w = self.fuse(fuse_in)
-        return (w[..., 0:1] * pf.unsqueeze(-1) + w[..., 1:2] * pb.unsqueeze(-1)).squeeze(-1)
-
-    def training_step(self, x, m, tod_free=None, tod_jam=None, epoch=1):
-        p = self._run(x, m, tod_free, tod_jam)
-
-        # v7 FIX: use random mask m for loss (not fixed node_mask)
-        # Teaches the model to impute ANY node position, including blind nodes.
-        jt       = torch.tensor(jam_thresh_train_np, dtype=torch.float32, device=x.device)
-        jam_flag = (x < jt.unsqueeze(1)).float()
-        free_flag = 1.0 - jam_flag
-
-        loss_free    = torch.mean(((p - x) * m * free_flag) ** 2)
-        loss_jam     = torch.mean(torch.abs(p - x) * m * jam_flag) * 3.0
-
-        # Spatial smoothness disabled in v7 — 4-path message passing provides implicit smoothing
-        # (add back if needed: degree-normalized A @ p, very light weight)
-
-        return loss_free + loss_jam
-
-    def impute(self, x, m, tod_free=None, tod_jam=None):
-        # Pass 1: standard imputation
-        p1 = self._run(x, m, tod_free, tod_jam)
-        # Pass 2: fill blind positions with p1, then re-run for refined estimates
-        x2 = m * x + (1.0 - m) * p1
-        p2 = self._run(x2, torch.ones_like(m), tod_free, tod_jam)
-        # Blend: trust pass 1 slightly more (60/40) for blind nodes
-        return m * x + (1.0 - m) * (0.6 * p1 + 0.4 * p2)
-
-
-def train_v7_model(hidden=96, epochs=300):
-    seed = abs(hash('GraphCTHNodeV7')) % (2**31)
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-
-    net = GraphCTHNodeV7(hidden=hidden, include_tod=True).to(device)
-    opt = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=5e-5)
-    best_vloss, best_wts, patience_ctr = float('inf'), None, 0
-
-    loss_history_train, loss_history_val = [], []
-
-    print(f"\n{'='*80}")
-    print(f"Training Graph-CTH-NODE v7: {epochs} epochs")
-    print(f"  Random-mask loss (like GRIN/GRIN++) + two-pass impute + cosine LR")
-    print(f"  hidden={hidden}, K=3 ChebConv, 4-path BiGRU, ToD priors")
-    print(f"{'='*80}\n")
-
-    for ep in range(1, epochs + 1):
-        net.train()
-        # Fixed 20% masking like GRIN (80% missing, 20% observed)
-        t0      = np.random.randint(0, TRAIN_END - BATCH_TIME)
-        x_full  = torch.tensor(speed_np[t0:t0+BATCH_TIME, :], dtype=torch.float32).T.to(device)
-        m_train = (torch.rand(NUM_NODES, 1, device=device) > 0.8).float().expand(-1, BATCH_TIME)
-
-        slots    = (np.arange(t0, t0+BATCH_TIME) % 288).astype(int)
-        tod_free = torch.tensor(tod_free_np[:, slots], dtype=torch.float32).to(device)
-        tod_jam  = torch.tensor(tod_jam_np[:,  slots], dtype=torch.float32).to(device)
-
-        loss = net.training_step(x_full, m_train, tod_free, tod_jam, epoch=ep)
-
-        if torch.isnan(loss) or torch.isinf(loss):
-            print(f"  ⚠️  NaN/Inf at ep {ep}, reinitializing...")
-            return train_v7_model(hidden, epochs)
-
-        loss_history_train.append(loss.item())
-        opt.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
-        opt.step()
-        scheduler.step()
-
-        if ep % 50 == 0:
-            net.eval()
-            with torch.no_grad():
-                x_v     = torch.tensor(speed_np[VAL_START:VAL_END, :], dtype=torch.float32).T.to(device)
-                m_v     = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, VAL_END-VAL_START)
-                slots_v = (np.arange(VAL_START, VAL_END) % 288).astype(int)
-                tf_v    = torch.tensor(tod_free_np[:, slots_v], dtype=torch.float32).to(device)
-                tj_v    = torch.tensor(tod_jam_np[:,  slots_v], dtype=torch.float32).to(device)
-                vl      = net.training_step(x_v, m_v, tf_v, tj_v).item()
-
-            loss_history_val.append(vl)
-            if vl < best_vloss:
-                best_vloss = vl
-                best_wts   = copy.deepcopy(net.state_dict())
-                patience_ctr = 0
-            else:
-                patience_ctr += 1
-            lr_now = scheduler.get_last_lr()[0]
-            print(f"  [v7] ep {ep:3d} | val_loss={vl:.4f} | lr={lr_now:.6f}")
-            if patience_ctr >= 4:
-                print(f"  → Early stop at ep {ep}")
-                break
-
-    if best_wts:
-        net.load_state_dict(best_wts)
-    return net, loss_history_train, loss_history_val
-
-
-def eval_v7(net, name='Graph-CTH-NODE v7'):
-    net.eval()
-    x_e  = torch.tensor(speed_np[EVAL_START:EVAL_START+_T_eval, :], dtype=torch.float32).T.to(device)
-    m_e  = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, _T_eval)
-    si   = np.arange(EVAL_START, EVAL_START + _T_eval) % 288
-    tf_e = torch.tensor(tod_free_np[:, si], dtype=torch.float32).to(device)
-    tj_e = torch.tensor(tod_jam_np[:,  si], dtype=torch.float32).to(device)
-
-    with torch.no_grad():
-        p_e = net.impute(x_e, m_e, tf_e, tj_e).cpu().numpy()
-
-    pred_kmh = np.zeros((len(blind_idx), _T_eval), dtype=np.float32)
-    for ni, n in enumerate(blind_idx):
-        if np.isnan(p_e[n]).any():
-            pred_kmh[ni] = true_eval_kmh[ni]
-        else:
-            pred_kmh[ni] = np.clip(p_e[n] * node_stds[n] + node_means[n], 0, 120)
-
-    results_table.append({'model': name, **eval_pred_np(pred_kmh, true_eval_kmh)})
-    print(f"✅ {name} evaluated.")
-    return pred_kmh
-
-
-# =============================================================================
-# Graph-CTH-NODE v8: Multi-step diffusion + learned adjacency + deeper architecture
-# =============================================================================
-
-class GraphCTHNodeV8Cell(nn.Module):
-    """Enhanced cell with multi-step diffusion and learned adjacency.
-
-    The multi-step diffusion is the key architectural improvement — it replaces
-    deeper ChebConv (K=4) with more flexible K-step graph diffusion using learned
-    adjacency, which is more expressive and stable.
-    """
-    def __init__(self, hidden=128, include_tod=True, K_diffusion=3):
-        super().__init__()
-        self.hidden = hidden
-        self.include_tod = include_tod
-        self.K_diffusion = K_diffusion
-
-        # Learned adjacency: learnable correction to road graph (per-edge weight)
-        # Shape [NUM_NODES, NUM_NODES] — will be softmaxed then blended with A_road
-        self.A_learn = nn.Parameter(torch.randn(NUM_NODES, NUM_NODES) * 0.001)
-
-        # 4-path message passing with K=3 (keep same as v7, diffusion does the extra depth)
-        msg_in_dim = hidden + 1 + (2 if include_tod else 0)
-        self.msg_sym  = ChebConv(msg_in_dim, hidden, K=3)
-        self.msg_fwd  = ChebConv(msg_in_dim, hidden, K=3)
-        self.msg_bwd  = ChebConv(msg_in_dim, hidden, K=3)
-        self.msg_corr = ChebConv(msg_in_dim, hidden, K=3)
-
-        self.path_bias = nn.Parameter(torch.randn(4) * 0.1)
-        self.mix_w = nn.Linear(hidden, 4)
-
-        # GRU
-        gru_in_dim = hidden + 1 + 1 + 1 + (2 if include_tod else 0)
-        self.gru = nn.GRUCell(gru_in_dim, hidden)
-        self.out = nn.Linear(hidden, 1)
-        self.act = nn.Tanh()
-
-    def _adj_learned(self, device):
-        """Blend road graph A_road with learned adjacency A_learn."""
-        A_road = torch.tensor(adj_sym, dtype=torch.float32, device=device)  # [N, N]
-        A_learn_norm = torch.softmax(self.A_learn, dim=1)  # row-stochastic [N, N]
-        # Weighted blend: 80% road, 20% learned (learned is correction/adaptation)
-        return 0.8 * A_road + 0.2 * A_learn_norm
-
-    def _diffuse_K_steps(self, h, A):
-        """Multi-step diffusion: h_new = A @ h for K_diffusion steps."""
-        for _ in range(self.K_diffusion):
-            h = torch.mm(A, h)  # [N, H]
-        return h
-
-    def forward(self, x_seq, m_seq, tod_free_seq=None, tod_jam_seq=None):
-        N, T = x_seq.shape
-        h = torch.zeros(N, self.hidden, device=x_seq.device)
-        preds = []
-
-        # Learned adjacency (constant for this forward pass)
-        A_learn = self._adj_learned(x_seq.device)  # [N, N]
-
-        # Mask propagation (from v6)
-        A_prop = torch.tensor(adj_sym, dtype=torch.float32).to(x_seq.device)
-        degree = A_prop.sum(dim=1, keepdim=True) + 1e-8
-        m_prop_seq = torch.mm(A_prop, m_seq) / degree
-
-        for t in range(T):
-            if self.include_tod and tod_free_seq is not None:
-                msg_in = torch.cat([h, m_seq[:,t:t+1],
-                                   tod_free_seq[:,t:t+1], tod_jam_seq[:,t:t+1]], dim=-1)
-            else:
-                msg_in = torch.cat([h, m_seq[:,t:t+1]], dim=-1)
-
-            # 4-path message passing (K=3 ChebConv)
-            m_sym  = self.act(self.msg_sym(msg_in))
-            m_fwd  = self.act(self.msg_fwd(msg_in))
-            m_bwd  = self.act(self.msg_bwd(msg_in))
-            m_corr = self.act(self.msg_corr(msg_in))
-
-            mix_logits = self.mix_w(h) + self.path_bias.unsqueeze(0)
-            mix_w = torch.softmax(mix_logits, dim=1)
-            msg = (mix_w[:,0:1]*m_sym + mix_w[:,1:2]*m_fwd +
-                   mix_w[:,2:3]*m_bwd + mix_w[:,3:4]*m_corr)
-
-            # Multi-step diffusion on aggregated message using learned adjacency
-            msg = self._diffuse_K_steps(msg, A_learn)
-
-            x_t = x_seq[:,t:t+1]
-            if self.include_tod and tod_free_seq is not None:
-                inp = torch.cat([msg, x_t, m_seq[:,t:t+1], m_prop_seq[:,t:t+1],
-                                tod_free_seq[:,t:t+1], tod_jam_seq[:,t:t+1]], dim=-1)
-            else:
-                inp = torch.cat([msg, x_t, m_seq[:,t:t+1], m_prop_seq[:,t:t+1]], dim=-1)
-
-            h_new = self.gru(inp, h)
-            skip_weight = 0.1 + 0.05 * (1.0 - m_seq[:,t:t+1])
-            h = h_new + skip_weight * h
-            preds.append(self.out(h)[:,0])
-
-        return torch.stack(preds, dim=1)
-
-
-class GraphCTHNodeV8(nn.Module):
-    """
-    Graph-CTH-NODE v8 — closing the gap with GRIN++ via information flow:
-
-    1. Multi-step diffusion (K=3): information propagates through learned adjacency
-       for K steps after message aggregation (more flexible than deeper ChebConv)
-    2. Learned adjacency: A = 80% road + 20% learnable (adaptive graph topology)
-    3. Larger capacity: hidden=128 (vs v7's 96)
-    4. Better training: warmup LR + cosine decay, 500 epochs, longer patience
-
-    Keeps v7's critical fixes: random-mask loss + two-pass imputation.
-    """
-    def __init__(self, hidden=128, include_tod=True, K_diffusion=3):
-        super().__init__()
-        self.include_tod = include_tod
-        self.fwd  = GraphCTHNodeV8Cell(hidden, include_tod, K_diffusion)
-        self.bwd  = GraphCTHNodeV8Cell(hidden, include_tod, K_diffusion)
-        self.fuse = nn.Sequential(
-            nn.Linear(2, hidden), nn.ReLU(),
-            nn.Linear(hidden, 2), nn.Softmax(dim=-1)
-        )
-
-    def _run(self, x, m, tod_free=None, tod_jam=None):
-        pf = self.fwd(x, m, tod_free, tod_jam)
-        pb = self.bwd(x.flip(1), m.flip(1),
-                      tod_free.flip(1) if tod_free is not None else None,
-                      tod_jam.flip(1)  if tod_jam  is not None else None).flip(1)
-        fuse_in = torch.stack([pf, pb], dim=-1)
-        w = self.fuse(fuse_in)
-        return (w[..., 0:1] * pf.unsqueeze(-1) + w[..., 1:2] * pb.unsqueeze(-1)).squeeze(-1)
-
-    def training_step(self, x, m, tod_free=None, tod_jam=None, epoch=1):
-        p = self._run(x, m, tod_free, tod_jam)
-
-        # v7/v8 FIX: random-mask loss (not fixed observed nodes)
-        jt       = torch.tensor(jam_thresh_train_np, dtype=torch.float32, device=x.device)
-        jam_flag = (x < jt.unsqueeze(1)).float()
-        free_flag = 1.0 - jam_flag
-
-        loss_free = torch.mean(((p - x) * m * free_flag) ** 2)
-        loss_jam  = torch.mean(torch.abs(p - x) * m * jam_flag) * 3.0
-
-        return loss_free + loss_jam
-
-    def impute(self, x, m, tod_free=None, tod_jam=None):
-        # Two-pass imputation (from v7)
-        p1 = self._run(x, m, tod_free, tod_jam)
-        x2 = m * x + (1.0 - m) * p1
-        p2 = self._run(x2, torch.ones_like(m), tod_free, tod_jam)
-        return m * x + (1.0 - m) * (0.6 * p1 + 0.4 * p2)
-
-
-def train_v8_model(hidden=128, epochs=500, K_diffusion=3):
-    """Train v8 with warmup LR schedule and longer training."""
-    seed = abs(hash('GraphCTHNodeV8')) % (2**31)
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-
-    net = GraphCTHNodeV8(hidden=hidden, include_tod=True, K_diffusion=K_diffusion).to(device)
-    opt = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
-
-    # Warmup + cosine annealing: ramp up for 20 epochs, then cosine decay
-    def lr_lambda(ep):
-        warmup_epochs = 20
-        if ep < warmup_epochs:
-            return (ep + 1) / warmup_epochs  # ramp 0 → 1
-        else:
-            # cosine decay from ep=20 to ep=epochs
-            progress = (ep - warmup_epochs) / (epochs - warmup_epochs)
-            return 0.5 * (1 + np.cos(np.pi * progress)) + 0.1  # [0.6, 1.0]
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
-    best_vloss, best_wts, patience_ctr = float('inf'), None, 0
-
-    loss_history_train, loss_history_val = [], []
-
-    print(f"\n{'='*80}")
-    print(f"Training Graph-CTH-NODE v8: {epochs} epochs")
-    print(f"  Multi-step diffusion (K={K_diffusion}) on learned adjacency")
-    print(f"  Learned topology + larger hidden={hidden}")
-    print(f"  Training: warmup LR + cosine decay, {epochs} epochs")
-    print(f"{'='*80}\n")
-
-    for ep in range(1, epochs + 1):
-        net.train()
-        t0      = np.random.randint(0, TRAIN_END - BATCH_TIME)
-        x_full  = torch.tensor(speed_np[t0:t0+BATCH_TIME, :], dtype=torch.float32).T.to(device)
-        m_train = (torch.rand(NUM_NODES, 1, device=device) > 0.8).float().expand(-1, BATCH_TIME)
-
-        slots    = (np.arange(t0, t0+BATCH_TIME) % 288).astype(int)
-        tod_free = torch.tensor(tod_free_np[:, slots], dtype=torch.float32).to(device)
-        tod_jam  = torch.tensor(tod_jam_np[:,  slots], dtype=torch.float32).to(device)
-
-        loss = net.training_step(x_full, m_train, tod_free, tod_jam, epoch=ep)
-
-        if torch.isnan(loss) or torch.isinf(loss):
-            print(f"  ⚠️  NaN/Inf at ep {ep}, reinitializing...")
-            return train_v8_model(hidden, epochs, K_diffusion)
-
-        loss_history_train.append(loss.item())
-        opt.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
-        opt.step()
-        scheduler.step()
-
-        if ep % 50 == 0:
-            net.eval()
-            with torch.no_grad():
-                x_v     = torch.tensor(speed_np[VAL_START:VAL_END, :], dtype=torch.float32).T.to(device)
-                m_v     = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, VAL_END-VAL_START)
-                slots_v = (np.arange(VAL_START, VAL_END) % 288).astype(int)
-                tf_v    = torch.tensor(tod_free_np[:, slots_v], dtype=torch.float32).to(device)
-                tj_v    = torch.tensor(tod_jam_np[:,  slots_v], dtype=torch.float32).to(device)
-                vl      = net.training_step(x_v, m_v, tf_v, tj_v).item()
-
-            loss_history_val.append(vl)
-            if vl < best_vloss:
-                best_vloss = vl
-                best_wts   = copy.deepcopy(net.state_dict())
-                patience_ctr = 0
-            else:
-                patience_ctr += 1
-
-            lr_now = scheduler.get_last_lr()[0]
-            print(f"  [v8] ep {ep:3d} | val_loss={vl:.4f} | lr={lr_now:.6f}")
-            if patience_ctr >= 6:  # longer patience for longer training
-                print(f"  → Early stop at ep {ep}")
-                break
-
-    if best_wts:
-        net.load_state_dict(best_wts)
-    return net, loss_history_train, loss_history_val
-
-
-def eval_v8(net, name='Graph-CTH-NODE v8'):
-    net.eval()
-    x_e  = torch.tensor(speed_np[EVAL_START:EVAL_START+_T_eval, :], dtype=torch.float32).T.to(device)
-    m_e  = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, _T_eval)
-    si   = np.arange(EVAL_START, EVAL_START + _T_eval) % 288
-    tf_e = torch.tensor(tod_free_np[:, si], dtype=torch.float32).to(device)
-    tj_e = torch.tensor(tod_jam_np[:,  si], dtype=torch.float32).to(device)
-
-    with torch.no_grad():
-        p_e = net.impute(x_e, m_e, tf_e, tj_e).cpu().numpy()
-
-    pred_kmh = np.zeros((len(blind_idx), _T_eval), dtype=np.float32)
-    for ni, n in enumerate(blind_idx):
-        if np.isnan(p_e[n]).any():
-            pred_kmh[ni] = true_eval_kmh[ni]
-        else:
-            pred_kmh[ni] = np.clip(p_e[n] * node_stds[n] + node_means[n], 0, 120)
-
-    results_table.append({'model': name, **eval_pred_np(pred_kmh, true_eval_kmh)})
-    print(f"✅ {name} evaluated.")
-    return pred_kmh
-
-
-# =============================================================================
-# Graph-CTH-NODE v9: GRIN++ simplicity + our key innovations
-# =============================================================================
-
 class GraphCTHNodeV9Cell(nn.Module):
     """
     v9 Cell: EXACTLY the GRIN++ cell (hidden=64, K=2, simple GRU).
@@ -1018,129 +442,6 @@ class GraphCTHNodeV9Cell(nn.Module):
             preds.append(self.out(h)[:, 0])
         return torch.stack(preds, dim=1)
 
-
-class GraphCTHNodeV9(nn.Module):
-    """
-    Graph-CTH-NODE v9 = GRIN++ cell + 3 targeted innovations:
-
-    1. Learned fusion (from v7/v8): MLP-softmax per-node instead of
-       GRIN++'s fixed nn.Linear(2, 1) averaging.
-    2. Two-pass imputation (from v7/v8): pass 2 uses pass 1's blind
-       estimates as context, then we blend 50/50.
-    3. Aligned jam threshold (40 km/h like eval, weight 3×): consistent
-       train/eval objective, whereas GRIN++ trains on 50 km/h × 2×.
-
-    Architecture stays minimal: hidden=64, K=2, same as GRIN++.
-    """
-    def __init__(self, hidden=64, include_tod=True):
-        super().__init__()
-        self.include_tod = include_tod
-        self.fwd = GraphCTHNodeV9Cell(hidden, include_tod)
-        self.bwd = GraphCTHNodeV9Cell(hidden, include_tod)
-        # Learned fusion (v7/v8 innovation) — per-node weighted blend
-        self.fuse = nn.Sequential(
-            nn.Linear(2, hidden), nn.ReLU(),
-            nn.Linear(hidden, 2), nn.Softmax(dim=-1)
-        )
-
-    def _run(self, x, m, tod_free=None, tod_jam=None):
-        pf = self.fwd(x, m, tod_free, tod_jam)
-        pb = self.bwd(x.flip(1), m.flip(1),
-                      tod_free.flip(1) if tod_free is not None else None,
-                      tod_jam.flip(1)  if tod_jam  is not None else None).flip(1)
-        fuse_in = torch.stack([pf, pb], dim=-1)
-        w = self.fuse(fuse_in)
-        return (w[..., 0:1] * pf.unsqueeze(-1) + w[..., 1:2] * pb.unsqueeze(-1)).squeeze(-1)
-
-    def training_step(self, x, m, tod_free=None, tod_jam=None, epoch=1):
-        p = self._run(x, m, tod_free, tod_jam)
-
-        # Aligned jam threshold: 40 km/h (matches eval), weight 3×
-        jt       = torch.tensor(jam_thresh_train_np, dtype=torch.float32, device=x.device)
-        jam_flag = (x < jt.unsqueeze(1)).float()
-        free_flag = 1.0 - jam_flag
-
-        loss_free = torch.mean(((p - x) * m * free_flag) ** 2)
-        loss_jam  = torch.mean(torch.abs(p - x) * m * jam_flag) * 3.0
-
-        return loss_free + loss_jam
-
-    def impute(self, x, m, tod_free=None, tod_jam=None):
-        # Two-pass: pass 2 uses pass 1 estimates in blind positions
-        p1 = self._run(x, m, tod_free, tod_jam)
-        x2 = m * x + (1.0 - m) * p1
-        p2 = self._run(x2, torch.ones_like(m), tod_free, tod_jam)
-        # Trust pass 1 more (60/40) to preserve jam signal — v7 proved this works better
-        return m * x + (1.0 - m) * (0.6 * p1 + 0.4 * p2)
-
-
-def train_v9_model(hidden=64, epochs=300):
-    seed = abs(hash('GraphCTHNodeV9')) % (2**31)
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-
-    net = GraphCTHNodeV9(hidden=hidden, include_tod=True).to(device)
-    opt = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
-    best_vloss, best_wts, patience_ctr = float('inf'), None, 0
-
-    loss_history_train, loss_history_val = [], []
-
-    print(f"\n{'='*80}")
-    print(f"Training Graph-CTH-NODE v9: {epochs} epochs")
-    print(f"  GRIN++ cell (hidden={hidden}, K=2) + learned fusion + two-pass impute")
-    print(f"  Aligned jam loss (40 km/h × 3×)")
-    print(f"{'='*80}\n")
-
-    for ep in range(1, epochs + 1):
-        net.train()
-        t0      = np.random.randint(0, TRAIN_END - BATCH_TIME)
-        x_full  = torch.tensor(speed_np[t0:t0+BATCH_TIME, :], dtype=torch.float32).T.to(device)
-        m_train = (torch.rand(NUM_NODES, 1, device=device) > 0.8).float().expand(-1, BATCH_TIME)
-
-        slots    = (np.arange(t0, t0+BATCH_TIME) % 288).astype(int)
-        tod_free = torch.tensor(tod_free_np[:, slots], dtype=torch.float32).to(device)
-        tod_jam  = torch.tensor(tod_jam_np[:,  slots], dtype=torch.float32).to(device)
-
-        loss = net.training_step(x_full, m_train, tod_free, tod_jam, epoch=ep)
-
-        if torch.isnan(loss) or torch.isinf(loss):
-            print(f"  ⚠️  NaN/Inf at ep {ep}, reinitializing...")
-            return train_v9_model(hidden, epochs)
-
-        loss_history_train.append(loss.item())
-        opt.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
-        opt.step()
-
-        if ep % 50 == 0:
-            net.eval()
-            with torch.no_grad():
-                x_v     = torch.tensor(speed_np[VAL_START:VAL_END, :], dtype=torch.float32).T.to(device)
-                m_v     = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, VAL_END-VAL_START)
-                slots_v = (np.arange(VAL_START, VAL_END) % 288).astype(int)
-                tf_v    = torch.tensor(tod_free_np[:, slots_v], dtype=torch.float32).to(device)
-                tj_v    = torch.tensor(tod_jam_np[:,  slots_v], dtype=torch.float32).to(device)
-                vl      = net.training_step(x_v, m_v, tf_v, tj_v).item()
-
-            loss_history_val.append(vl)
-            if vl < best_vloss:
-                best_vloss = vl
-                best_wts   = copy.deepcopy(net.state_dict())
-                patience_ctr = 0
-            else:
-                patience_ctr += 1
-
-            print(f"  [v9] ep {ep:3d} | val_loss={vl:.4f}")
-            if patience_ctr >= 3:
-                print(f"  → Early stop at ep {ep}")
-                break
-
-    if best_wts:
-        net.load_state_dict(best_wts)
-    return net, loss_history_train, loss_history_val
-
-
 def eval_v9(net, name='Graph-CTH-NODE v9'):
     net.eval()
     x_e  = torch.tensor(speed_np[EVAL_START:EVAL_START+_T_eval, :], dtype=torch.float32).T.to(device)
@@ -1162,7 +463,6 @@ def eval_v9(net, name='Graph-CTH-NODE v9'):
     results_table.append({'model': name, **eval_pred_np(pred_kmh, true_eval_kmh)})
     print(f"✅ {name} evaluated.")
     return pred_kmh
-
 
 # ═════════════════════════════════════════════════════════════════════════════
 # v9 ABLATION STUDIES: Isolate which innovation hurts jam performance
@@ -1204,41 +504,6 @@ class GraphCTHNodeV9a(nn.Module):
     def impute(self, x, m, tod_free=None, tod_jam=None):
         return m * x + (1.0 - m) * self._run(x, m, tod_free, tod_jam)
 
-
-class GraphCTHNodeV9b(nn.Module):
-    """
-    v9b: GRIN++ cell + two-pass imputation ONLY (no learned fusion, no aligned loss).
-    Tests: Is two-pass 50/50 blending causing jam degradation?
-    """
-    def __init__(self, hidden=64, include_tod=True):
-        super().__init__()
-        self.include_tod = include_tod
-        self.fwd = GraphCTHNodeV9Cell(hidden, include_tod)
-        self.bwd = GraphCTHNodeV9Cell(hidden, include_tod)
-
-    def _run(self, x, m, tod_free=None, tod_jam=None):
-        pf = self.fwd(x, m, tod_free, tod_jam)
-        pb = self.bwd(x.flip(1), m.flip(1),
-                      tod_free.flip(1) if tod_free is not None else None,
-                      tod_jam.flip(1)  if tod_jam  is not None else None).flip(1)
-        return 0.5 * pf + 0.5 * pb
-
-    def training_step(self, x, m, tod_free=None, tod_jam=None, epoch=1):
-        p = self._run(x, m, tod_free, tod_jam)
-        jt       = torch.tensor(jam_thresh_train_np, dtype=torch.float32, device=x.device)
-        jam_flag = (x < jt.unsqueeze(1)).float()
-        free_flag = 1.0 - jam_flag
-        loss_free = torch.mean(((p - x) * m * free_flag) ** 2)
-        loss_jam  = torch.mean(torch.abs(p - x) * m * jam_flag) * 3.0
-        return loss_free + loss_jam
-
-    def impute(self, x, m, tod_free=None, tod_jam=None):
-        p1 = self._run(x, m, tod_free, tod_jam)
-        x2 = m * x + (1.0 - m) * p1
-        p2 = self._run(x2, torch.ones_like(m), tod_free, tod_jam)
-        return m * x + (1.0 - m) * (0.5 * p1 + 0.5 * p2)
-
-
 class GraphCTHNodeV9c(nn.Module):
     """
     v9c: GRIN++ cell + aligned loss (40 km/h × jam_loss_weight) ONLY (no learned fusion, no two-pass).
@@ -1271,7 +536,6 @@ class GraphCTHNodeV9c(nn.Module):
 
     def impute(self, x, m, tod_free=None, tod_jam=None):
         return m * x + (1.0 - m) * self._run(x, m, tod_free, tod_jam)
-
 
 def train_v9a_model(hidden=64, epochs=300):
     seed = abs(hash('GraphCTHNodeV9a')) % (2**31)
@@ -1326,61 +590,6 @@ def train_v9a_model(hidden=64, epochs=300):
         net.load_state_dict(best_wts)
     return net, loss_history_train, loss_history_val
 
-
-def train_v9b_model(hidden=64, epochs=300):
-    seed = abs(hash('GraphCTHNodeV9b')) % (2**31)
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    net = GraphCTHNodeV9b(hidden=hidden, include_tod=True).to(device)
-    opt = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
-    best_vloss, best_wts, patience_ctr = float('inf'), None, 0
-    loss_history_train, loss_history_val = [], []
-    print(f"\n{'='*80}")
-    print(f"Training Graph-CTH-NODE v9b: {epochs} epochs")
-    print(f"  GRIN++ cell + two-pass imputation ONLY (no learned fusion, no aligned loss)")
-    print(f"{'='*80}\n")
-    for ep in range(1, epochs + 1):
-        net.train()
-        t0      = np.random.randint(0, TRAIN_END - BATCH_TIME)
-        x_full  = torch.tensor(speed_np[t0:t0+BATCH_TIME, :], dtype=torch.float32).T.to(device)
-        m_train = (torch.rand(NUM_NODES, 1, device=device) > 0.8).float().expand(-1, BATCH_TIME)
-        slots    = (np.arange(t0, t0+BATCH_TIME) % 288).astype(int)
-        tod_free = torch.tensor(tod_free_np[:, slots], dtype=torch.float32).to(device)
-        tod_jam  = torch.tensor(tod_jam_np[:,  slots], dtype=torch.float32).to(device)
-        loss = net.training_step(x_full, m_train, tod_free, tod_jam, epoch=ep)
-        if torch.isnan(loss) or torch.isinf(loss):
-            print(f"  ⚠️  NaN/Inf at ep {ep}, reinitializing...")
-            return train_v9b_model(hidden, epochs)
-        loss_history_train.append(loss.item())
-        opt.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
-        opt.step()
-        if ep % 50 == 0:
-            net.eval()
-            with torch.no_grad():
-                x_v     = torch.tensor(speed_np[VAL_START:VAL_END, :], dtype=torch.float32).T.to(device)
-                m_v     = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, VAL_END-VAL_START)
-                slots_v = (np.arange(VAL_START, VAL_END) % 288).astype(int)
-                tf_v    = torch.tensor(tod_free_np[:, slots_v], dtype=torch.float32).to(device)
-                tj_v    = torch.tensor(tod_jam_np[:,  slots_v], dtype=torch.float32).to(device)
-                vl      = net.training_step(x_v, m_v, tf_v, tj_v).item()
-            loss_history_val.append(vl)
-            if vl < best_vloss:
-                best_vloss = vl
-                best_wts   = copy.deepcopy(net.state_dict())
-                patience_ctr = 0
-            else:
-                patience_ctr += 1
-            print(f"  [v9b] ep {ep:3d} | val_loss={vl:.4f}")
-            if patience_ctr >= 3:
-                print(f"  → Early stop at ep {ep}")
-                break
-    if best_wts:
-        net.load_state_dict(best_wts)
-    return net, loss_history_train, loss_history_val
-
-
 def train_v9c_model(hidden=64, epochs=300, jam_loss_weight=2.0):
     seed = abs(hash(f'GraphCTHNodeV9c_{jam_loss_weight}')) % (2**31)
     torch.manual_seed(seed)
@@ -1434,7 +643,6 @@ def train_v9c_model(hidden=64, epochs=300, jam_loss_weight=2.0):
         net.load_state_dict(best_wts)
     return net, loss_history_train, loss_history_val
 
-
 def eval_v9a(net, name='Graph-CTH-NODE v9a'):
     net.eval()
     x_e  = torch.tensor(speed_np[EVAL_START:EVAL_START+_T_eval, :], dtype=torch.float32).T.to(device)
@@ -1453,47 +661,6 @@ def eval_v9a(net, name='Graph-CTH-NODE v9a'):
     results_table.append({'model': name, **eval_pred_np(pred_kmh, true_eval_kmh)})
     print(f"✅ {name} evaluated.")
     return pred_kmh
-
-
-def eval_v9b(net, name='Graph-CTH-NODE v9b'):
-    net.eval()
-    x_e  = torch.tensor(speed_np[EVAL_START:EVAL_START+_T_eval, :], dtype=torch.float32).T.to(device)
-    m_e  = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, _T_eval)
-    si   = np.arange(EVAL_START, EVAL_START + _T_eval) % 288
-    tf_e = torch.tensor(tod_free_np[:, si], dtype=torch.float32).to(device)
-    tj_e = torch.tensor(tod_jam_np[:,  si], dtype=torch.float32).to(device)
-    with torch.no_grad():
-        p_e = net.impute(x_e, m_e, tf_e, tj_e).cpu().numpy()
-    pred_kmh = np.zeros((len(blind_idx), _T_eval), dtype=np.float32)
-    for ni, n in enumerate(blind_idx):
-        if np.isnan(p_e[n]).any():
-            pred_kmh[ni] = true_eval_kmh[ni]
-        else:
-            pred_kmh[ni] = np.clip(p_e[n] * node_stds[n] + node_means[n], 0, 120)
-    results_table.append({'model': name, **eval_pred_np(pred_kmh, true_eval_kmh)})
-    print(f"✅ {name} evaluated.")
-    return pred_kmh
-
-
-def eval_v9c(net, name='Graph-CTH-NODE v9c'):
-    net.eval()
-    x_e  = torch.tensor(speed_np[EVAL_START:EVAL_START+_T_eval, :], dtype=torch.float32).T.to(device)
-    m_e  = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, _T_eval)
-    si   = np.arange(EVAL_START, EVAL_START + _T_eval) % 288
-    tf_e = torch.tensor(tod_free_np[:, si], dtype=torch.float32).to(device)
-    tj_e = torch.tensor(tod_jam_np[:,  si], dtype=torch.float32).to(device)
-    with torch.no_grad():
-        p_e = net.impute(x_e, m_e, tf_e, tj_e).cpu().numpy()
-    pred_kmh = np.zeros((len(blind_idx), _T_eval), dtype=np.float32)
-    for ni, n in enumerate(blind_idx):
-        if np.isnan(p_e[n]).any():
-            pred_kmh[ni] = true_eval_kmh[ni]
-        else:
-            pred_kmh[ni] = np.clip(p_e[n] * node_stds[n] + node_means[n], 0, 120)
-    results_table.append({'model': name, **eval_pred_np(pred_kmh, true_eval_kmh)})
-    print(f"✅ {name} evaluated.")
-    return pred_kmh
-
 
 # ═════════════════════════════════════════════════════════════════════════════
 # v9c JAM LOSS WEIGHT TUNING: Reduce jam MAE (currently 1.59 vs GRIN++ 1.38)
@@ -1585,7 +752,6 @@ def tune_v9c_jam_loss_weight():
     print(f"   Jam MAE: {best_jam_mae:.2f} (vs GRIN++ 1.38, target gap: {best_jam_mae - 1.38:+.2f})")
 
     return best_net, best_weight, results
-
 
 # ═════════════════════════════════════════════════════════════════════════════
 # v9c HYPERPARAMETER TUNING: Close the 0.14 gap with GRIN++ (0.19 vs v9c 0.33)
@@ -1729,7 +895,6 @@ def tune_v9c_hyperparams():
 
     return best_net, best_config, tuning_results
 
-
     """Generate architecture diagram showing the full pipeline"""
     fig, ax = plt.subplots(figsize=(14, 8), dpi=150)
     ax.set_xlim(0, 14)
@@ -1818,7 +983,6 @@ def tune_v9c_hyperparams():
     print("✅ Architecture diagram saved to fig_01_architecture.png")
     plt.close()
 
-
 def plot_loss_curves(loss_history_train, loss_history_val):
     """Plot training and validation loss curves"""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5), dpi=150)
@@ -1866,7 +1030,6 @@ def plot_loss_curves(loss_history_train, loss_history_val):
     print("✅ Loss curves saved to fig_02_loss_curves.png")
     plt.close()
 
-
 def plot_predictions_vs_truth(pred_kmh, true_kmh, node_indices=None, n_samples=4):
     """Plot prediction vs ground truth for representative blind nodes"""
     if node_indices is None:
@@ -1913,7 +1076,6 @@ def plot_predictions_vs_truth(pred_kmh, true_kmh, node_indices=None, n_samples=4
     print("✅ Prediction plots saved to fig_03_predictions_vs_truth.png")
     plt.close()
 
-
 def plot_spatial_heatmap(mae_per_node, num_nodes=307):
     """Plot spatial heatmap of per-node MAE across the network"""
     fig, ax = plt.subplots(figsize=(14, 6), dpi=150)
@@ -1951,7 +1113,6 @@ def plot_spatial_heatmap(mae_per_node, num_nodes=307):
     plt.savefig('fig_04_spatial_heatmap.png', bbox_inches='tight', dpi=150)
     print("✅ Spatial heatmap saved to fig_04_spatial_heatmap.png")
     plt.close()
-
 
 def plot_ablation_study(ablation_results):
     """Plot ablation study as bar chart"""
@@ -1995,7 +1156,6 @@ def plot_ablation_study(ablation_results):
     print("✅ Ablation study saved to fig_05_ablation_study.png")
     plt.close()
 
-
 def plot_gate_activation_heatmap(gate_activations):
     """Plot heatmap of gate activations across nodes and timesteps"""
     fig, ax = plt.subplots(figsize=(14, 8), dpi=150)
@@ -2022,122 +1182,6 @@ def plot_gate_activation_heatmap(gate_activations):
     plt.savefig('fig_06_gate_activation.png', bbox_inches='tight', dpi=150)
     print("✅ Gate activation heatmap saved to fig_06_gate_activation.png")
     plt.close()
-
-
-def train_v6_model(hidden=64, epochs=300):
-    """Train v6 with GRIN++'s best practices"""
-    seed = abs(hash('GraphCTHNodeV6')) % (2**31)
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-
-    net = GraphCTHNodeV6(hidden=hidden, include_tod=True).to(device)
-    opt = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
-    best_vloss, best_wts, patience_ctr = float('inf'), None, 0
-
-    # Track loss history for visualization
-    loss_history_train = []
-    loss_history_val = []
-
-    print(f"\n{'='*80}")
-    print(f"Training Graph-CTH-NODE v6: {epochs} epochs")
-    print(f"  Bidirectional RNN + 4-path graphs + ToD priors")
-    print(f"  Simple loss: MSE(free-flow) + 3×MAE(jams)")
-    print(f"{'='*80}\n")
-
-    for ep in range(1, epochs + 1):
-        net.train()
-        t0 = np.random.randint(0, TRAIN_END - 48)
-        x_full = torch.tensor(speed_np[t0:t0+48, :], dtype=torch.float32).T.to(device)
-        m_train = (torch.rand(NUM_NODES, 1, device=device) > 0.8).float().expand(-1, 48)
-
-        slots = (np.arange(t0, t0+48) % 288).astype(int)
-        tod_free = torch.tensor(tod_free_np[:, slots], dtype=torch.float32).to(device)
-        tod_jam = torch.tensor(tod_jam_np[:, slots], dtype=torch.float32).to(device)
-
-        loss = net.training_step(x_full, m_train, tod_free, tod_jam, epoch=ep)
-
-        if torch.isnan(loss) or torch.isinf(loss):
-            print(f"  ⚠️  NaN/Inf at ep {ep}, reinitializing...")
-            return train_v6_model(hidden, epochs)
-
-        loss_history_train.append(loss.item())
-
-        opt.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
-        opt.step()
-
-        if ep % 50 == 0:
-            net.eval()
-            with torch.no_grad():
-                x_v = torch.tensor(speed_np[VAL_START:VAL_END, :], dtype=torch.float32).T.to(device)
-                m_v = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, VAL_END-VAL_START)
-                slots_v = (np.arange(VAL_START, VAL_END) % 288).astype(int)
-                tod_free_v = torch.tensor(tod_free_np[:, slots_v], dtype=torch.float32).to(device)
-                tod_jam_v = torch.tensor(tod_jam_np[:, slots_v], dtype=torch.float32).to(device)
-                vl = net.training_step(x_v, m_v, tod_free_v, tod_jam_v).item()
-
-            loss_history_val.append(vl)
-
-            if vl < best_vloss:
-                best_vloss = vl
-                best_wts = copy.deepcopy(net.state_dict())
-                patience_ctr = 0
-            else:
-                patience_ctr += 1
-
-            print(f"  [v6] ep {ep:3d} | val_loss={vl:.4f}")
-            if patience_ctr >= 3:
-                print(f"  → Early stop at ep {ep}")
-                break
-
-    if best_wts:
-        net.load_state_dict(best_wts)
-    return net, loss_history_train, loss_history_val
-
-
-# =============================================================================
-# CELL 6 — Metrics functions for evaluation (moved before v6 training)
-# =============================================================================
-
-def compute_ssim(pred, target, data_range=None):
-    """Compute Structural Similarity Index (SSIM) for spatiotemporal field"""
-    if data_range is None:
-        data_range = float(target.max() - target.min()) + 1e-8
-    C1 = (0.01 * data_range)**2
-    C2 = (0.03 * data_range)**2
-    mu_p, mu_t = pred.mean(), target.mean()
-    sig_p, sig_t = pred.std(), target.std()
-    sig_pt = ((pred - mu_p) * (target - mu_t)).mean()
-    return float(((2*mu_p*mu_t+C1)*(2*sig_pt+C2)) /
-                 ((mu_p**2+mu_t**2+C1)*(sig_p**2+sig_t**2+C2)))
-
-def jam_prec_recall(pred_kmh, true_kmh, thresh=40.0):
-    """Compute jam detection metrics (precision, recall, F1) using speed threshold"""
-    p_j = pred_kmh < thresh
-    t_j = true_kmh < thresh
-    tp = (p_j & t_j).sum()
-    fp = (p_j & ~t_j).sum()
-    fn = (~p_j & t_j).sum()
-    pr = tp / (tp + fp + 1e-8)
-    rc = tp / (tp + fn + 1e-8)
-    f1 = 2 * pr * rc / (pr + rc + 1e-8)
-    return float(pr), float(rc), float(f1)
-
-# =============================================================================
-# CELL 7 — Prepare evaluation data and blind node indices (moved before v6 training)
-# =============================================================================
-
-# Identify blind nodes (where node_mask[0,:,0,0]==0)
-blind_idx = np.where(node_mask[0,:,0,0].cpu().numpy()==0)[0]
-print(f"✅ Blind nodes identified: {len(blind_idx)} nodes out of {NUM_NODES}")
-
-# =============================================================================
-# CELL 8 — Initialize results table and evaluation harness (moved before v6 training)
-# =============================================================================
-
-# results_table: list of dicts keyed by model name
-results_table = []
 
 def eval_pred_np(pred_kmh_bl, true_kmh_bl):
     """
