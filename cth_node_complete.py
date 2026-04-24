@@ -2465,6 +2465,7 @@ def train_rnn_baseline(model_cls, name, hidden=64, epochs=BL_EPOCHS):
 
 def eval_rnn_baseline(net, name):
     net.eval()
+    obs_nodes = (node_mask[0, :, 0, 0] == 1).cpu().numpy().nonzero()[0]
     x_e = torch.tensor(speed_np[EVAL_START:EVAL_START+_T_eval, :],
                         dtype=torch.float32).T.to(device)  # [N, T]
     m_e = torch.zeros_like(x_e)
