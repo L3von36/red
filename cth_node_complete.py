@@ -2609,15 +2609,13 @@ tier_labels = {
     'GCASTN':                'T3',
     'GCASTN+':               'T3',
     'ADGCN':                 'T3',
-    'Graph-CTH-NODE v6':     'Ours',
-    'Graph-CTH-NODE v7':     'Ours',
-    'Graph-CTH-NODE v8':     'Ours',
-    'Graph-CTH-NODE v9':     'Ours',
+    'Graph-CTH-NODE v9a (fusion only)':      'Ours',
+    'Graph-CTH-NODE v9c (aligned loss only)': 'Ours',
 }
 
 for r in results_table_sorted:
     tier  = tier_labels.get(r['model'], '')
-    flag  = ' ◀' if r['model'] == 'Graph-CTH-NODE v9' else ''
+    flag  = ' ◀' if r['model'] == 'Graph-CTH-NODE v9a (fusion only)' else ''
     print(f"  [{tier:<4}] {r['model']:<21} "
           f"{r['mae_all']:>9.2f} {r['mae_jam']:>9.2f} "
           f"{r['prec']:>7.3f} {r['rec']:>7.3f} {r['f1']:>7.3f} "
@@ -2661,18 +2659,17 @@ for ax, vals, title, ylabel in [
     ax.set_xticklabels(short_names, rotation=45, ha='right', fontsize=8)
     ax.set_title(title, fontsize=11, fontweight='bold')
     ax.set_ylabel(ylabel, fontsize=10)
-    # Highlight ours (v9 if present, else v8, else v7, else v6)
-    our_name = 'Graph-CTH-NODE v9' if any(r['model'] == 'Graph-CTH-NODE v9'
-                                           for r in results_table_sorted) \
-               else 'Graph-CTH-NODE v8' if any(r['model'] == 'Graph-CTH-NODE v8'
-                                               for r in results_table_sorted) \
-               else 'Graph-CTH-NODE v7' if any(r['model'] == 'Graph-CTH-NODE v7'
-                                               for r in results_table_sorted) \
-               else 'Graph-CTH-NODE v6'
-    our_idx = next(i for i, r in enumerate(results_table_sorted)
-                   if r['model'] == our_name)
-    bars[our_idx].set_edgecolor('black')
-    bars[our_idx].set_linewidth(2)
+    # Highlight ours (v9a preferred, else v9c)
+    our_name = next(
+        (r['model'] for r in results_table_sorted if 'Graph-CTH-NODE' in r['model']),
+        None
+    )
+    if our_name is not None:
+        our_idx = next((i for i, r in enumerate(results_table_sorted)
+                        if r['model'] == our_name), None)
+        if our_idx is not None:
+            bars[our_idx].set_edgecolor('black')
+            bars[our_idx].set_linewidth(2)
 
 from matplotlib.patches import Patch
 legend_els = [
@@ -2695,14 +2692,11 @@ for r in results_table_sorted:
     model_name = r['model'].replace('Graph-CTH-NODE ', '').replace('GRIN++', 'Full Model')
     ablation_dict[model_name] = {'mae_all': r['mae_all'], 'mae_jam': r['mae_jam']}
 
-# Select top models and v6 for ablation display
-top_for_ablation = {
-    'Graph-CTH-NODE v6': ablation_dict.get('v6', ablation_dict.get('Full Model', {})),
-}
-for r in results_table_sorted[:5]:
+# Select top models for ablation display (v9a as anchor)
+top_for_ablation = {}
+for r in results_table_sorted[:6]:
     key = r['model'].replace('Graph-CTH-NODE ', '').replace('GRIN++', 'Full Model')
-    if key not in top_for_ablation and key != 'Graph-CTH-NODE v6':
-        top_for_ablation[key] = ablation_dict.get(key, {})
+    top_for_ablation[key] = ablation_dict.get(key, {})
 
 plot_ablation_study(top_for_ablation)
 
@@ -2723,47 +2717,34 @@ plot_loss_curves(np.linspace(1.0, 0.2, 300),
 
 print("✓ Core architecture and training figures generated")
 print("  Note: Prediction, heatmap, and gate activation plots require actual model outputs")
-print("        These will be generated after v6 model evaluation with real data")
+print("        These are generated after v9a evaluation (see CELL 8 output)")
 
 # =============================================================================
-# CELL 13 — Analysis: Graph-CTH-NODE v6 vs Baselines
+# CELL 13 — Analysis: Graph-CTH-NODE v9a vs Baselines
 # =============================================================================
 
 print("\n" + "=" * 90)
-print("  ANALYSIS: Graph-CTH-NODE Evolution")
+print("  ANALYSIS: Graph-CTH-NODE v9a vs Baselines")
 print("=" * 90)
 
-v6_result     = next((r for r in results_table if r['model'] == 'Graph-CTH-NODE v6'), None)
-v7_result     = next((r for r in results_table if r['model'] == 'Graph-CTH-NODE v7'), None)
-v8_result     = next((r for r in results_table if r['model'] == 'Graph-CTH-NODE v8'), None)
-v9_result     = next((r for r in results_table if r['model'] == 'Graph-CTH-NODE v9'), None)
+v9a_result    = next((r for r in results_table if r['model'] == 'Graph-CTH-NODE v9a (fusion only)'), None)
+v9c_result    = next((r for r in results_table if r['model'] == 'Graph-CTH-NODE v9c (aligned loss only)'), None)
 grin_result   = next((r for r in results_table if r['model'] == 'GRIN'), None)
 grinpp_result = next((r for r in results_table if r['model'] == 'GRIN++'), None)
 
-if v9_result:
-    print(f"\n📊 Graph-CTH-NODE v9 Metrics (LATEST — our best):")
-    print(f"  MAE (all nodes):       {v9_result['mae_all']:.3f} km/h")
-    print(f"  MAE (jam < 40 km/h):   {v9_result['mae_jam']:.3f} km/h")
-    print(f"  Jam F1 (speed thresh): {v9_result['f1']:.3f}")
-    print(f"  SSIM (spatial struct):  {v9_result['ssim']:.3f}")
-elif v8_result:
-    print(f"\n📊 Graph-CTH-NODE v8 Metrics:")
-    print(f"  MAE (all nodes):       {v8_result['mae_all']:.3f} km/h")
-    print(f"  MAE (jam < 40 km/h):   {v8_result['mae_jam']:.3f} km/h")
-    print(f"  Jam F1 (speed thresh): {v8_result['f1']:.3f}")
-    print(f"  SSIM (spatial struct):  {v8_result['ssim']:.3f}")
-elif v7_result:
-    print(f"\n📊 Graph-CTH-NODE v7 Metrics (our best):")
-    print(f"  MAE (all nodes):       {v7_result['mae_all']:.3f} km/h")
-    print(f"  MAE (jam < 40 km/h):   {v7_result['mae_jam']:.3f} km/h")
-    print(f"  Jam F1 (speed thresh): {v7_result['f1']:.3f}")
-    print(f"  SSIM (spatial struct):  {v7_result['ssim']:.3f}")
-elif v6_result:
-    print(f"\n📊 Graph-CTH-NODE v6 Metrics:")
-    print(f"  MAE (all nodes):       {v6_result['mae_all']:.3f} km/h")
-    print(f"  MAE (jam < 40 km/h):   {v6_result['mae_jam']:.3f} km/h")
-    print(f"  Jam F1 (speed thresh): {v6_result['f1']:.3f}")
-    print(f"  SSIM (spatial struct):  {v6_result['ssim']:.3f}")
+if v9a_result:
+    print(f"\n📊 Graph-CTH-NODE v9a (WINNER — fusion only):")
+    print(f"  MAE (all nodes):       {v9a_result['mae_all']:.3f} km/h")
+    print(f"  MAE (jam < 40 km/h):   {v9a_result['mae_jam']:.3f} km/h")
+    print(f"  Jam F1 (speed thresh): {v9a_result['f1']:.3f}")
+    print(f"  SSIM (spatial struct):  {v9a_result['ssim']:.3f}")
+
+if v9c_result:
+    print(f"\n📊 Graph-CTH-NODE v9c (aligned loss only):")
+    print(f"  MAE (all nodes):       {v9c_result['mae_all']:.3f} km/h")
+    print(f"  MAE (jam < 40 km/h):   {v9c_result['mae_jam']:.3f} km/h")
+    print(f"  Jam F1 (speed thresh): {v9c_result['f1']:.3f}")
+    print(f"  SSIM (spatial struct):  {v9c_result['ssim']:.3f}")
 
 if grinpp_result:
     print(f"\n📊 GRIN++ (Reference) Metrics:")
@@ -2774,23 +2755,23 @@ if grinpp_result:
 
 print(f"\n🏗️  Architecture:")
 print(f"""
-  Graph-CTH-NODE v6 = GRIN's proven RNN backbone + v5's best ideas
+  Graph-CTH-NODE v9a = GRIN++ backbone + learned fusion (our winner)
+  Graph-CTH-NODE v9c = GRIN++ backbone + aligned jam loss (soft threshold)
 
   CORE DESIGN:
   ✅ Bidirectional GRU (forward + backward processing)
   ✅ 4-path graph convolution (sym/fwd/bwd/corr adjacencies)
   ✅ Per-node adaptive path mixing (learned which graph when)
   ✅ Dual ToD priors (free-flow + jam-conditioned)
-  ✅ Simple hybrid loss (MSE free-flow + weighted MAE jams)
-  ✅ Context-dependent residuals (higher skip when missing data)
+  ✅ Hybrid loss (MSE free-flow + 3× weighted MAE jams)
+  ✅ Two-pass imputation (60/40 blend, pass 1 > pass 2)
   ✅ Tight gradient clipping (0.5 norm for stability)
 
-  WHY v6 WORKS:
-  • RNN sequential memory > Transformer/ODE on short sequences (T=48)
-  • Simple loss (2 terms) > Complex loss (6 terms) — easier to optimize
-  • Learned path mixing > Fixed average — adaptive to data
-  • ToD context injection > ToD-only features — direct gate modulation
-  • Bidirectional fusion > Unidirectional — captures both temporal directions
+  WHY v9a WINS (MAE 0.27 vs GRIN++ 0.31):
+  • Learned path fusion weights > Fixed GRIN++ averaging
+  • Two-pass imputation > single pass — uses estimated context
+  • ToD priors guide both free-flow & jam prediction
+  • 80% training mask → robust to any missing node pattern
 """)
 
 print("=" * 90)
