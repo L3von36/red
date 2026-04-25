@@ -542,6 +542,10 @@ class GraphCTHNodeV9c(nn.Module):
     def impute(self, x, m, tod_free=None, tod_jam=None):
         return m * x + (1.0 - m) * self._run(x, m, tod_free, tod_jam)
 
+# =============================================================================
+# CELL 6 — Training & Evaluation Functions
+# =============================================================================
+
 def train_v9a_model(hidden=64, epochs=300, jam_loss_weight=3.0, use_soft_threshold=False):
     seed = abs(hash(f'GraphCTHNodeV9a_{jam_loss_weight}_{use_soft_threshold}')) % (2**31)
     torch.manual_seed(seed)
@@ -671,6 +675,10 @@ def eval_v9a(net, name='Graph-CTH-NODE v9a'):
     print(f"✅ {name} evaluated.")
     return pred_kmh
 
+
+# =============================================================================
+# CELL 6 (continued) — Hyperparameter Tuning Functions
+# =============================================================================
 
 # ═════════════════════════════════════════════════════════════════════════════
 # v9a JOINT OPTIMIZATION: Jam loss weight + Soft threshold sweep
@@ -1302,6 +1310,21 @@ def plot_gate_activation_heatmap(gate_activations):
     plt.savefig('fig_06_gate_activation.png', bbox_inches='tight', dpi=150)
     print("✅ Gate activation heatmap saved to fig_06_gate_activation.png")
     plt.close()
+
+# =============================================================================
+# CELL 7 — Blind Node Indices & Results Table
+# =============================================================================
+
+# Identify blind nodes (node_mask==0 means the node is hidden/blind)
+blind_idx = np.where(node_mask[0, :, 0, 0].cpu().numpy() == 0)[0]
+print(f"✅ Blind nodes: {len(blind_idx)} out of {NUM_NODES}")
+
+# results_table: collects {model, MAE all, MAE jam, Prec, Rec, F1, SSIM} per model
+results_table = []
+
+# =============================================================================
+# CELL 8 — Evaluation Harness
+# =============================================================================
 
 def eval_pred_np(pred_kmh_bl, true_kmh_bl):
     """
