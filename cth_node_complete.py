@@ -1447,7 +1447,7 @@ v9a_pred_kmh = eval_v9a(v9a_net, 'Graph-CTH-NODE v9a (fusion only)')
 # ─────────────────────────────────────────────────────────────────────────────
 # OPTION: Uncomment below to run v9a joint optimization tuning on Kaggle
 # Tests 16 configurations: 8 weights (1.5–3.25×) × 2 thresholds (40/50 km/h)
-# v9a_best_net, v9a_best_config, v9a_tuning_results = tune_v9a_jam_weight_and_threshold()
+v9a_best_net, v9a_best_config, v9a_tuning_results = tune_v9a_jam_weight_and_threshold()
 
 # Skip v9b (underperforms)
 # v9b_net, v9b_loss_train, v9b_loss_val = train_v9b_model(hidden=64, epochs=300)
@@ -2147,9 +2147,9 @@ def train_grinpp_baseline(model_cls, name, **kwargs):
         net.load_state_dict(best_wts)
     return net
 
-print("\nTraining GRIN++...")
-grinpp_net = train_grinpp_baseline(GRINPlusPlus, 'GRIN++', hidden=GNN_HIDDEN, include_tod=True)
-eval_grinpp_baseline(grinpp_net, 'GRIN++')
+# print("\nTraining GRIN++...")
+# grinpp_net = train_grinpp_baseline(GRINPlusPlus, 'GRIN++', hidden=GNN_HIDDEN, include_tod=True)
+# eval_grinpp_baseline(grinpp_net, 'GRIN++')
 
 # ─── SPIN ────────────────────────────────────────────────────────────────────
 class SPIN(nn.Module):
@@ -2374,7 +2374,7 @@ class GCASTN_Plus(nn.Module):
         p, _ = self._forward(x, m, tod_free, tod_jam)
         return m*x + (1-m)*p
 
-print("\nTraining GCASTN+...")
+# print("\nTraining GCASTN+...")
 
 def train_gcastn_plus():
     """Train GCASTN+ with 4-path graphs, ToD priors, and focal loss"""
@@ -2441,7 +2441,7 @@ def train_gcastn_plus():
         net.load_state_dict(best_wts)
     return net
 
-gcastn_plus_net = train_gcastn_plus()
+# gcastn_plus_net = train_gcastn_plus()
 
 def eval_gcastn_plus(net, name='GCASTN+'):
     """Evaluate GCASTN+ with per-node denormalization"""
@@ -2466,7 +2466,7 @@ def eval_gcastn_plus(net, name='GCASTN+'):
     results_table.append({'model': name, **eval_pred_np(pred_kmh, true_eval_kmh)})
     print(f"✅ {name} evaluated.")
 
-eval_gcastn_plus(gcastn_plus_net, 'GCASTN+')
+# eval_gcastn_plus(gcastn_plus_net, 'GCASTN+')
 
 # ─── GCASTN ──────────────────────────────────────────────────────────────────
 class GCASTN(nn.Module):
