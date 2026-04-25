@@ -1326,6 +1326,30 @@ results_table = []
 # CELL 8 — Evaluation Harness
 # =============================================================================
 
+def compute_ssim(pred, target, data_range=None):
+    """Compute Structural Similarity Index (SSIM) for spatiotemporal field"""
+    if data_range is None:
+        data_range = float(target.max() - target.min()) + 1e-8
+    C1 = (0.01 * data_range)**2
+    C2 = (0.03 * data_range)**2
+    mu_p, mu_t = pred.mean(), target.mean()
+    sig_p, sig_t = pred.std(), target.std()
+    sig_pt = ((pred - mu_p) * (target - mu_t)).mean()
+    return float(((2*mu_p*mu_t+C1)*(2*sig_pt+C2)) /
+                 ((mu_p**2+mu_t**2+C1)*(sig_p**2+sig_t**2+C2)))
+
+def jam_prec_recall(pred_kmh, true_kmh, thresh=40.0):
+    """Compute jam detection metrics (precision, recall, F1) using speed threshold"""
+    p_j = pred_kmh < thresh
+    t_j = true_kmh < thresh
+    tp = (p_j & t_j).sum()
+    fp = (p_j & ~t_j).sum()
+    fn = (~p_j & t_j).sum()
+    pr = tp / (tp + fp + 1e-8)
+    rc = tp / (tp + fn + 1e-8)
+    f1 = 2 * pr * rc / (pr + rc + 1e-8)
+    return float(pr), float(rc), float(f1)
+
 def eval_pred_np(pred_kmh_bl, true_kmh_bl):
     """
     pred_kmh_bl, true_kmh_bl: np arrays [n_blind, T_eval] in km/h
