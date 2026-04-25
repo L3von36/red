@@ -1481,15 +1481,15 @@ print("  GENERATING PUBLICATION-READY FIGURES WITH REAL MODEL OUTPUTS")
 print("=" * 90)
 
 # Compute per-node MAE for spatial heatmap
-mae_per_node_v6 = np.mean(np.abs(v6_pred_kmh - true_eval_kmh), axis=1)
+mae_per_node_v9a = np.mean(np.abs(v9a_pred_kmh - true_eval_kmh), axis=1)
 
 # Generate prediction plots
 print("\nGenerating prediction vs truth plots...")
-plot_predictions_vs_truth(v6_pred_kmh, true_eval_kmh)
+plot_predictions_vs_truth(v9a_pred_kmh, true_eval_kmh)
 
 # Generate spatial heatmap
 print("Generating spatial heatmap...")
-plot_spatial_heatmap(mae_per_node_v6, num_nodes=len(blind_idx))
+plot_spatial_heatmap(mae_per_node_v9a, num_nodes=len(blind_idx))
 
 # Simulate gate activations (if model supports it)
 print("Simulating gate activation patterns...")
