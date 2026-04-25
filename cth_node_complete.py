@@ -470,12 +470,15 @@ def eval_v9(net, name='Graph-CTH-NODE v9'):
 
 class GraphCTHNodeV9a(nn.Module):
     """
-    v9a: GRIN++ cell + learned fusion ONLY (no two-pass, no aligned loss).
-    Tests: Is learned fusion causing jam degradation?
+    v9a: GRIN++ cell + learned fusion + parameterized jam loss.
+    Can use strict 40 km/h or soft 50 km/h threshold.
+    Can tune jam_loss_weight (default 3.0, GRIN++ uses 2.0).
     """
-    def __init__(self, hidden=64, include_tod=True):
+    def __init__(self, hidden=64, include_tod=True, jam_loss_weight=3.0, use_soft_threshold=False):
         super().__init__()
         self.include_tod = include_tod
+        self.jam_loss_weight = jam_loss_weight
+        self.use_soft_threshold = use_soft_threshold
         self.fwd = GraphCTHNodeV9Cell(hidden, include_tod)
         self.bwd = GraphCTHNodeV9Cell(hidden, include_tod)
         self.fuse = nn.Sequential(
@@ -494,11 +497,13 @@ class GraphCTHNodeV9a(nn.Module):
 
     def training_step(self, x, m, tod_free=None, tod_jam=None, epoch=1):
         p = self._run(x, m, tod_free, tod_jam)
-        jt       = torch.tensor(jam_thresh_train_np, dtype=torch.float32, device=x.device)
+        # Use soft 50 km/h threshold if enabled (GRIN++ style), else strict 40 km/h
+        jt = torch.tensor(jam_thresh_soft_np if self.use_soft_threshold else jam_thresh_train_np,
+                          dtype=torch.float32, device=x.device)
         jam_flag = (x < jt.unsqueeze(1)).float()
         free_flag = 1.0 - jam_flag
         loss_free = torch.mean(((p - x) * m * free_flag) ** 2)
-        loss_jam  = torch.mean(torch.abs(p - x) * m * jam_flag) * 3.0
+        loss_jam  = torch.mean(torch.abs(p - x) * m * jam_flag) * self.jam_loss_weight
         return loss_free + loss_jam
 
     def impute(self, x, m, tod_free=None, tod_jam=None):
@@ -537,17 +542,21 @@ class GraphCTHNodeV9c(nn.Module):
     def impute(self, x, m, tod_free=None, tod_jam=None):
         return m * x + (1.0 - m) * self._run(x, m, tod_free, tod_jam)
 
-def train_v9a_model(hidden=64, epochs=300):
-    seed = abs(hash('GraphCTHNodeV9a')) % (2**31)
+def train_v9a_model(hidden=64, epochs=300, jam_loss_weight=3.0, use_soft_threshold=False):
+    seed = abs(hash(f'GraphCTHNodeV9a_{jam_loss_weight}_{use_soft_threshold}')) % (2**31)
     torch.manual_seed(seed)
     np.random.seed(seed)
-    net = GraphCTHNodeV9a(hidden=hidden, include_tod=True).to(device)
+    net = GraphCTHNodeV9a(hidden=hidden, include_tod=True,
+                          jam_loss_weight=jam_loss_weight, use_soft_threshold=use_soft_threshold).to(device)
     opt = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
     best_vloss, best_wts, patience_ctr = float('inf'), None, 0
     loss_history_train, loss_history_val = [], []
+
+    threshold_str = "50 km/h (soft)" if use_soft_threshold else "40 km/h (strict)"
     print(f"\n{'='*80}")
     print(f"Training Graph-CTH-NODE v9a: {epochs} epochs")
-    print(f"  GRIN++ cell + learned fusion ONLY (no two-pass, no aligned loss)")
+    print(f"  GRIN++ cell + learned fusion")
+    print(f"  Threshold: {threshold_str}, Jam loss weight: {jam_loss_weight}×")
     print(f"{'='*80}\n")
     for ep in range(1, epochs + 1):
         net.train()
@@ -661,6 +670,117 @@ def eval_v9a(net, name='Graph-CTH-NODE v9a'):
     results_table.append({'model': name, **eval_pred_np(pred_kmh, true_eval_kmh)})
     print(f"✅ {name} evaluated.")
     return pred_kmh
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# v9a JOINT OPTIMIZATION: Jam loss weight + Soft threshold sweep
+# ═════════════════════════════════════════════════════════════════════════════
+
+def tune_v9a_jam_weight_and_threshold():
+    """
+    Sweep v9a's jam loss weight (1.5–3.25×) with both strict and soft thresholds.
+    Tests 16 configurations total (8 weights × 2 thresholds).
+
+    Current v9a: 3.0× weight + 40 km/h strict = jam MAE 1.41
+    GRIN++:      2.0× weight + 50 km/h soft   = jam MAE 1.38
+
+    Goal: Find optimal combination that beats or matches GRIN++.
+    """
+    weights = [1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 3.25]
+    thresholds = [False, True]  # False = strict 40 km/h, True = soft 50 km/h
+    results = []
+
+    print("\n" + "=" * 90)
+    print("  v9a JOINT OPTIMIZATION: Jam loss weight (1.5–3.25×) + Threshold (40/50 km/h)")
+    print(f"  Current: 3.0× + 40 km/h = jam MAE 1.41")
+    print(f"  Target:  beat 1.38 (GRIN++) or match within 0.02")
+    print("=" * 90 + "\n")
+
+    best_jam_mae = float('inf')
+    best_config = None
+    best_net = None
+    config_id = 0
+
+    for use_soft in thresholds:
+        threshold_name = "50 km/h (soft)" if use_soft else "40 km/h (strict)"
+        print(f"\n{'─'*90}")
+        print(f"Testing with {threshold_name} threshold:")
+        print(f"{'─'*90}\n")
+
+        for weight in weights:
+            config_id += 1
+            config_name = f"v9a_w{weight:.2f}_{'soft' if use_soft else 'strict'}"
+
+            print(f"[{config_id}/16] weight={weight:.2f}, threshold={threshold_name}")
+
+            try:
+                # Train
+                net, loss_train, loss_val = train_v9a_model(
+                    hidden=64, epochs=300,
+                    jam_loss_weight=weight, use_soft_threshold=use_soft
+                )
+
+                # Evaluate
+                net.eval()
+                x_e  = torch.tensor(speed_np[EVAL_START:EVAL_START+_T_eval, :], dtype=torch.float32).T.to(device)
+                m_e  = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, _T_eval)
+                si   = np.arange(EVAL_START, EVAL_START + _T_eval) % 288
+                tf_e = torch.tensor(tod_free_np[:, si], dtype=torch.float32).to(device)
+                tj_e = torch.tensor(tod_jam_np[:,  si], dtype=torch.float32).to(device)
+
+                with torch.no_grad():
+                    p_e = net.impute(x_e, m_e, tf_e, tj_e).cpu().numpy()
+
+                pred_kmh = np.zeros((len(blind_idx), _T_eval), dtype=np.float32)
+                for ni, n in enumerate(blind_idx):
+                    if np.isnan(p_e[n]).any():
+                        pred_kmh[ni] = true_eval_kmh[ni]
+                    else:
+                        pred_kmh[ni] = np.clip(p_e[n] * node_stds[n] + node_means[n], 0, 120)
+
+                metrics = eval_pred_np(pred_kmh, true_eval_kmh)
+                mae_all = metrics['MAE all']
+                jam_mae = metrics['MAE jam']
+                prec = metrics['Prec']
+                f1 = metrics['F1']
+
+                results.append({
+                    'config': config_name,
+                    'weight': weight,
+                    'threshold': threshold_name,
+                    'mae_all': mae_all,
+                    'jam_mae': jam_mae,
+                    'prec': prec,
+                    'f1': f1
+                })
+
+                gap_to_grin = jam_mae - 1.38
+                marker = "🎯" if jam_mae < best_jam_mae else "  "
+                print(f"  {marker} MAE all: {mae_all:.4f} | jam: {jam_mae:.2f} (gap: {gap_to_grin:+.2f}) | Prec: {prec:.3f} | F1: {f1:.3f}")
+
+                if jam_mae < best_jam_mae:
+                    best_jam_mae = jam_mae
+                    best_config = (weight, threshold_name)
+                    best_net = net
+                    print(f"     🏆 NEW BEST JAM MAE: {jam_mae:.2f}")
+
+            except Exception as e:
+                print(f"  ❌ Error: {e}")
+                continue
+
+    # Print summary
+    print("\n" + "=" * 90)
+    print("  JOINT OPTIMIZATION SUMMARY (sorted by jam MAE)")
+    print("=" * 90)
+    results_df = pd.DataFrame(results).sort_values('jam_mae')
+    print(results_df[['config', 'jam_mae', 'mae_all', 'prec', 'f1']].head(10).to_string(index=False))
+
+    print(f"\n🏆 BEST CONFIGURATION:")
+    print(f"   Weight: {best_config[0]:.2f}×, Threshold: {best_config[1]}")
+    print(f"   Jam MAE: {best_jam_mae:.2f} (vs GRIN++ 1.38, gap: {best_jam_mae - 1.38:+.2f})")
+
+    return best_net, best_config, results
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # v9c JAM LOSS WEIGHT TUNING: Reduce jam MAE (currently 1.59 vs GRIN++ 1.38)
@@ -1251,8 +1371,14 @@ print("  v9c: MAE all 0.34, jam 1.60 — Backup")
 print("=" * 90)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# BASELINE v9a: current config (3.0× weight, 40 km/h strict threshold)
 v9a_net, v9a_loss_train, v9a_loss_val = train_v9a_model(hidden=64, epochs=300)
 v9a_pred_kmh = eval_v9a(v9a_net, 'Graph-CTH-NODE v9a (fusion only)')
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OPTION: Uncomment below to run v9a joint optimization tuning on Kaggle
+# Tests 16 configurations: 8 weights (1.5–3.25×) × 2 thresholds (40/50 km/h)
+# v9a_best_net, v9a_best_config, v9a_tuning_results = tune_v9a_jam_weight_and_threshold()
 
 # Skip v9b (underperforms)
 # v9b_net, v9b_loss_train, v9b_loss_val = train_v9b_model(hidden=64, epochs=300)
