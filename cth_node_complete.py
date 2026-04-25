@@ -744,7 +744,7 @@ def tune_v9a_jam_weight_and_threshold():
             try:
                 # Train
                 net, loss_train, loss_val = train_v9a_model(
-                    hidden=64, epochs=300,
+                    hidden=64, epochs=600,
                     jam_loss_weight=weight, use_soft_threshold=use_soft
                 )
 
@@ -1441,7 +1441,7 @@ print("=" * 90)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BASELINE v9a: current config (3.0× weight, 40 km/h strict threshold)
-v9a_net, v9a_loss_train, v9a_loss_val = train_v9a_model(hidden=64, epochs=300)
+v9a_net, v9a_loss_train, v9a_loss_val = train_v9a_model(hidden=64, epochs=600)
 v9a_pred_kmh = eval_v9a(v9a_net, 'Graph-CTH-NODE v9a (fusion only)')
 
 # ─────────────────────────────────────────────────────────────────────────────
