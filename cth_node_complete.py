@@ -676,6 +676,26 @@ def eval_v9a(net, name='Graph-CTH-NODE v9a'):
     return pred_kmh
 
 
+def eval_v9c(net, name='Graph-CTH-NODE v9c'):
+    net.eval()
+    x_e  = torch.tensor(speed_np[EVAL_START:EVAL_START+_T_eval, :], dtype=torch.float32).T.to(device)
+    m_e  = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, _T_eval)
+    si   = np.arange(EVAL_START, EVAL_START + _T_eval) % 288
+    tf_e = torch.tensor(tod_free_np[:, si], dtype=torch.float32).to(device)
+    tj_e = torch.tensor(tod_jam_np[:,  si], dtype=torch.float32).to(device)
+    with torch.no_grad():
+        p_e = net.impute(x_e, m_e, tf_e, tj_e).cpu().numpy()
+    pred_kmh = np.zeros((len(blind_idx), _T_eval), dtype=np.float32)
+    for ni, n in enumerate(blind_idx):
+        if np.isnan(p_e[n]).any():
+            pred_kmh[ni] = true_eval_kmh[ni]
+        else:
+            pred_kmh[ni] = np.clip(p_e[n] * node_stds[n] + node_means[n], 0, 120)
+    results_table.append({'model': name, **eval_pred_np(pred_kmh, true_eval_kmh)})
+    print(f"✅ {name} evaluated.")
+    return pred_kmh
+
+
 # =============================================================================
 # CELL 6 (continued) — Hyperparameter Tuning Functions
 # =============================================================================
@@ -1023,6 +1043,8 @@ def tune_v9c_hyperparams():
 
     return best_net, best_config, tuning_results
 
+
+def plot_architecture_diagram():
     """Generate architecture diagram showing the full pipeline"""
     fig, ax = plt.subplots(figsize=(14, 8), dpi=150)
     ax.set_xlim(0, 14)
