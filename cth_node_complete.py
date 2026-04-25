@@ -767,10 +767,10 @@ def tune_v9a_jam_weight_and_threshold():
                         pred_kmh[ni] = np.clip(p_e[n] * node_stds[n] + node_means[n], 0, 120)
 
                 metrics = eval_pred_np(pred_kmh, true_eval_kmh)
-                mae_all = metrics['MAE all']
-                jam_mae = metrics['MAE jam']
-                prec = metrics['Prec']
-                f1 = metrics['F1']
+                mae_all = metrics['mae_all']
+                jam_mae = metrics['mae_jam']
+                prec = metrics['prec']
+                f1 = metrics['f1']
 
                 results.append({
                     'config': config_name,
@@ -861,11 +861,11 @@ def tune_v9c_jam_loss_weight():
                     pred_kmh[ni] = np.clip(p_e[n] * node_stds[n] + node_means[n], 0, 120)
 
             metrics = eval_pred_np(pred_kmh, true_eval_kmh)
-            mae_all = metrics['MAE all']
-            jam_mae = metrics['MAE jam']
-            prec = metrics['Prec']
-            rec = metrics['Rec']
-            f1 = metrics['F1']
+            mae_all = metrics['mae_all']
+            jam_mae = metrics['mae_jam']
+            prec = metrics['prec']
+            rec = metrics['rec']
+            f1 = metrics['f1']
 
             results.append({
                 'weight': weight,
@@ -1010,7 +1010,7 @@ def tune_v9c_hyperparams():
                             pred_kmh[ni] = np.clip(p_e[n] * node_stds[n] + node_means[n], 0, 120)
 
                     metrics = eval_pred_np(pred_kmh, true_eval_kmh)
-                    mae_all = metrics['MAE all']
+                    mae_all = metrics['mae_all']
 
                     tuning_results.append({
                         'config': config_name,
@@ -1019,7 +1019,7 @@ def tune_v9c_hyperparams():
                         **metrics
                     })
 
-                    print(f"    ✓ MAE all: {mae_all:.4f} | jam: {metrics['MAE jam']:.2f} | F1: {metrics['F1']:.3f}")
+                    print(f"    ✓ MAE all: {mae_all:.4f} | jam: {metrics['mae_jam']:.2f} | F1: {metrics['f1']:.3f}")
 
                     if mae_all < best_mae_all:
                         best_mae_all = mae_all
