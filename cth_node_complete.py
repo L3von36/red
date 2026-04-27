@@ -2867,7 +2867,7 @@ class HSTGCN(nn.Module):
         self.enc          = nn.Linear(2, hidden)
         self.gcn_node     = ChebConv(hidden, hidden, K=2)
         self.cluster_proj = nn.Linear(hidden, n_clusters, bias=False)
-        self.cluster_mix  = nn.Linear(n_clusters, n_clusters)
+        self.cluster_mix  = nn.Linear(hidden, hidden)
         self.gru          = nn.GRUCell(hidden * 2, hidden)
         self.out          = nn.Linear(hidden, 1)
         self.act          = nn.ReLU()
@@ -2882,8 +2882,9 @@ class HSTGCN(nn.Module):
             fn  = self.act(self.gcn_node(f))                 # [N, H] node-level GCN
             # Soft cluster assignment [N, K]
             S   = torch.softmax(self.cluster_proj(fn), dim=-1)
-            # Cluster features and mixing [K, H]
-            fc  = self.act(self.cluster_mix(S.T)) @ fn       # [K, H]
+            # Cluster features and mixing: S.T @ fn = [K, N] @ [N, H] = [K, H]
+            fc  = S.T @ fn                                   # [K, H]
+            fc  = self.act(self.cluster_mix(fc))             # [K, H]
             # Upsample back to nodes and fuse
             fn2 = S @ fc                                     # [N, H]
             h   = self.gru(torch.cat([fn, fn2], dim=-1), h)
