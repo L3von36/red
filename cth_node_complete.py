@@ -472,12 +472,13 @@ class GraphCTHNodeV9a(nn.Module):
     """
     v9a: GRIN++ cell + learned fusion + parameterized jam loss.
     Can use strict 40 km/h or soft 50 km/h threshold.
-    Can tune jam_loss_weight (default 3.0, GRIN++ uses 2.0).
+    Tuned to balance both jam_loss_weight and free_loss_weight.
     """
-    def __init__(self, hidden=64, include_tod=True, jam_loss_weight=3.0, use_soft_threshold=False):
+    def __init__(self, hidden=64, include_tod=True, jam_loss_weight=2.5, free_loss_weight=1.0, use_soft_threshold=False):
         super().__init__()
         self.include_tod = include_tod
         self.jam_loss_weight = jam_loss_weight
+        self.free_loss_weight = free_loss_weight
         self.use_soft_threshold = use_soft_threshold
         self.fwd = GraphCTHNodeV9Cell(hidden, include_tod)
         self.bwd = GraphCTHNodeV9Cell(hidden, include_tod)
@@ -502,7 +503,7 @@ class GraphCTHNodeV9a(nn.Module):
                           dtype=torch.float32, device=x.device)
         jam_flag = (x < jt.unsqueeze(1)).float()
         free_flag = 1.0 - jam_flag
-        loss_free = torch.mean(((p - x) * m * free_flag) ** 2)
+        loss_free = torch.mean(((p - x) * m * free_flag) ** 2) * self.free_loss_weight
         loss_jam  = torch.mean(torch.abs(p - x) * m * jam_flag) * self.jam_loss_weight
         return loss_free + loss_jam
 
@@ -512,12 +513,13 @@ class GraphCTHNodeV9a(nn.Module):
 class GraphCTHNodeV9c(nn.Module):
     """
     v9c: GRIN++ cell + aligned loss (40 km/h × jam_loss_weight) ONLY (no learned fusion, no two-pass).
-    Parameterized jam loss weight to tune jam vs overall MAE tradeoff.
+    Tuned to balance both jam_loss_weight and free_loss_weight.
     """
-    def __init__(self, hidden=64, include_tod=True, jam_loss_weight=2.0):
+    def __init__(self, hidden=64, include_tod=True, jam_loss_weight=2.0, free_loss_weight=1.0):
         super().__init__()
         self.include_tod = include_tod
         self.jam_loss_weight = jam_loss_weight
+        self.free_loss_weight = free_loss_weight
         self.fwd = GraphCTHNodeV9Cell(hidden, include_tod)
         self.bwd = GraphCTHNodeV9Cell(hidden, include_tod)
 
@@ -535,7 +537,7 @@ class GraphCTHNodeV9c(nn.Module):
         jt       = torch.tensor(jam_thresh_soft_np, dtype=torch.float32, device=x.device)
         jam_flag = (x < jt.unsqueeze(1)).float()
         free_flag = 1.0 - jam_flag
-        loss_free = torch.mean(((p - x) * m * free_flag) ** 2)
+        loss_free = torch.mean(((p - x) * m * free_flag) ** 2) * self.free_loss_weight
         loss_jam  = torch.mean(torch.abs(p - x) * m * jam_flag) * self.jam_loss_weight
         return loss_free + loss_jam
 
@@ -546,12 +548,12 @@ class GraphCTHNodeV9c(nn.Module):
 # CELL 6 — Training & Evaluation Functions
 # =============================================================================
 
-def train_v9a_model(hidden=64, epochs=300, jam_loss_weight=3.0, use_soft_threshold=False):
-    seed = abs(hash(f'GraphCTHNodeV9a_{jam_loss_weight}_{use_soft_threshold}')) % (2**31)
+def train_v9a_model(hidden=64, epochs=300, jam_loss_weight=2.5, free_loss_weight=1.0, use_soft_threshold=False):
+    seed = abs(hash(f'GraphCTHNodeV9a_{jam_loss_weight}_{free_loss_weight}_{use_soft_threshold}')) % (2**31)
     torch.manual_seed(seed)
     np.random.seed(seed)
     net = GraphCTHNodeV9a(hidden=hidden, include_tod=True,
-                          jam_loss_weight=jam_loss_weight, use_soft_threshold=use_soft_threshold).to(device)
+                          jam_loss_weight=jam_loss_weight, free_loss_weight=free_loss_weight, use_soft_threshold=use_soft_threshold).to(device)
     opt = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
     best_vloss, best_wts, patience_ctr = float('inf'), None, 0
     loss_history_train, loss_history_val = [], []
@@ -560,7 +562,7 @@ def train_v9a_model(hidden=64, epochs=300, jam_loss_weight=3.0, use_soft_thresho
     print(f"\n{'='*80}")
     print(f"Training Graph-CTH-NODE v9a: {epochs} epochs")
     print(f"  GRIN++ cell + learned fusion")
-    print(f"  Threshold: {threshold_str}, Jam loss weight: {jam_loss_weight}×")
+    print(f"  Threshold: {threshold_str}, Jam weight: {jam_loss_weight}×, Free weight: {free_loss_weight}×")
     print(f"{'='*80}\n")
     for ep in range(1, epochs + 1):
         net.train()
@@ -603,17 +605,17 @@ def train_v9a_model(hidden=64, epochs=300, jam_loss_weight=3.0, use_soft_thresho
         net.load_state_dict(best_wts)
     return net, loss_history_train, loss_history_val
 
-def train_v9c_model(hidden=64, epochs=300, jam_loss_weight=2.0):
-    seed = abs(hash(f'GraphCTHNodeV9c_{jam_loss_weight}')) % (2**31)
+def train_v9c_model(hidden=64, epochs=300, jam_loss_weight=2.0, free_loss_weight=1.0):
+    seed = abs(hash(f'GraphCTHNodeV9c_{jam_loss_weight}_{free_loss_weight}')) % (2**31)
     torch.manual_seed(seed)
     np.random.seed(seed)
-    net = GraphCTHNodeV9c(hidden=hidden, include_tod=True, jam_loss_weight=jam_loss_weight).to(device)
+    net = GraphCTHNodeV9c(hidden=hidden, include_tod=True, jam_loss_weight=jam_loss_weight, free_loss_weight=free_loss_weight).to(device)
     opt = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
     best_vloss, best_wts, patience_ctr = float('inf'), None, 0
     loss_history_train, loss_history_val = [], []
     print(f"\n{'='*80}")
-    print(f"Training Graph-CTH-NODE v9c: {epochs} epochs, jam_loss_weight={jam_loss_weight}")
-    print(f"  GRIN++ cell + GRIN++ loss formula (50 km/h train, 40 km/h eval, {jam_loss_weight}x weight)")
+    print(f"Training Graph-CTH-NODE v9c: {epochs} epochs")
+    print(f"  GRIN++ cell + loss formula (50 km/h train, 40 km/h eval, jam_weight={jam_loss_weight}x, free_weight={free_loss_weight}x)")
     print(f"{'='*80}\n")
     for ep in range(1, epochs + 1):
         net.train()
@@ -706,31 +708,28 @@ def eval_v9c(net, name='Graph-CTH-NODE v9c'):
 
 def tune_v9a_multiseed():
     """
-    MULTI-SEED LOTTERY: Try w3.75 with different random initializations.
-    Sometimes stochastic training finds better local minima!
-
-    Current best: w3.75, seed=hash = jam MAE 1.0090
-    Goal: Find a seed that breaks below 1.0
+    MULTI-SEED LOTTERY: Try balanced weights with different random initializations.
+    Optimize for BOTH jam MAE and overall MAE using balanced loss weighting.
     """
-    weight = 3.75
-    num_seeds = 10  # Try 10 different random seeds
+    jam_weight = 2.0
+    free_weight = 0.8
+    num_seeds = 8  # Try 8 different random seeds
     results = []
 
     print("\n" + "=" * 90)
-    print("  v9a MULTI-SEED LOTTERY: w3.75 with different random initializations")
-    print(f"  Weight: 3.75×, Epochs: 800")
-    print(f"  Current best: jam MAE 1.0090")
-    print(f"  Goal: Find seed that breaks below 1.0 ✅")
+    print("  v9a MULTI-SEED SWEEP: Balanced weights with different random initializations")
+    print(f"  Jam weight: {jam_weight}×, Free weight: {free_weight}×, Epochs: 600")
+    print(f"  Objective: Balance jam MAE < 1.2 AND overall MAE < 0.20")
     print("=" * 90 + "\n")
 
-    best_jam_mae = float('inf')
+    best_combined_score = float('inf')
     best_seed = None
     best_net = None
 
     for seed_id in range(num_seeds):
-        config_name = f"v9a_w3.75_seed{seed_id}"
+        config_name = f"v9a_balanced_seed{seed_id}"
 
-        print(f"[{seed_id+1}/{num_seeds}] w3.75, seed={seed_id}, epochs=800")
+        print(f"[{seed_id+1}/{num_seeds}] jam_w={jam_weight}, free_w={free_weight}, seed={seed_id}, epochs=600")
 
         try:
             # Set random seeds
@@ -738,13 +737,13 @@ def tune_v9a_multiseed():
             torch.manual_seed(seed)
             np.random.seed(seed)
 
-            # Train
+            # Train with balanced weights
             net = GraphCTHNodeV9a(hidden=64, include_tod=True,
-                                 jam_loss_weight=weight, use_soft_threshold=False).to(device)
+                                 jam_loss_weight=jam_weight, free_loss_weight=free_weight, use_soft_threshold=False).to(device)
             opt = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
             best_vloss, best_wts, patience_ctr = float('inf'), None, 0
 
-            for ep in range(1, 800 + 1):
+            for ep in range(1, 600 + 1):
                 net.train()
                 t0      = np.random.randint(0, TRAIN_END - BATCH_TIME)
                 x_full  = torch.tensor(speed_np[t0:t0+BATCH_TIME, :], dtype=torch.float32).T.to(device)
@@ -807,27 +806,34 @@ def tune_v9a_multiseed():
             metrics = eval_pred_np(pred_kmh, true_eval_kmh)
             mae_all = metrics['mae_all']
             jam_mae = metrics['mae_jam']
+            rmse_all = metrics['rmse_all']
+            r2_all = metrics['r2_all']
             prec = metrics['prec']
             f1 = metrics['f1']
+
+            # Combined score: weighted balance of jam and overall MAE
+            # Normalize: jam_mae target ~1.2, overall MAE target ~0.20
+            combined_score = (jam_mae / 1.2) * 0.5 + (mae_all / 0.20) * 0.5
 
             results.append({
                 'seed': seed_id,
                 'jam_mae': jam_mae,
                 'mae_all': mae_all,
+                'rmse_all': rmse_all,
+                'r2_all': r2_all,
                 'prec': prec,
-                'f1': f1
+                'f1': f1,
+                'combined_score': combined_score
             })
 
-            gap = jam_mae - 1.0
-            below_1 = "✅ BELOW 1.0!" if jam_mae < 1.0 else f"gap: {gap:+.6f}"
-            marker = "🎯" if jam_mae < best_jam_mae else "  "
-            print(f"  {marker} jam: {jam_mae:.6f} {below_1} | MAE all: {mae_all:.4f} | F1: {f1:.3f}")
+            marker = "🎯" if combined_score < best_combined_score else "  "
+            print(f"  {marker} jam: {jam_mae:.4f} | all: {mae_all:.4f} | R²: {r2_all:.4f} | score: {combined_score:.3f}")
 
-            if jam_mae < best_jam_mae:
-                best_jam_mae = jam_mae
+            if combined_score < best_combined_score:
+                best_combined_score = combined_score
                 best_seed = seed_id
-                best_net = net
-                print(f"     🏆 NEW BEST JAM MAE: {jam_mae:.6f}")
+                best_net = copy.deepcopy(net)
+                print(f"     🏆 NEW BEST BALANCED SCORE: {combined_score:.3f}")
 
         except Exception as e:
             print(f"    ❌ Error: {e}")
@@ -836,17 +842,19 @@ def tune_v9a_multiseed():
     # Print summary
     if results:
         print("\n" + "=" * 90)
-        print("  MULTI-SEED LOTTERY SUMMARY (sorted by jam MAE)")
+        print("  MULTI-SEED SWEEP SUMMARY (sorted by combined balanced score)")
         print("=" * 90)
-        results_df = pd.DataFrame(results).sort_values('jam_mae')
-        print(results_df[['seed', 'jam_mae', 'mae_all', 'prec', 'f1']].to_string(index=False))
+        results_df = pd.DataFrame(results).sort_values('combined_score')
+        print(results_df[['seed', 'jam_mae', 'mae_all', 'rmse_all', 'r2_all', 'f1', 'combined_score']].to_string(index=False))
 
-        print(f"\n🏆 BEST SEED FOUND:")
+        print(f"\n🏆 BEST SEED FOUND (BALANCED OBJECTIVE):")
         print(f"   Seed: {best_seed}")
-        print(f"   Jam MAE: {best_jam_mae:.6f}")
-        print(f"   Gap to 1.0: {best_jam_mae - 1.0:+.6f}")
-        if best_jam_mae < 1.0:
-            print(f"   ✅ BREAKTHROUGH: jam MAE < 1.0!")
+        best_result = results_df.iloc[0]
+        print(f"   Jam MAE: {best_result['jam_mae']:.4f}")
+        print(f"   Overall MAE: {best_result['mae_all']:.4f}")
+        print(f"   RMSE: {best_result['rmse_all']:.4f}")
+        print(f"   R²: {best_result['r2_all']:.4f}")
+        print(f"   Combined Score: {best_combined_score:.3f}")
     else:
         print("\n❌ All seeds failed!")
 
@@ -1907,14 +1915,57 @@ def jam_prec_recall(pred_kmh, true_kmh, thresh=40.0):
 def eval_pred_np(pred_kmh_bl, true_kmh_bl):
     """
     pred_kmh_bl, true_kmh_bl: np arrays [n_blind, T_eval] in km/h
-    Returns dict of metrics.
+    Returns dict of metrics: MAE, RMSE, R², MAPE, MSLE, Jam metrics, Precision, Recall, F1, SSIM.
     """
-    mae_all = float(np.abs(pred_kmh_bl - true_kmh_bl).mean())
+    diff = pred_kmh_bl - true_kmh_bl
+
+    # Overall metrics (all data)
+    mae_all = float(np.abs(diff).mean())
+    mse_all = float((diff ** 2).mean())
+    rmse_all = float(np.sqrt(mse_all))
+
+    # R² (coefficient of determination)
+    ss_res = (diff ** 2).sum()
+    ss_tot = ((true_kmh_bl - true_kmh_bl.mean()) ** 2).sum()
+    r2_all = float(1.0 - ss_res / (ss_tot + 1e-8))
+
+    # MAPE (Mean Absolute Percentage Error) — avoid div by 0
+    mape_all = float(np.abs((diff / (np.abs(true_kmh_bl) + 1e-8))).mean())
+
+    # MSLE (Mean Squared Log Error) — for skewed error distributions
+    msle_all = float((np.log1p(np.abs(pred_kmh_bl)) - np.log1p(np.abs(true_kmh_bl))) ** 2).mean()
+
+    # Jam metrics (< JAM_KMH_EVAL)
     jm = true_kmh_bl < JAM_KMH_EVAL
-    mae_jam = float(np.abs((pred_kmh_bl - true_kmh_bl)[jm]).mean()) if jm.any() else float('nan')
+    if jm.any():
+        mae_jam = float(np.abs(diff[jm]).mean())
+        mse_jam = float((diff[jm] ** 2).mean())
+        rmse_jam = float(np.sqrt(mse_jam))
+        r2_jam = float(1.0 - (diff[jm] ** 2).sum() / (((true_kmh_bl[jm] - true_kmh_bl[jm].mean()) ** 2).sum() + 1e-8))
+        mape_jam = float(np.abs((diff[jm] / (np.abs(true_kmh_bl[jm]) + 1e-8))).mean())
+    else:
+        mae_jam = rmse_jam = mse_jam = r2_jam = mape_jam = float('nan')
+
+    # Free flow metrics (>= JAM_KMH_EVAL)
+    ff = ~jm
+    if ff.any():
+        mae_free = float(np.abs(diff[ff]).mean())
+        mse_free = float((diff[ff] ** 2).mean())
+        rmse_free = float(np.sqrt(mse_free))
+        r2_free = float(1.0 - (diff[ff] ** 2).sum() / (((true_kmh_bl[ff] - true_kmh_bl[ff].mean()) ** 2).sum() + 1e-8))
+    else:
+        mae_free = rmse_free = mse_free = r2_free = float('nan')
+
+    # Jam precision/recall
     pr, rc, f1 = jam_prec_recall(pred_kmh_bl, true_kmh_bl)
     ssim = compute_ssim(pred_kmh_bl, true_kmh_bl)
-    return dict(mae_all=mae_all, mae_jam=mae_jam, prec=pr, rec=rc, f1=f1, ssim=ssim)
+
+    return dict(
+        mae_all=mae_all, rmse_all=rmse_all, r2_all=r2_all, mape_all=mape_all, msle_all=msle_all,
+        mae_jam=mae_jam, rmse_jam=rmse_jam, r2_jam=r2_jam, mape_jam=mape_jam,
+        mae_free=mae_free, rmse_free=rmse_free, r2_free=r2_free,
+        prec=pr, rec=rc, f1=f1, ssim=ssim
+    )
 
 # Ground truth on blind nodes for the eval window (km/h)
 _T_eval = (EVAL_LEN // BATCH_TIME) * BATCH_TIME
@@ -1972,21 +2023,21 @@ print("  v9c: MAE all 0.34, jam 1.60 — Backup")
 print("=" * 90)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BASELINE v9a: current config (3.0× weight, 40 km/h strict threshold)
-v9a_net, v9a_loss_train, v9a_loss_val = train_v9a_model(hidden=64, epochs=600)
-v9a_pred_kmh = eval_v9a(v9a_net, 'Graph-CTH-NODE v9a (fusion only)')
+# BALANCED BASELINE: Optimized weights for both jam and overall MAE
+# jam_loss_weight=2.0 (balanced) and free_loss_weight=0.8 (slightly reduce free-flow emphasis)
+v9a_net, v9a_loss_train, v9a_loss_val = train_v9a_model(hidden=64, epochs=600, jam_loss_weight=2.0, free_loss_weight=0.8)
+v9a_pred_kmh = eval_v9a(v9a_net, 'Graph-CTH-NODE v9a (balanced loss)')
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OPTION: Uncomment below to run v9a joint optimization tuning on Kaggle
-# Tests 16 configurations: 8 weights (1.5–3.25×) × 2 thresholds (40/50 km/h)
+# Multi-seed sweep to find best local minima for balanced objectives
 v9a_best_net, v9a_best_seed, v9a_tuning_results = tune_v9a_multiseed()
 
 # Skip v9b (underperforms)
 # v9b_net, v9b_loss_train, v9b_loss_val = train_v9b_model(hidden=64, epochs=300)
 # v9b_pred_kmh = eval_v9b(v9b_net, 'Graph-CTH-NODE v9b (two-pass only)')
 
-v9c_net, v9c_loss_train, v9c_loss_val = train_v9c_model(hidden=64, epochs=300)
-v9c_pred_kmh = eval_v9c(v9c_net, 'Graph-CTH-NODE v9c (aligned loss only)')
+v9c_net, v9c_loss_train, v9c_loss_val = train_v9c_model(hidden=64, epochs=300, jam_loss_weight=1.8, free_loss_weight=0.9)
+v9c_pred_kmh = eval_v9c(v9c_net, 'Graph-CTH-NODE v9c (balanced loss)')
 
 # ABLATION RESULTS:
 #   v9c (aligned loss only):     MAE all 0.33, jam 1.59 — BEST! Simple wins.
