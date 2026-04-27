@@ -1544,7 +1544,7 @@ def eval_pred_np(pred_kmh_bl, true_kmh_bl):
     mape_all = float(np.abs((diff / (np.abs(true_kmh_bl) + 1e-8))).mean())
 
     # MSLE (Mean Squared Log Error) — for skewed error distributions
-    msle_all = float((np.log1p(np.abs(pred_kmh_bl)) - np.log1p(np.abs(true_kmh_bl))) ** 2).mean()
+    msle_all = float(((np.log1p(np.abs(pred_kmh_bl)) - np.log1p(np.abs(true_kmh_bl))) ** 2).mean())
 
     # Jam metrics (< JAM_KMH_EVAL)
     jm = true_kmh_bl < JAM_KMH_EVAL
