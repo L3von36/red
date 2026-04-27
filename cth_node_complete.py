@@ -121,10 +121,13 @@ raw_npz   = np.load(fn_npz)
 NUM_NODES  = ds_cfg['num_nodes']
 TIME_STEPS = ds_cfg['time_steps']
 CHAN_IDX   = ds_cfg['channel_idx']
-TRAIN_END  = min(4000, int(0.8 * TIME_STEPS))
-VAL_END    = min(TRAIN_END + 240, int(0.9 * TIME_STEPS))
-EVAL_START = min(VAL_END + 260, int(0.9 * TIME_STEPS))
-EVAL_LEN   = min(450, TIME_STEPS - EVAL_START)
+TRAIN_END    = min(4000, int(0.8 * TIME_STEPS))
+VAL_END      = min(TRAIN_END + 240, int(0.9 * TIME_STEPS))
+EVAL_START   = min(VAL_END + 260, int(0.9 * TIME_STEPS))
+EVAL_LEN     = min(450, TIME_STEPS - EVAL_START)
+# Warm-up: feed this many steps before EVAL_START so the GRU hidden state
+# is not cold-zero. Uses only the observed-node mask (no label leakage).
+WARMUP_STEPS = 96   # 8 hours of 5-min intervals
 
 # Batch/sequence window size
 BATCH_TIME = 48
@@ -660,13 +663,18 @@ def train_v9c_model(hidden=64, epochs=300, jam_loss_weight=2.0, free_loss_weight
 
 def eval_v9a(net, name='Graph-CTH-NODE v9a'):
     net.eval()
-    x_e  = torch.tensor(speed_np[EVAL_START:EVAL_START+_T_eval, :], dtype=torch.float32).T.to(device)
-    m_e  = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, _T_eval)
-    si   = np.arange(EVAL_START, EVAL_START + _T_eval) % 288
-    tf_e = torch.tensor(tod_free_np[:, si], dtype=torch.float32).to(device)
-    tj_e = torch.tensor(tod_jam_np[:,  si], dtype=torch.float32).to(device)
+    # Warm-up window: prepend WARMUP_STEPS before eval so GRU h != 0
+    ws    = max(0, EVAL_START - WARMUP_STEPS)
+    total = (EVAL_START + _T_eval) - ws
+    x_e   = torch.tensor(speed_np[ws:EVAL_START+_T_eval, :], dtype=torch.float32).T.to(device)
+    m_e   = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, total)
+    si    = np.arange(ws, EVAL_START + _T_eval) % 288
+    tf_e  = torch.tensor(tod_free_np[:, si], dtype=torch.float32).to(device)
+    tj_e  = torch.tensor(tod_jam_np[:,  si], dtype=torch.float32).to(device)
     with torch.no_grad():
-        p_e = net.impute(x_e, m_e, tf_e, tj_e).cpu().numpy()
+        p_full = net.impute(x_e, m_e, tf_e, tj_e).cpu().numpy()   # [N, total]
+    offset   = EVAL_START - ws   # skip warm-up steps
+    p_e      = p_full[:, offset:]                                   # [N, _T_eval]
     pred_kmh = np.zeros((len(blind_idx), _T_eval), dtype=np.float32)
     for ni, n in enumerate(blind_idx):
         if np.isnan(p_e[n]).any():
@@ -2094,14 +2102,19 @@ def train_gnn_baseline(model_cls, name, **kwargs):
 
 def eval_gnn_baseline(net, name):
     net.eval()
-    x_e = torch.tensor(speed_np[EVAL_START:EVAL_START+_T_eval, :],
-                        dtype=torch.float32).T.to(device)   # [N, T]
-    m_e = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, _T_eval)
+    # Warm-up: prepend WARMUP_STEPS so recurrent hidden state is not cold-zero
+    ws    = max(0, EVAL_START - WARMUP_STEPS)
+    total = (EVAL_START + _T_eval) - ws
+    x_e   = torch.tensor(speed_np[ws:EVAL_START+_T_eval, :],
+                         dtype=torch.float32).T.to(device)   # [N, total]
+    m_e   = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, total)
     with torch.no_grad():
-        p_e = net.impute(x_e, m_e).cpu().numpy()  # [N, T]
+        p_full = net.impute(x_e, m_e).cpu().numpy()          # [N, total]
+    offset   = EVAL_START - ws
+    p_e      = p_full[:, offset:]                             # [N, _T_eval]
     pred_kmh = np.zeros((len(blind_idx), _T_eval), dtype=np.float32)
     for ni, n in enumerate(blind_idx):
-        pred_kmh[ni] = p_e[n] * node_stds[n] + node_means[n]
+        pred_kmh[ni] = np.clip(p_e[n] * node_stds[n] + node_means[n], 0, 120)
     results_table.append({'model': name, **eval_pred_np(pred_kmh, true_eval_kmh)})
     print(f"✅ {name} evaluated.")
 
@@ -3550,10 +3563,13 @@ def train_v9a_sp(m_vec, sparsity, epochs=SP_V9A_EPOCHS):
 
 def eval_gnn_sp(net, m_vec, blind, true_kmh):
     net.eval()
-    x_e = torch.tensor(speed_np[EVAL_START:EVAL_START + _T_eval], dtype=torch.float32).T.to(device)
-    m_e = m_vec.unsqueeze(1).expand(-1, _T_eval)
+    ws    = max(0, EVAL_START - WARMUP_STEPS)
+    total = (EVAL_START + _T_eval) - ws
+    x_e   = torch.tensor(speed_np[ws:EVAL_START + _T_eval], dtype=torch.float32).T.to(device)
+    m_e   = m_vec.unsqueeze(1).expand(-1, total)
     with torch.no_grad():
-        p_e = net.impute(x_e, m_e).cpu().numpy()
+        p_full = net.impute(x_e, m_e).cpu().numpy()
+    p_e      = p_full[:, EVAL_START - ws:]
     pred_kmh = np.zeros((len(blind), _T_eval), dtype=np.float32)
     for ni, n in enumerate(blind):
         pred_kmh[ni] = np.clip(p_e[n] * node_stds[n] + node_means[n], 0, 120)
@@ -3562,13 +3578,16 @@ def eval_gnn_sp(net, m_vec, blind, true_kmh):
 
 def eval_v9a_sp(net, m_vec, blind, true_kmh):
     net.eval()
-    x_e  = torch.tensor(speed_np[EVAL_START:EVAL_START + _T_eval], dtype=torch.float32).T.to(device)
-    m_e  = m_vec.unsqueeze(1).expand(-1, _T_eval)
-    si   = np.arange(EVAL_START, EVAL_START + _T_eval) % 288
-    tf_e = torch.tensor(tod_free_np[:, si], dtype=torch.float32).to(device)
-    tj_e = torch.tensor(tod_jam_np[:,  si], dtype=torch.float32).to(device)
+    ws    = max(0, EVAL_START - WARMUP_STEPS)
+    total = (EVAL_START + _T_eval) - ws
+    x_e   = torch.tensor(speed_np[ws:EVAL_START + _T_eval], dtype=torch.float32).T.to(device)
+    m_e   = m_vec.unsqueeze(1).expand(-1, total)
+    si    = np.arange(ws, EVAL_START + _T_eval) % 288
+    tf_e  = torch.tensor(tod_free_np[:, si], dtype=torch.float32).to(device)
+    tj_e  = torch.tensor(tod_jam_np[:,  si], dtype=torch.float32).to(device)
     with torch.no_grad():
-        p_e = net.impute(x_e, m_e, tf_e, tj_e).cpu().numpy()
+        p_full = net.impute(x_e, m_e, tf_e, tj_e).cpu().numpy()
+    p_e      = p_full[:, EVAL_START - ws:]
     pred_kmh = np.zeros((len(blind), _T_eval), dtype=np.float32)
     for ni, n in enumerate(blind):
         pred_kmh[ni] = np.clip(p_e[n] * node_stds[n] + node_means[n], 0, 120)
