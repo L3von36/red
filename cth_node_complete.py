@@ -3457,19 +3457,20 @@ print("=" * 90)
 #   Shows that Graph-CTH-NODE v9a retains superiority across all missing rates.
 # =============================================================================
 
-SPARSITY_LEVELS = [0.40, 0.60, 0.80, 0.90]
-SP_GNN_EPOCHS   = 150    # reduced from 300 for sweep speed
-SP_V9A_EPOCHS   = 300    # reduced from 600 for sweep speed
-SWEEP_SEED_BASE = 77777
+SPARSITY_LEVELS  = [0.40, 0.60, 0.80, 0.90]
+SP_GNN_EPOCHS    = 150    # reduced from 300 for sweep speed
+SP_V9A_EPOCHS    = 300    # reduced from 600 for sweep speed
+SWEEP_SEED_BASE  = 77777
+SWEEP_N_SEEDS    = 3      # blind-mask seeds per sparsity level
 
 print("\n" + "=" * 80)
 print("  MULTI-SPARSITY ROBUSTNESS SWEEP  (40 / 60 / 80 / 90 % blind nodes)")
 print("=" * 80)
 
 
-def make_blind_setup(sparsity):
+def make_blind_setup(sparsity, seed_offset=0):
     """Consistent blind mask + ground-truth km/h for a given sparsity level."""
-    rng    = np.random.RandomState(SWEEP_SEED_BASE + int(sparsity * 1000))
+    rng    = np.random.RandomState(SWEEP_SEED_BASE + int(sparsity * 1000) + seed_offset)
     n_bl   = int(NUM_NODES * sparsity)
     blind  = rng.choice(NUM_NODES, n_bl, replace=False)
     obs    = np.setdiff1d(np.arange(NUM_NODES), blind)
@@ -3481,8 +3482,8 @@ def make_blind_setup(sparsity):
     return m_vec, blind, obs, true_kmh
 
 
-def train_gnn_sp(model_cls, name, m_vec, sparsity, epochs=SP_GNN_EPOCHS):
-    seed = abs(hash(f"{name}_{sparsity:.2f}")) % (2**31)
+def train_gnn_sp(model_cls, name, m_vec, sparsity, epochs=SP_GNN_EPOCHS, seed_offset=0):
+    seed = abs(hash(f"{name}_{sparsity:.2f}_{seed_offset}")) % (2**31)
     torch.manual_seed(seed)
     np.random.seed(seed)
     net = model_cls().to(device)
@@ -3517,9 +3518,10 @@ def train_gnn_sp(model_cls, name, m_vec, sparsity, epochs=SP_GNN_EPOCHS):
     return net
 
 
-def train_v9a_sp(m_vec, sparsity, epochs=SP_V9A_EPOCHS):
-    torch.manual_seed(PRODUCTION_SEED)
-    np.random.seed(PRODUCTION_SEED)
+def train_v9a_sp(m_vec, sparsity, epochs=SP_V9A_EPOCHS, seed_offset=0):
+    seed = PRODUCTION_SEED + seed_offset * 12345
+    torch.manual_seed(seed)
+    np.random.seed(seed)
     net = GraphCTHNodeV9a(hidden=64, include_tod=True,
                           jam_loss_weight=PRODUCTION_JAM_WEIGHT,
                           free_loss_weight=PRODUCTION_FREE_WEIGHT,
@@ -3594,91 +3596,84 @@ def eval_v9a_sp(net, m_vec, blind, true_kmh):
     return eval_pred_np(pred_kmh, true_kmh)
 
 
-# ── Main sweep loop ───────────────────────────────────────────────────────────
-sparsity_results = {}   # {model_name: {sparsity_float: metrics_dict}}
+# ── Main sweep loop: SWEEP_N_SEEDS blind-mask seeds per sparsity ──────────────
+# sparsity_raw[model][sp] = list of metrics dicts (one per seed)
+SWEEP_MODELS_LIST = ['Hist. Avg', 'GRIN', 'HSTGCN', 'GCASTN', 'CTH-NODE v9a']
+sparsity_raw = {m: {sp: [] for sp in SPARSITY_LEVELS} for m in SWEEP_MODELS_LIST}
 
 for sp in SPARSITY_LEVELS:
     sp_pct = int(sp * 100)
-    m_vec, blind, obs, true_kmh = make_blind_setup(sp)
-    print(f"\n--- Sparsity {sp_pct}%  (blind={len(blind)}, observed={len(obs)}) ---")
+    print(f"\n--- Sparsity {sp_pct}%  ({SWEEP_N_SEEDS} seeds) ---")
 
-    # Historical Average
-    ha_pred = node_means[blind][:, None] * np.ones((len(blind), _T_eval), dtype=np.float32)
-    r = eval_pred_np(ha_pred, true_kmh)
-    sparsity_results.setdefault('Hist. Avg', {})[sp] = r
-    print(f"  Hist. Avg  MAE={r['mae_all']:.3f}  JamMAE={r['mae_jam']:.3f}")
+    for si in range(SWEEP_N_SEEDS):
+        m_vec, blind, obs, true_kmh = make_blind_setup(sp, seed_offset=si)
+        print(f"  [seed {si}] blind={len(blind)}, observed={len(obs)}")
 
-    # GRIN
-    print(f"  Training GRIN @ {sp_pct}%...")
-    net = train_gnn_sp(GRIN, 'GRIN', m_vec, sp)
-    r   = eval_gnn_sp(net, m_vec, blind, true_kmh)
-    sparsity_results.setdefault('GRIN', {})[sp] = r
-    print(f"  GRIN       MAE={r['mae_all']:.3f}  JamMAE={r['mae_jam']:.3f}")
+        # Historical Average
+        ha_pred = node_means[blind][:, None] * np.ones((len(blind), _T_eval), dtype=np.float32)
+        sparsity_raw['Hist. Avg'][sp].append(eval_pred_np(ha_pred, true_kmh))
 
-    # HSTGCN
-    print(f"  Training HSTGCN @ {sp_pct}%...")
-    net = train_gnn_sp(HSTGCN, 'HSTGCN', m_vec, sp)
-    r   = eval_gnn_sp(net, m_vec, blind, true_kmh)
-    sparsity_results.setdefault('HSTGCN', {})[sp] = r
-    print(f"  HSTGCN     MAE={r['mae_all']:.3f}  JamMAE={r['mae_jam']:.3f}")
+        # GRIN
+        net = train_gnn_sp(GRIN, 'GRIN', m_vec, sp, seed_offset=si)
+        sparsity_raw['GRIN'][sp].append(eval_gnn_sp(net, m_vec, blind, true_kmh))
 
-    # GCASTN
-    print(f"  Training GCASTN @ {sp_pct}%...")
-    net = train_gnn_sp(GCASTN, 'GCASTN', m_vec, sp)
-    r   = eval_gnn_sp(net, m_vec, blind, true_kmh)
-    sparsity_results.setdefault('GCASTN', {})[sp] = r
-    print(f"  GCASTN     MAE={r['mae_all']:.3f}  JamMAE={r['mae_jam']:.3f}")
+        # HSTGCN
+        net = train_gnn_sp(HSTGCN, 'HSTGCN', m_vec, sp, seed_offset=si)
+        sparsity_raw['HSTGCN'][sp].append(eval_gnn_sp(net, m_vec, blind, true_kmh))
 
-    # Graph-CTH-NODE v9a (ours)
-    print(f"  Training CTH-NODE v9a @ {sp_pct}%...")
-    net = train_v9a_sp(m_vec, sp)
-    r   = eval_v9a_sp(net, m_vec, blind, true_kmh)
-    sparsity_results.setdefault('CTH-NODE v9a', {})[sp] = r
-    print(f"  CTH-NODE   MAE={r['mae_all']:.3f}  JamMAE={r['mae_jam']:.3f}")
+        # GCASTN
+        net = train_gnn_sp(GCASTN, 'GCASTN', m_vec, sp, seed_offset=si)
+        sparsity_raw['GCASTN'][sp].append(eval_gnn_sp(net, m_vec, blind, true_kmh))
+
+        # CTH-NODE v9a
+        net = train_v9a_sp(m_vec, sp, seed_offset=si)
+        sparsity_raw['CTH-NODE v9a'][sp].append(eval_v9a_sp(net, m_vec, blind, true_kmh))
+
+        for mn in SWEEP_MODELS_LIST:
+            r = sparsity_raw[mn][sp][-1]
+            print(f"    {mn:<16}  MAE={r['mae_all']:.3f}  JamMAE={r['mae_jam']:.3f}")
+
+# ── Aggregate mean ± std ──────────────────────────────────────────────────────
+def sp_mean(model, sp, key):
+    vals = [r[key] for r in sparsity_raw[model][sp]]
+    return float(np.mean(vals)), float(np.std(vals))
 
 # ── Summary table ─────────────────────────────────────────────────────────────
-print("\n" + "=" * 80)
-print("  MULTI-SPARSITY RESULTS — MAE all (km/h)")
-print(f"  {'Model':<16}" + "".join(f"  {int(s*100)}%miss" for s in SPARSITY_LEVELS))
-print("  " + "-" * 60)
-for mname in ['Hist. Avg', 'GRIN', 'HSTGCN', 'GCASTN', 'CTH-NODE v9a']:
-    row = f"  {mname:<16}"
-    for sp in SPARSITY_LEVELS:
-        v = sparsity_results.get(mname, {}).get(sp, {}).get('mae_all', float('nan'))
-        row += f"  {v:>7.3f}"
-    print(row)
+for metric_key, metric_label in [('mae_all', 'MAE all'), ('mae_jam', 'MAE jam')]:
+    print("\n" + "=" * 90)
+    print(f"  MULTI-SPARSITY RESULTS — {metric_label} (km/h)  [mean ± std over {SWEEP_N_SEEDS} seeds]")
+    print(f"  {'Model':<16}" + "".join(f"  {int(s*100):>3}%miss      " for s in SPARSITY_LEVELS))
+    print("  " + "-" * 80)
+    for mname in SWEEP_MODELS_LIST:
+        row = f"  {mname:<16}"
+        for sp in SPARSITY_LEVELS:
+            mu, sd = sp_mean(mname, sp, metric_key)
+            row += f"  {mu:.3f}±{sd:.3f}"
+        print(row)
+print("=" * 90)
 
-print()
-print("  MULTI-SPARSITY RESULTS — MAE jam (km/h)")
-print(f"  {'Model':<16}" + "".join(f"  {int(s*100)}%miss" for s in SPARSITY_LEVELS))
-print("  " + "-" * 60)
-for mname in ['Hist. Avg', 'GRIN', 'HSTGCN', 'GCASTN', 'CTH-NODE v9a']:
-    row = f"  {mname:<16}"
-    for sp in SPARSITY_LEVELS:
-        v = sparsity_results.get(mname, {}).get(sp, {}).get('mae_jam', float('nan'))
-        row += f"  {v:>7.3f}"
-    print(row)
-print("=" * 80)
-
-# ── Publication figure: multi-sparsity line chart ─────────────────────────────
-fig_sp, axes_sp = plt.subplots(1, 2, figsize=(12, 5), dpi=130)
-sp_x      = [int(s * 100) for s in SPARSITY_LEVELS]
+# ── Publication figure: mean line + std shaded band ───────────────────────────
+fig_sp, axes_sp = plt.subplots(1, 2, figsize=(13, 5), dpi=130)
+sp_x       = [int(s * 100) for s in SPARSITY_LEVELS]
 palette_sp = {'Hist. Avg': '#aaaaaa', 'GRIN': '#4878d0', 'HSTGCN': '#ee854a',
-              'GCASTN': '#6acc65', 'CTH-NODE v9a': '#d65f5f'}
+               'GCASTN': '#6acc65', 'CTH-NODE v9a': '#d65f5f'}
 markers_sp = {'Hist. Avg': 's', 'GRIN': 'o', 'HSTGCN': '^',
-              'GCASTN': 'D', 'CTH-NODE v9a': '*'}
+               'GCASTN': 'D', 'CTH-NODE v9a': '*'}
 
-for mname in ['Hist. Avg', 'GRIN', 'HSTGCN', 'GCASTN', 'CTH-NODE v9a']:
-    mae_vals = [sparsity_results.get(mname, {}).get(sp, {}).get('mae_all', np.nan)
-                for sp in SPARSITY_LEVELS]
-    jam_vals = [sparsity_results.get(mname, {}).get(sp, {}).get('mae_jam', np.nan)
-                for sp in SPARSITY_LEVELS]
-    lw  = 2.5 if mname == 'CTH-NODE v9a' else 1.5
-    ms  = 10  if mname == 'CTH-NODE v9a' else 7
-    axes_sp[0].plot(sp_x, mae_vals, color=palette_sp[mname],
-                    marker=markers_sp[mname], linewidth=lw, markersize=ms, label=mname)
-    axes_sp[1].plot(sp_x, jam_vals, color=palette_sp[mname],
-                    marker=markers_sp[mname], linewidth=lw, markersize=ms, label=mname)
+for mname in SWEEP_MODELS_LIST:
+    for ax_i, key in enumerate(['mae_all', 'mae_jam']):
+        mu_vals = [sp_mean(mname, sp, key)[0] for sp in SPARSITY_LEVELS]
+        sd_vals = [sp_mean(mname, sp, key)[1] for sp in SPARSITY_LEVELS]
+        mu_arr  = np.array(mu_vals)
+        sd_arr  = np.array(sd_vals)
+        lw  = 2.5 if mname == 'CTH-NODE v9a' else 1.5
+        ms  = 10  if mname == 'CTH-NODE v9a' else 7
+        col = palette_sp[mname]
+        axes_sp[ax_i].plot(sp_x, mu_arr, color=col,
+                           marker=markers_sp[mname], linewidth=lw, markersize=ms,
+                           label=mname, zorder=3)
+        axes_sp[ax_i].fill_between(sp_x, mu_arr - sd_arr, mu_arr + sd_arr,
+                                   color=col, alpha=0.15, zorder=2)
 
 for ax, title, ylabel in zip(
         axes_sp,
@@ -3693,8 +3688,9 @@ for ax, title, ylabel in zip(
     ax.grid(axis='y', alpha=0.3)
     ax.spines[['top', 'right']].set_visible(False)
 
-fig_sp.suptitle('Robustness to Missing Rate — PEMS04 (307 nodes, t=4500-4950)',
-                fontsize=12, fontweight='bold', y=1.02)
+fig_sp.suptitle(
+    f'Robustness to Missing Rate — PEMS04  (mean ± std, {SWEEP_N_SEEDS} seeds)',
+    fontsize=12, fontweight='bold', y=1.02)
 fig_sp.tight_layout()
 fig_sp.savefig('fig_pub_06_sparsity_sweep.png', dpi=150, bbox_inches='tight')
 print("Saved: fig_pub_06_sparsity_sweep.png")
