@@ -3169,11 +3169,11 @@ print(f"{len(results_table)} unique models")
 # Sort by MAE all (ascending)
 results_table_sorted = sorted(results_table, key=lambda r: r['mae_all'])
 
-print("\n" + "=" * 90)
+print("\n" + "=" * 120)
 print("  COMPREHENSIVE BASELINE COMPARISON — PEMS04  |  80% blind nodes  |  test t=4500–4950")
-print("=" * 90)
-print(f"  {'Model':<26} {'MAE all':>9} {'MAE jam':>9} {'Prec':>7} {'Rec':>7} {'F1':>7} {'SSIM':>7}")
-print("  " + "-"*86)
+print("=" * 120)
+print(f"  {'Model':<28} {'MAE all':>8} {'RMSE':>8} {'R²':>8} {'MAE jam':>8} {'F1':>7} {'SSIM':>7}")
+print("  " + "-"*118)
 
 tier_labels = {
     'Global Mean':           'T1',
@@ -3192,31 +3192,35 @@ tier_labels = {
     'GCASTN':                'T3',
     'GCASTN+':               'T3',
     'ADGCN':                 'T3',
-    'Graph-CTH-NODE v9a (fusion only)':      'Ours',
-    'Graph-CTH-NODE v9c (aligned loss only)': 'Ours',
+    'Graph-CTH-NODE v9a (balanced loss)':      'Ours',
+    'Graph-CTH-NODE v9c (balanced loss)': 'Ours',
 }
 
 for r in results_table_sorted:
     tier  = tier_labels.get(r['model'], '')
-    flag  = ' ◀' if r['model'] == 'Graph-CTH-NODE v9a (fusion only)' else ''
-    print(f"  [{tier:<4}] {r['model']:<21} "
-          f"{r['mae_all']:>9.2f} {r['mae_jam']:>9.2f} "
-          f"{r['prec']:>7.3f} {r['rec']:>7.3f} {r['f1']:>7.3f} "
-          f"{r['ssim']:>7.3f}{flag}")
+    flag  = ' ◀' if 'v9a' in r['model'] else ''
+    rmse = r.get('rmse_all', r.get('mae_all', 0))  # fallback for older entries
+    r2 = r.get('r2_all', 0.0)  # fallback for older entries
+    print(f"  [{tier:<4}] {r['model']:<24} "
+          f"{r['mae_all']:>8.4f} {rmse:>8.4f} {r2:>8.4f} {r['mae_jam']:>8.4f} "
+          f"{r['f1']:>7.3f} {r['ssim']:>7.3f}{flag}")
 
-print("=" * 90)
+print("=" * 120)
 print("  Metric definitions:")
 print("    MAE all : mean absolute error (km/h) on all blind nodes in test window")
+print("    RMSE    : root mean squared error (km/h) — penalizes larger errors more")
+print("    R²      : coefficient of determination (variance explained)")
 print("    MAE jam : MAE restricted to timesteps where true speed < 40 km/h")
-print("    Prec/Rec/F1 : jam detection via speed threshold < 40 km/h on predictions")
+print("    F1      : jam detection F1-score via speed threshold < 40 km/h on predictions")
 print("    SSIM    : structural similarity of spatiotemporal speed field")
 print("  Tier: T1=Statistical  T2=RNN/temporal  T3=GNN imputation  Ours=Graph-CTH-NODE")
-print("=" * 90)
+print("=" * 120)
 
-# Bar chart
-fig2, axes = plt.subplots(1, 3, figsize=(18, 6), dpi=120)
+# Bar chart - 2x2 grid for comprehensive comparison
+fig2, axes = plt.subplots(2, 2, figsize=(16, 10), dpi=120)
 names   = [r['model'] for r in results_table_sorted]
 mae_all = [r['mae_all'] for r in results_table_sorted]
+rmse_all = [r.get('rmse_all', r['mae_all']) for r in results_table_sorted]
 mae_jam = [r['mae_jam'] for r in results_table_sorted]
 f1_vals = [r['f1']      for r in results_table_sorted]
 
@@ -3230,12 +3234,17 @@ for r in results_table_sorted:
 
 short_names = [n.replace('Graph-CTH-NODE ', '').replace('KNN Kriging (k=5)', 'KNN-K')
                .replace('Linear Interpolation', 'Lin.Interp')
-               .replace('Historical Average', 'Hist.Avg') for n in names]
+               .replace('Historical Average', 'Hist.Avg')
+               .replace(' (balanced loss)', '')
+               .replace(' (fusion only)', '')
+               .replace(' (aligned loss only)', '') for n in names]
 
+axes_flat = axes.flatten()
 for ax, vals, title, ylabel in [
-    (axes[0], mae_all, 'MAE — All Blind Nodes (km/h)', 'MAE (km/h)'),
-    (axes[1], mae_jam, 'MAE — Jam Conditions (km/h)',  'MAE (km/h)'),
-    (axes[2], f1_vals, 'Jam Detection F1 (speed<40)',  'F1'),
+    (axes_flat[0], mae_all, 'MAE — All Blind Nodes (km/h)', 'MAE (km/h)'),
+    (axes_flat[1], rmse_all, 'RMSE — All Blind Nodes (km/h)', 'RMSE (km/h)'),
+    (axes_flat[2], mae_jam, 'MAE — Jam Conditions (km/h)',  'MAE (km/h)'),
+    (axes_flat[3], f1_vals, 'Jam Detection F1 (speed<40)',  'F1'),
 ]:
     bars = ax.bar(range(len(vals)), vals, color=colors, edgecolor='white', linewidth=0.5)
     ax.set_xticks(range(len(vals)))
