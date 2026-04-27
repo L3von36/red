@@ -2023,9 +2023,12 @@ print(f"   Tier 2 complete — {len(results_table)} entries in results_table.")
 #   GCASTN (Liu et al. 2023)  — graph convolution + attention + ST context
 #   ADGCN  (Chen et al. 2023) — adaptive diffusion GCN, tested on PEMS04
 #
-#   All models use adj_sym as the static graph. Training: t=0–4000.
-#   Each model takes [N, T, F] input where F=1 (speed only) with a binary
-#   mask indicating observed nodes. Output: [N, T, 1] imputed speed.
+#   See CELL 11b for Tier 4: recent 2024-2025 models (ImputeFormer, HSTGCN,
+#   Casper, MagiNet).
+#
+#   All models use adj_sym as the static graph. Training: t=0-4000.
+#   Each model takes [N, T] input with binary mask (observed=1).
+#   Output: [N, T] imputed speed (normalized).
 # =============================================================================
 
 GNN_HIDDEN  = 64
@@ -2798,6 +2801,214 @@ eval_gnn_baseline(adgcn_net, 'ADGCN')
 print(f"   Tier 3 complete — {len(results_table)} entries in results_table.")
 
 # =============================================================================
+# CELL 11b — Tier 4: Recent 2024-2025 GNN imputation models
+#
+#   ImputeFormer (Nie et al., KDD 2024) — low-rank Transformer for ST imputation
+#   HSTGCN       (Chen et al., Info Fusion 2024) — hierarchical ST graph conv
+#   Casper       (Wang et al., arXiv 2403.11960) — causality-aware ST-GNN
+#   MagiNet      (Liang et al., ACM TKDD 2025)  — mask-aware graph imputation
+# =============================================================================
+
+# ─── ImputeFormer ────────────────────────────────────────────────────────────
+class ImputeFormer(nn.Module):
+    """
+    ImputeFormer (Nie et al., KDD 2024): Low-rankness-induced Transformer.
+    Replaces O(T^2) temporal attention with O(r*T) low-rank projection,
+    then applies spatial cross-node attention at each time step.
+    """
+    def __init__(self, hidden=GNN_HIDDEN, rank=8, n_heads=4):
+        super().__init__()
+        self.inp_proj = nn.Linear(2, hidden)
+        self.t_down   = nn.Linear(hidden, rank)
+        self.t_up     = nn.Linear(rank, hidden)
+        self.sp_attn  = nn.MultiheadAttention(hidden, n_heads, batch_first=True, dropout=0.1)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden, hidden * 2), nn.GELU(), nn.Linear(hidden * 2, hidden)
+        )
+        self.norm1 = nn.LayerNorm(hidden)
+        self.norm2 = nn.LayerNorm(hidden)
+        self.norm3 = nn.LayerNorm(hidden)
+        self.out   = nn.Linear(hidden, 1)
+
+    def _forward(self, x, m):
+        N, T = x.shape
+        h = self.inp_proj(torch.stack([x, m], dim=-1))   # [N, T, H]
+        # Low-rank temporal mixing
+        h_lr = F.gelu(self.t_down(h))                     # [N, T, r]
+        h = self.norm1(h + self.t_up(h_lr))               # [N, T, H]
+        # Spatial attention: at each step nodes attend over all nodes
+        h_s = h.permute(1, 0, 2)                          # [T, N, H]
+        h_s2, _ = self.sp_attn(h_s, h_s, h_s)
+        h = self.norm2(h + h_s2.permute(1, 0, 2))         # [N, T, H]
+        h = self.norm3(h + self.ffn(h))
+        return self.out(h).squeeze(-1)                     # [N, T]
+
+    def training_step(self, x, m):
+        p = self._forward(x, m)
+        return F.mse_loss(p[m == 1], x[m == 1])
+
+    def impute(self, x, m):
+        p = self._forward(x, m)
+        return m * x + (1 - m) * p
+
+print("\nTraining ImputeFormer...")
+imputeformer_net = train_gnn_baseline(ImputeFormer, 'ImputeFormer')
+eval_gnn_baseline(imputeformer_net, 'ImputeFormer')
+
+# ─── HSTGCN ──────────────────────────────────────────────────────────────────
+class HSTGCN(nn.Module):
+    """
+    HSTGCN (Chen et al., Information Fusion 2024): Hierarchical ST-GCN.
+    Two-scale processing: (1) node-level ChebConv, (2) soft cluster pooling
+    with cluster-level linear mixing, then upsample and fuse via GRU.
+    """
+    def __init__(self, hidden=GNN_HIDDEN, n_clusters=32):
+        super().__init__()
+        self.enc          = nn.Linear(2, hidden)
+        self.gcn_node     = ChebConv(hidden, hidden, K=2)
+        self.cluster_proj = nn.Linear(hidden, n_clusters, bias=False)
+        self.cluster_mix  = nn.Linear(n_clusters, n_clusters)
+        self.gru          = nn.GRUCell(hidden * 2, hidden)
+        self.out          = nn.Linear(hidden, 1)
+        self.act          = nn.ReLU()
+
+    def _forward(self, x, m):
+        N, T = x.shape
+        h = torch.zeros(N, self.gru.hidden_size, device=x.device)
+        preds = []
+        for t in range(T):
+            inp = torch.stack([x[:, t], m[:, t]], dim=-1)   # [N, 2]
+            f   = self.act(self.enc(inp))                    # [N, H]
+            fn  = self.act(self.gcn_node(f))                 # [N, H] node-level GCN
+            # Soft cluster assignment [N, K]
+            S   = torch.softmax(self.cluster_proj(fn), dim=-1)
+            # Cluster features and mixing [K, H]
+            fc  = self.act(self.cluster_mix(S.T)) @ fn       # [K, H]
+            # Upsample back to nodes and fuse
+            fn2 = S @ fc                                     # [N, H]
+            h   = self.gru(torch.cat([fn, fn2], dim=-1), h)
+            preds.append(self.out(h).squeeze(-1))
+        return torch.stack(preds, dim=1)                     # [N, T]
+
+    def training_step(self, x, m):
+        p = self._forward(x, m)
+        return F.mse_loss(p[m == 1], x[m == 1])
+
+    def impute(self, x, m):
+        p = self._forward(x, m)
+        return m * x + (1 - m) * p
+
+print("\nTraining HSTGCN...")
+hstgcn_net = train_gnn_baseline(HSTGCN, 'HSTGCN')
+eval_gnn_baseline(hstgcn_net, 'HSTGCN')
+
+# ─── Casper ──────────────────────────────────────────────────────────────────
+class Casper(nn.Module):
+    """
+    Casper (Wang et al., arXiv 2403.11960, 2024): Causality-Aware ST-GNN.
+    Spatiotemporal Causal Attention (SCA) discovers sparse causal edges;
+    Prompt-Based Decoder (PBD) cross-attends learned prompts to suppress
+    non-causal confounders.
+    """
+    def __init__(self, hidden=GNN_HIDDEN, n_heads=4, n_prompts=16):
+        super().__init__()
+        self.hidden    = hidden
+        self.enc       = nn.Linear(2, hidden)
+        enc_layer      = nn.TransformerEncoderLayer(
+            hidden, nhead=n_heads, dim_feedforward=hidden * 2,
+            dropout=0.1, batch_first=True)
+        self.t_enc     = nn.TransformerEncoder(enc_layer, num_layers=1)
+        self.causal_W  = nn.Linear(hidden, hidden // 4)
+        self.prompts   = nn.Parameter(torch.randn(n_prompts, hidden) * 0.02)
+        self.cross_attn = nn.MultiheadAttention(hidden, n_heads, batch_first=True)
+        self.norm      = nn.LayerNorm(hidden)
+        self.out       = nn.Linear(hidden, 1)
+        self.act       = nn.GELU()
+
+    def _causal_adj(self, h_mean):
+        # h_mean: [N, H] -> sparse causal adjacency [N, N]
+        e      = self.causal_W(h_mean)                          # [N, H/4]
+        scores = torch.mm(e, e.T) / (e.size(1) ** 0.5)         # [N, N]
+        topk   = max(1, int(scores.size(0) * 0.2))
+        thresh = scores.topk(topk, dim=-1).values[:, -1:]
+        mask   = (scores >= thresh).float()
+        A      = torch.softmax(scores * mask + (1 - mask) * (-1e9), dim=-1)
+        return A
+
+    def _forward(self, x, m):
+        N, T = x.shape
+        h = self.act(self.enc(torch.stack([x, m], dim=-1)))  # [N, T, H]
+        h = self.t_enc(h)                                     # [N, T, H] temporal
+        A = self._causal_adj(h.mean(dim=1))                   # [N, N]
+        # Causal spatial aggregation: A @ h for each time step
+        h_sp = torch.einsum('ij,jth->ith', A, h)             # [N, T, H]
+        h    = self.norm(h + h_sp)
+        # Prompt-based decoder: suppress confounders via cross-attention
+        prompts     = self.prompts.unsqueeze(0).expand(N, -1, -1)  # [N, P, H]
+        h, _        = self.cross_attn(h, prompts, prompts)
+        return self.out(h).squeeze(-1)                        # [N, T]
+
+    def training_step(self, x, m):
+        p = self._forward(x, m)
+        return F.mse_loss(p[m == 1], x[m == 1])
+
+    def impute(self, x, m):
+        p = self._forward(x, m)
+        return m * x + (1 - m) * p
+
+print("\nTraining Casper...")
+casper_net = train_gnn_baseline(Casper, 'Casper')
+eval_gnn_baseline(casper_net, 'Casper')
+
+# ─── MagiNet ─────────────────────────────────────────────────────────────────
+class MagiNet(nn.Module):
+    """
+    MagiNet (Liang et al., ACM TKDD 2025): Mask-Aware Graph Imputation Network.
+    Conditions graph message passing on mask status: separate ChebConv paths
+    for observed vs missing sender nodes, then gated fusion + GRU.
+    """
+    def __init__(self, hidden=GNN_HIDDEN):
+        super().__init__()
+        self.mask_emb  = nn.Embedding(2, hidden // 4)
+        self.enc       = nn.Linear(1 + hidden // 4, hidden)
+        self.gcn_obs   = ChebConv(hidden, hidden, K=2)
+        self.gcn_miss  = ChebConv(hidden, hidden, K=2)
+        self.gate      = nn.Linear(hidden * 2, hidden)
+        self.gru       = nn.GRUCell(hidden, hidden)
+        self.out       = nn.Linear(hidden, 1)
+        self.act       = nn.ReLU()
+
+    def _forward(self, x, m):
+        N, T = x.shape
+        h = torch.zeros(N, self.gru.hidden_size, device=x.device)
+        preds = []
+        for t in range(T):
+            me   = self.mask_emb(m[:, t].long())                     # [N, H/4]
+            f    = self.act(self.enc(torch.cat([x[:, t:t+1], me], -1)))  # [N, H]
+            mo   = m[:, t:t+1]                                       # [N, 1]
+            agg_obs  = self.act(self.gcn_obs(f * mo))
+            agg_miss = self.act(self.gcn_miss(f * (1 - mo)))
+            g    = torch.sigmoid(self.gate(torch.cat([agg_obs, agg_miss], -1)))
+            agg  = g * agg_obs + (1 - g) * agg_miss
+            h    = self.gru(agg, h)
+            preds.append(self.out(h).squeeze(-1))
+        return torch.stack(preds, dim=1)                             # [N, T]
+
+    def training_step(self, x, m):
+        p = self._forward(x, m)
+        return F.mse_loss(p[m == 1], x[m == 1])
+
+    def impute(self, x, m):
+        p = self._forward(x, m)
+        return m * x + (1 - m) * p
+
+print("\nTraining MagiNet...")
+maginet_net = train_gnn_baseline(MagiNet, 'MagiNet')
+eval_gnn_baseline(maginet_net, 'MagiNet')
+
+print(f"   Tier 4 complete — {len(results_table)} entries in results_table.")
+
+# =============================================================================
 # CELL 12 — Final comparison table + bar chart
 # =============================================================================
 
@@ -2835,6 +3046,10 @@ tier_labels = {
     'DGCRIN':                'T3',
     'GCASTN':                'T3',
     'ADGCN':                 'T3',
+    'ImputeFormer':          'T4',
+    'HSTGCN':                'T4',
+    'Casper':                'T4',
+    'MagiNet':               'T4',
     'Graph-CTH-NODE v9a (balanced loss)':        'Ours',
     'Graph-CTH-NODE v9a (Seed 5 Production)':    'Ours',
 }
@@ -2856,7 +3071,7 @@ print("    R²      : coefficient of determination (variance explained)")
 print("    MAE jam : MAE restricted to timesteps where true speed < 40 km/h")
 print("    F1      : jam detection F1-score via speed threshold < 40 km/h on predictions")
 print("    SSIM    : structural similarity of spatiotemporal speed field")
-print("  Tier: T1=Statistical  T2=RNN/temporal  T3=GNN imputation  Ours=Graph-CTH-NODE")
+print("  Tier: T1=Statistical  T2=RNN/temporal  T3=GNN imputation  T4=Recent 2024-2025  Ours=Graph-CTH-NODE")
 print("=" * 120)
 
 # Bar chart - 2x2 grid for comprehensive comparison
