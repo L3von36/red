@@ -3437,3 +3437,246 @@ def plot_publication_figures(results_table_sorted, v9a_pred_kmh_pub, true_eval_k
 v9a_pred_for_pub = v9a_pred_kmh if 'v9a_pred_kmh' in dir() else None
 plot_publication_figures(results_table_sorted, v9a_pred_for_pub, true_eval_kmh)
 print("=" * 90)
+
+# =============================================================================
+# CELL 16 — Multi-Sparsity Robustness Ablation
+#   Trains and evaluates 5 key models at 40%, 60%, 80%, 90% blind node rates.
+#   Shows that Graph-CTH-NODE v9a retains superiority across all missing rates.
+# =============================================================================
+
+SPARSITY_LEVELS = [0.40, 0.60, 0.80, 0.90]
+SP_GNN_EPOCHS   = 150    # reduced from 300 for sweep speed
+SP_V9A_EPOCHS   = 300    # reduced from 600 for sweep speed
+SWEEP_SEED_BASE = 77777
+
+print("\n" + "=" * 80)
+print("  MULTI-SPARSITY ROBUSTNESS SWEEP  (40 / 60 / 80 / 90 % blind nodes)")
+print("=" * 80)
+
+
+def make_blind_setup(sparsity):
+    """Consistent blind mask + ground-truth km/h for a given sparsity level."""
+    rng    = np.random.RandomState(SWEEP_SEED_BASE + int(sparsity * 1000))
+    n_bl   = int(NUM_NODES * sparsity)
+    blind  = rng.choice(NUM_NODES, n_bl, replace=False)
+    obs    = np.setdiff1d(np.arange(NUM_NODES), blind)
+    m_vec  = torch.zeros(NUM_NODES, dtype=torch.float32, device=device)
+    m_vec[obs] = 1.0
+    true_kmh = np.zeros((len(blind), _T_eval), dtype=np.float32)
+    for ni, n in enumerate(blind):
+        true_kmh[ni] = speed_np[EVAL_START:EVAL_START + _T_eval, n] * node_stds[n] + node_means[n]
+    return m_vec, blind, obs, true_kmh
+
+
+def train_gnn_sp(model_cls, name, m_vec, sparsity, epochs=SP_GNN_EPOCHS):
+    seed = abs(hash(f"{name}_{sparsity:.2f}")) % (2**31)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    net = model_cls().to(device)
+    opt = torch.optim.Adam(net.parameters(), lr=GNN_LR, weight_decay=1e-4)
+    best_vloss, best_wts, patience_ctr = float('inf'), None, 0
+    m_v = m_vec.unsqueeze(1).expand(-1, VAL_END - VAL_START)
+    for ep in range(1, epochs + 1):
+        net.train()
+        t0     = np.random.randint(0, TRAIN_END - GNN_BATCH)
+        x_full = torch.tensor(speed_np[t0:t0+GNN_BATCH], dtype=torch.float32).T.to(device)
+        m_t    = (torch.rand(NUM_NODES, 1, device=device) > sparsity).float().expand(-1, GNN_BATCH)
+        loss   = net.training_step(x_full, m_t)
+        if torch.isnan(loss) or torch.isinf(loss):
+            return train_gnn_sp(model_cls, name, m_vec, sparsity, epochs)
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+        opt.step()
+        if ep % 50 == 0:
+            net.eval()
+            with torch.no_grad():
+                x_v = torch.tensor(speed_np[VAL_START:VAL_END], dtype=torch.float32).T.to(device)
+                vl  = net.training_step(x_v, m_v).item()
+            if vl < best_vloss:
+                best_vloss, best_wts, patience_ctr = vl, copy.deepcopy(net.state_dict()), 0
+            else:
+                patience_ctr += 1
+            if patience_ctr >= 3:
+                break
+    if best_wts:
+        net.load_state_dict(best_wts)
+    return net
+
+
+def train_v9a_sp(m_vec, sparsity, epochs=SP_V9A_EPOCHS):
+    torch.manual_seed(PRODUCTION_SEED)
+    np.random.seed(PRODUCTION_SEED)
+    net = GraphCTHNodeV9a(hidden=64, include_tod=True,
+                          jam_loss_weight=PRODUCTION_JAM_WEIGHT,
+                          free_loss_weight=PRODUCTION_FREE_WEIGHT,
+                          use_soft_threshold=False).to(device)
+    opt = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
+    best_vloss, best_wts, patience_ctr = float('inf'), None, 0
+    m_v = m_vec.unsqueeze(1).expand(-1, VAL_END - VAL_START)
+    for ep in range(1, epochs + 1):
+        net.train()
+        t0     = np.random.randint(0, TRAIN_END - BATCH_TIME)
+        x_full = torch.tensor(speed_np[t0:t0+BATCH_TIME], dtype=torch.float32).T.to(device)
+        m_t    = (torch.rand(NUM_NODES, 1, device=device) > sparsity).float().expand(-1, BATCH_TIME)
+        slots  = (np.arange(t0, t0 + BATCH_TIME) % 288).astype(int)
+        tf     = torch.tensor(tod_free_np[:, slots], dtype=torch.float32).to(device)
+        tj     = torch.tensor(tod_jam_np[:,  slots], dtype=torch.float32).to(device)
+        loss   = net.training_step(x_full, m_t, tf, tj)
+        if torch.isnan(loss) or torch.isinf(loss):
+            return train_v9a_sp(m_vec, sparsity, epochs)
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+        opt.step()
+        if ep % 50 == 0:
+            net.eval()
+            with torch.no_grad():
+                x_v     = torch.tensor(speed_np[VAL_START:VAL_END], dtype=torch.float32).T.to(device)
+                sl_v    = (np.arange(VAL_START, VAL_END) % 288).astype(int)
+                tf_v    = torch.tensor(tod_free_np[:, sl_v], dtype=torch.float32).to(device)
+                tj_v    = torch.tensor(tod_jam_np[:,  sl_v], dtype=torch.float32).to(device)
+                vl      = net.training_step(x_v, m_v, tf_v, tj_v).item()
+            if vl < best_vloss:
+                best_vloss, best_wts, patience_ctr = vl, copy.deepcopy(net.state_dict()), 0
+            else:
+                patience_ctr += 1
+            if patience_ctr >= 3:
+                break
+    if best_wts:
+        net.load_state_dict(best_wts)
+    return net
+
+
+def eval_gnn_sp(net, m_vec, blind, true_kmh):
+    net.eval()
+    x_e = torch.tensor(speed_np[EVAL_START:EVAL_START + _T_eval], dtype=torch.float32).T.to(device)
+    m_e = m_vec.unsqueeze(1).expand(-1, _T_eval)
+    with torch.no_grad():
+        p_e = net.impute(x_e, m_e).cpu().numpy()
+    pred_kmh = np.zeros((len(blind), _T_eval), dtype=np.float32)
+    for ni, n in enumerate(blind):
+        pred_kmh[ni] = np.clip(p_e[n] * node_stds[n] + node_means[n], 0, 120)
+    return eval_pred_np(pred_kmh, true_kmh)
+
+
+def eval_v9a_sp(net, m_vec, blind, true_kmh):
+    net.eval()
+    x_e  = torch.tensor(speed_np[EVAL_START:EVAL_START + _T_eval], dtype=torch.float32).T.to(device)
+    m_e  = m_vec.unsqueeze(1).expand(-1, _T_eval)
+    si   = np.arange(EVAL_START, EVAL_START + _T_eval) % 288
+    tf_e = torch.tensor(tod_free_np[:, si], dtype=torch.float32).to(device)
+    tj_e = torch.tensor(tod_jam_np[:,  si], dtype=torch.float32).to(device)
+    with torch.no_grad():
+        p_e = net.impute(x_e, m_e, tf_e, tj_e).cpu().numpy()
+    pred_kmh = np.zeros((len(blind), _T_eval), dtype=np.float32)
+    for ni, n in enumerate(blind):
+        pred_kmh[ni] = np.clip(p_e[n] * node_stds[n] + node_means[n], 0, 120)
+    return eval_pred_np(pred_kmh, true_kmh)
+
+
+# ── Main sweep loop ───────────────────────────────────────────────────────────
+sparsity_results = {}   # {model_name: {sparsity_float: metrics_dict}}
+
+for sp in SPARSITY_LEVELS:
+    sp_pct = int(sp * 100)
+    m_vec, blind, obs, true_kmh = make_blind_setup(sp)
+    print(f"\n--- Sparsity {sp_pct}%  (blind={len(blind)}, observed={len(obs)}) ---")
+
+    # Historical Average
+    ha_pred = node_means[blind][:, None] * np.ones((len(blind), _T_eval), dtype=np.float32)
+    r = eval_pred_np(ha_pred, true_kmh)
+    sparsity_results.setdefault('Hist. Avg', {})[sp] = r
+    print(f"  Hist. Avg  MAE={r['mae_all']:.3f}  JamMAE={r['mae_jam']:.3f}")
+
+    # GRIN
+    print(f"  Training GRIN @ {sp_pct}%...")
+    net = train_gnn_sp(GRIN, 'GRIN', m_vec, sp)
+    r   = eval_gnn_sp(net, m_vec, blind, true_kmh)
+    sparsity_results.setdefault('GRIN', {})[sp] = r
+    print(f"  GRIN       MAE={r['mae_all']:.3f}  JamMAE={r['mae_jam']:.3f}")
+
+    # HSTGCN
+    print(f"  Training HSTGCN @ {sp_pct}%...")
+    net = train_gnn_sp(HSTGCN, 'HSTGCN', m_vec, sp)
+    r   = eval_gnn_sp(net, m_vec, blind, true_kmh)
+    sparsity_results.setdefault('HSTGCN', {})[sp] = r
+    print(f"  HSTGCN     MAE={r['mae_all']:.3f}  JamMAE={r['mae_jam']:.3f}")
+
+    # GCASTN
+    print(f"  Training GCASTN @ {sp_pct}%...")
+    net = train_gnn_sp(GCASTN, 'GCASTN', m_vec, sp)
+    r   = eval_gnn_sp(net, m_vec, blind, true_kmh)
+    sparsity_results.setdefault('GCASTN', {})[sp] = r
+    print(f"  GCASTN     MAE={r['mae_all']:.3f}  JamMAE={r['mae_jam']:.3f}")
+
+    # Graph-CTH-NODE v9a (ours)
+    print(f"  Training CTH-NODE v9a @ {sp_pct}%...")
+    net = train_v9a_sp(m_vec, sp)
+    r   = eval_v9a_sp(net, m_vec, blind, true_kmh)
+    sparsity_results.setdefault('CTH-NODE v9a', {})[sp] = r
+    print(f"  CTH-NODE   MAE={r['mae_all']:.3f}  JamMAE={r['mae_jam']:.3f}")
+
+# ── Summary table ─────────────────────────────────────────────────────────────
+print("\n" + "=" * 80)
+print("  MULTI-SPARSITY RESULTS — MAE all (km/h)")
+print(f"  {'Model':<16}" + "".join(f"  {int(s*100)}%miss" for s in SPARSITY_LEVELS))
+print("  " + "-" * 60)
+for mname in ['Hist. Avg', 'GRIN', 'HSTGCN', 'GCASTN', 'CTH-NODE v9a']:
+    row = f"  {mname:<16}"
+    for sp in SPARSITY_LEVELS:
+        v = sparsity_results.get(mname, {}).get(sp, {}).get('mae_all', float('nan'))
+        row += f"  {v:>7.3f}"
+    print(row)
+
+print()
+print("  MULTI-SPARSITY RESULTS — MAE jam (km/h)")
+print(f"  {'Model':<16}" + "".join(f"  {int(s*100)}%miss" for s in SPARSITY_LEVELS))
+print("  " + "-" * 60)
+for mname in ['Hist. Avg', 'GRIN', 'HSTGCN', 'GCASTN', 'CTH-NODE v9a']:
+    row = f"  {mname:<16}"
+    for sp in SPARSITY_LEVELS:
+        v = sparsity_results.get(mname, {}).get(sp, {}).get('mae_jam', float('nan'))
+        row += f"  {v:>7.3f}"
+    print(row)
+print("=" * 80)
+
+# ── Publication figure: multi-sparsity line chart ─────────────────────────────
+fig_sp, axes_sp = plt.subplots(1, 2, figsize=(12, 5), dpi=130)
+sp_x      = [int(s * 100) for s in SPARSITY_LEVELS]
+palette_sp = {'Hist. Avg': '#aaaaaa', 'GRIN': '#4878d0', 'HSTGCN': '#ee854a',
+              'GCASTN': '#6acc65', 'CTH-NODE v9a': '#d65f5f'}
+markers_sp = {'Hist. Avg': 's', 'GRIN': 'o', 'HSTGCN': '^',
+              'GCASTN': 'D', 'CTH-NODE v9a': '*'}
+
+for mname in ['Hist. Avg', 'GRIN', 'HSTGCN', 'GCASTN', 'CTH-NODE v9a']:
+    mae_vals = [sparsity_results.get(mname, {}).get(sp, {}).get('mae_all', np.nan)
+                for sp in SPARSITY_LEVELS]
+    jam_vals = [sparsity_results.get(mname, {}).get(sp, {}).get('mae_jam', np.nan)
+                for sp in SPARSITY_LEVELS]
+    lw  = 2.5 if mname == 'CTH-NODE v9a' else 1.5
+    ms  = 10  if mname == 'CTH-NODE v9a' else 7
+    axes_sp[0].plot(sp_x, mae_vals, color=palette_sp[mname],
+                    marker=markers_sp[mname], linewidth=lw, markersize=ms, label=mname)
+    axes_sp[1].plot(sp_x, jam_vals, color=palette_sp[mname],
+                    marker=markers_sp[mname], linewidth=lw, markersize=ms, label=mname)
+
+for ax, title, ylabel in zip(
+        axes_sp,
+        ['Overall MAE vs Missing Rate', 'Congestion MAE vs Missing Rate'],
+        ['MAE (km/h)', 'Jam MAE (km/h)']):
+    ax.set_xlabel('Missing rate (%)', fontsize=11)
+    ax.set_ylabel(ylabel, fontsize=11)
+    ax.set_title(title, fontsize=12, fontweight='bold')
+    ax.set_xticks(sp_x)
+    ax.set_xticklabels([f'{s}%' for s in sp_x])
+    ax.legend(fontsize=9, frameon=False)
+    ax.grid(axis='y', alpha=0.3)
+    ax.spines[['top', 'right']].set_visible(False)
+
+fig_sp.suptitle('Robustness to Missing Rate — PEMS04 (307 nodes, t=4500-4950)',
+                fontsize=12, fontweight='bold', y=1.02)
+fig_sp.tight_layout()
+fig_sp.savefig('fig_pub_06_sparsity_sweep.png', dpi=150, bbox_inches='tight')
+print("Saved: fig_pub_06_sparsity_sweep.png")
+print("=" * 90)
