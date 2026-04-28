@@ -3263,14 +3263,13 @@ def plot_publication_figures(results_table_sorted, v9a_pred_kmh_pub, true_eval_k
 
     # Filter to top 10 by MAE for readability
     top10 = results_table_sorted[:10]
-    names = [r['model'].replace('DualFlow ', 'CTH-NODE ')
-                       .replace(' (Seed 5 Production)', '')
+    names = [r['model'].replace(' (Seed 5 Production)', '')
                        .replace('KNN Kriging (k=5)', 'KNN-K')
                        .replace('Historical Average', 'Hist.Avg')
                        .replace('Linear Interpolation', 'Lin.Interp')
              for r in top10]
     colors = [tier_color.get(tier_map.get(r['model'], 'T3'), '#1f77b4')
-              if 'v9a' not in r['model']
+              if 'DualFlow' not in r['model']
               else '#d62728'
               for r in top10]
 
@@ -3351,7 +3350,7 @@ def plot_publication_figures(results_table_sorted, v9a_pred_kmh_pub, true_eval_k
             pred_s = v9a_pred_kmh_pub[ni]
             ax3.plot(t_axis, true_s, color='#1f77b4', linewidth=1.5, label='Ground truth', alpha=0.9)
             ax3.plot(t_axis, pred_s, color='#d62728', linewidth=1.2,
-                     linestyle='--', label='CTH-NODE (ours)', alpha=0.9)
+                     linestyle='--', label='DualFlow (ours)', alpha=0.9)
             ax3.fill_between(t_axis, true_s, pred_s, alpha=0.12, color='gray')
             ax3.axhline(40, color='orange', linewidth=0.8, linestyle=':', alpha=0.7, label='Jam threshold (40 km/h)')
             ax3.set_ylabel('Speed (km/h)', fontsize=9)
@@ -3598,7 +3597,7 @@ def eval_v9a_sp(net, m_vec, blind, true_kmh):
 
 # ── Main sweep loop: SWEEP_N_SEEDS blind-mask seeds per sparsity ──────────────
 # sparsity_raw[model][sp] = list of metrics dicts (one per seed)
-SWEEP_MODELS_LIST = ['Hist. Avg', 'GRIN', 'HSTGCN', 'GCASTN', 'CTH-NODE v9a']
+SWEEP_MODELS_LIST = ['Hist. Avg', 'GRIN', 'HSTGCN', 'GCASTN', 'DualFlow']
 sparsity_raw = {m: {sp: [] for sp in SPARSITY_LEVELS} for m in SWEEP_MODELS_LIST}
 
 for sp in SPARSITY_LEVELS:
@@ -3625,9 +3624,9 @@ for sp in SPARSITY_LEVELS:
         net = train_gnn_sp(GCASTN, 'GCASTN', m_vec, sp, seed_offset=si)
         sparsity_raw['GCASTN'][sp].append(eval_gnn_sp(net, m_vec, blind, true_kmh))
 
-        # CTH-NODE v9a
+        # DualFlow
         net = train_v9a_sp(m_vec, sp, seed_offset=si)
-        sparsity_raw['CTH-NODE v9a'][sp].append(eval_v9a_sp(net, m_vec, blind, true_kmh))
+        sparsity_raw['DualFlow'][sp].append(eval_v9a_sp(net, m_vec, blind, true_kmh))
 
         for mn in SWEEP_MODELS_LIST:
             r = sparsity_raw[mn][sp][-1]
@@ -3656,9 +3655,9 @@ print("=" * 90)
 fig_sp, axes_sp = plt.subplots(1, 2, figsize=(13, 5), dpi=130)
 sp_x       = [int(s * 100) for s in SPARSITY_LEVELS]
 palette_sp = {'Hist. Avg': '#aaaaaa', 'GRIN': '#4878d0', 'HSTGCN': '#ee854a',
-               'GCASTN': '#6acc65', 'CTH-NODE v9a': '#d65f5f'}
+               'GCASTN': '#6acc65', 'DualFlow': '#d65f5f'}
 markers_sp = {'Hist. Avg': 's', 'GRIN': 'o', 'HSTGCN': '^',
-               'GCASTN': 'D', 'CTH-NODE v9a': '*'}
+               'GCASTN': 'D', 'DualFlow': '*'}
 
 for mname in SWEEP_MODELS_LIST:
     for ax_i, key in enumerate(['mae_all', 'mae_jam']):
@@ -3666,8 +3665,8 @@ for mname in SWEEP_MODELS_LIST:
         sd_vals = [sp_mean(mname, sp, key)[1] for sp in SPARSITY_LEVELS]
         mu_arr  = np.array(mu_vals)
         sd_arr  = np.array(sd_vals)
-        lw  = 2.5 if mname == 'CTH-NODE v9a' else 1.5
-        ms  = 10  if mname == 'CTH-NODE v9a' else 7
+        lw  = 2.5 if mname == 'DualFlow' else 1.5
+        ms  = 10  if mname == 'DualFlow' else 7
         col = palette_sp[mname]
         axes_sp[ax_i].plot(sp_x, mu_arr, color=col,
                            marker=markers_sp[mname], linewidth=lw, markersize=ms,
