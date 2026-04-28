@@ -3040,7 +3040,7 @@ print(f"{len(results_table)} unique models")
 results_table_sorted = sorted(results_table, key=lambda r: r['mae_all'])
 
 print("\n" + "=" * 120)
-print("  COMPREHENSIVE BASELINE COMPARISON — PEMS04  |  80% blind nodes  |  test t=4500–4950")
+print(f"  COMPREHENSIVE BASELINE COMPARISON — {DATASET_NAME}  |  80% blind nodes  |  test t=4500–4950")
 print("=" * 120)
 print(f"  {'Model':<28} {'MAE all':>8} {'RMSE':>8} {'R²':>8} {'MAE jam':>8} {'F1':>7} {'SSIM':>7}")
 print("  " + "-"*118)
@@ -3242,12 +3242,12 @@ print("\nGenerating publication figures...")
 
 def plot_publication_figures(results_table_sorted, v9a_pred_kmh_pub, true_eval_kmh):
 
-    OUR_MODEL = next((r['model'] for r in results_table_sorted if 'v9a' in r['model']), None)
-    our_result = next((r for r in results_table_sorted if 'v9a' in r['model']), None)
+    OUR_MODEL = next((r['model'] for r in results_table_sorted if 'DualFlow' in r['model']), None)
+    our_result = next((r for r in results_table_sorted if 'DualFlow' in r['model']), None)
 
     # ── Figure 1: Main Comparison Bar Chart ──────────────────────────────────
     fig1, axes = plt.subplots(1, 3, figsize=(16, 5), dpi=150)
-    fig1.suptitle('DualFlow vs Baselines — PEMS04 (80% blind nodes)',
+    fig1.suptitle(f'DualFlow vs Baselines — {DATASET_NAME} (80% blind nodes)',
                   fontsize=13, fontweight='bold', y=1.02)
 
     tier_color = {
@@ -3688,7 +3688,7 @@ for ax, title, ylabel in zip(
     ax.spines[['top', 'right']].set_visible(False)
 
 fig_sp.suptitle(
-    f'Robustness to Missing Rate — PEMS04  (mean ± std, {SWEEP_N_SEEDS} seeds)',
+    f'Robustness to Missing Rate — {DATASET_NAME}  (mean ± std, {SWEEP_N_SEEDS} seeds)',
     fontsize=12, fontweight='bold', y=1.02)
 fig_sp.tight_layout()
 fig_sp.savefig('fig_pub_06_sparsity_sweep.png', dpi=150, bbox_inches='tight')
