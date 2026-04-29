@@ -2737,8 +2737,13 @@ plot_publication_figures(results_table_sorted, dualflow_pred_for_pub, true_eval_
 print("=" * 90)
 
 # =============================================================================
-# Helper function for ablation study
+# Helper constants and functions for ablation study
 # =============================================================================
+
+SP_GNN_EPOCHS    = 150    # reduced from 300 for sweep speed
+SP_V9A_EPOCHS    = 300    # reduced from 600 for sweep speed
+SWEEP_SEED_BASE  = 77777
+SWEEP_N_SEEDS    = 3      # blind-mask seeds per sparsity level
 
 def make_blind_setup(sparsity, seed_offset=0):
     """Consistent blind mask + ground-truth km/h for a given sparsity level."""
@@ -2873,33 +2878,6 @@ def train_ablation_variant(variant_name, **ablation_kwargs):
     if best_wts:
         net.load_state_dict(best_wts)
     return net
-
-def eval_ablation_variant(net, variant_name):
-    """Evaluate ablation variant using warm-up window"""
-    if net is None:
-        return {'mae_all': 999.0, 'mae_jam': 999.0, 'f1': 0.0, 'r2': 0.0}
-
-    net.eval()
-    ws = max(0, EVAL_START - WARMUP_STEPS)
-    total = (EVAL_START + _T_eval) - ws
-
-    x_e = torch.tensor(speed_np[ws:EVAL_START+_T_eval, :], dtype=torch.float32).T.to(device)
-    m_e = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, total)
-    si = np.arange(ws, EVAL_START + _T_eval) % 288
-    tf_e = torch.tensor(tod_free_np[:, si], dtype=torch.float32).to(device)
-    tj_e = torch.tensor(tod_jam_np[:, si], dtype=torch.float32).to(device)
-
-    with torch.no_grad():
-        p_full = net.impute(x_e, m_e, tf_e, tj_e).cpu().numpy()
-
-    offset = EVAL_START - ws
-    p_e = p_full[:, offset:]
-
-    pred_kmh = np.zeros((len(blind_idx), _T_eval), dtype=np.float32)
-    for ni, n in enumerate(blind_idx):
-        pred_kmh[ni] = np.clip(p_e[n] * node_stds[n] + node_means[n], 0, 120)
-
-    return eval_pred_np(pred_kmh, true_eval_kmh)
 
 # Run ablation study across multiple sparsity levels
 ablation_configs = [
@@ -3061,28 +3039,9 @@ plt.close()
 # =============================================================================
 
 SPARSITY_LEVELS  = [0.40, 0.60, 0.80, 0.90]
-SP_GNN_EPOCHS    = 150    # reduced from 300 for sweep speed
-SP_V9A_EPOCHS    = 300    # reduced from 600 for sweep speed
-SWEEP_SEED_BASE  = 77777
-SWEEP_N_SEEDS    = 3      # blind-mask seeds per sparsity level
-
 print("\n" + "=" * 80)
 print("  MULTI-SPARSITY ROBUSTNESS SWEEP  (40 / 60 / 80 / 90 % blind nodes)")
 print("=" * 80)
-
-
-def make_blind_setup(sparsity, seed_offset=0):
-    """Consistent blind mask + ground-truth km/h for a given sparsity level."""
-    rng    = np.random.RandomState(SWEEP_SEED_BASE + int(sparsity * 1000) + seed_offset)
-    n_bl   = int(NUM_NODES * sparsity)
-    blind  = rng.choice(NUM_NODES, n_bl, replace=False)
-    obs    = np.setdiff1d(np.arange(NUM_NODES), blind)
-    m_vec  = torch.zeros(NUM_NODES, dtype=torch.float32, device=device)
-    m_vec[obs] = 1.0
-    true_kmh = np.zeros((len(blind), _T_eval), dtype=np.float32)
-    for ni, n in enumerate(blind):
-        true_kmh[ni] = speed_np[EVAL_START:EVAL_START + _T_eval, n] * node_stds[n] + node_means[n]
-    return m_vec, blind, obs, true_kmh
 
 
 def train_gnn_sp(model_cls, name, m_vec, sparsity, epochs=SP_GNN_EPOCHS, seed_offset=0):
