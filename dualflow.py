@@ -402,17 +402,26 @@ class DualFlowCell(nn.Module):
 
     This cell is an exact replica of GRINPlusPlusCell to preserve what works.
     """
-    def __init__(self, hidden=64, include_tod=True):
+    def __init__(self, hidden=64, include_tod=True, include_4path=True, include_path_mixing=True):
         super().__init__()
         self.include_tod = include_tod
+        self.include_4path = include_4path
+        self.include_path_mixing = include_path_mixing
         self.hidden = hidden
         # 4-path message passing (K=2 like GRIN++)
         msg_in_dim = hidden + 1 + (2 if include_tod else 0)
-        self.msg_sym  = ChebConv(msg_in_dim, hidden, K=2)
-        self.msg_fwd  = ChebConv(msg_in_dim, hidden, K=2)
-        self.msg_bwd  = ChebConv(msg_in_dim, hidden, K=2)
-        self.msg_corr = ChebConv(msg_in_dim, hidden, K=2)
-        self.mix_w = nn.Linear(hidden, 4)
+
+        if include_4path:
+            self.msg_sym  = ChebConv(msg_in_dim, hidden, K=2)
+            self.msg_fwd  = ChebConv(msg_in_dim, hidden, K=2)
+            self.msg_bwd  = ChebConv(msg_in_dim, hidden, K=2)
+            self.msg_corr = ChebConv(msg_in_dim, hidden, K=2)
+            if include_path_mixing:
+                self.mix_w = nn.Linear(hidden, 4)
+        else:
+            # Single path fallback
+            self.msg_sym  = ChebConv(msg_in_dim, hidden, K=2)
+
         # Simple GRU input: [msg, x, m] — no mask_prop, no ToD-in-GRU
         self.gru = nn.GRUCell(hidden + 2, hidden)
         self.out = nn.Linear(hidden, 1)
@@ -429,14 +438,20 @@ class DualFlowCell(nn.Module):
             else:
                 msg_in = torch.cat([h, m_seq[:, t:t+1]], dim=-1)
 
-            m_sym  = self.act(self.msg_sym(msg_in))
-            m_fwd  = self.act(self.msg_fwd(msg_in))
-            m_bwd  = self.act(self.msg_bwd(msg_in))
-            m_corr = self.act(self.msg_corr(msg_in))
+            if self.include_4path:
+                m_sym  = self.act(self.msg_sym(msg_in))
+                m_fwd  = self.act(self.msg_fwd(msg_in))
+                m_bwd  = self.act(self.msg_bwd(msg_in))
+                m_corr = self.act(self.msg_corr(msg_in))
 
-            mix_w = torch.softmax(self.mix_w(h), dim=1)
-            msg = (mix_w[:, 0:1]*m_sym + mix_w[:, 1:2]*m_fwd +
-                   mix_w[:, 2:3]*m_bwd + mix_w[:, 3:4]*m_corr)
+                if self.include_path_mixing:
+                    mix_w = torch.softmax(self.mix_w(h), dim=1)
+                    msg = (mix_w[:, 0:1]*m_sym + mix_w[:, 1:2]*m_fwd +
+                           mix_w[:, 2:3]*m_bwd + mix_w[:, 3:4]*m_corr)
+                else:
+                    msg = 0.25 * (m_sym + m_fwd + m_bwd + m_corr)
+            else:
+                msg = self.act(self.msg_sym(msg_in))
 
             x_t = x_seq[:, t:t+1]
             inp = torch.cat([msg, x_t, m_seq[:, t:t+1]], dim=-1)  # [msg, x, m]
@@ -2781,11 +2796,11 @@ class DualFlowAblation(nn.Module):
         self.jam_loss_weight = 2.0
         self.free_loss_weight = 0.8
 
-        self.fwd = DualFlowCell(hidden, include_tod)
+        self.fwd = DualFlowCell(hidden, include_tod, include_4path, include_path_mixing)
         if include_bidirectional:
-            self.bwd = DualFlowCell(hidden, include_tod)
+            self.bwd = DualFlowCell(hidden, include_tod, include_4path, include_path_mixing)
 
-        if include_path_mixing:
+        if include_bidirectional and include_path_mixing:
             self.fuse = nn.Sequential(
                 nn.Linear(2, hidden), nn.ReLU(),
                 nn.Linear(hidden, 2), nn.Softmax(dim=-1)
