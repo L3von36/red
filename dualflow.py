@@ -411,16 +411,15 @@ class DualFlowCell(nn.Module):
         # 4-path message passing (K=2 like GRIN++)
         msg_in_dim = hidden + 1 + (2 if include_tod else 0)
 
+        # Always create msg_sym; conditional paths for efficiency
+        self.msg_sym  = ChebConv(msg_in_dim, hidden, K=2)
+
         if include_4path:
-            self.msg_sym  = ChebConv(msg_in_dim, hidden, K=2)
             self.msg_fwd  = ChebConv(msg_in_dim, hidden, K=2)
             self.msg_bwd  = ChebConv(msg_in_dim, hidden, K=2)
             self.msg_corr = ChebConv(msg_in_dim, hidden, K=2)
             if include_path_mixing:
                 self.mix_w = nn.Linear(hidden, 4)
-        else:
-            # Single path fallback
-            self.msg_sym  = ChebConv(msg_in_dim, hidden, K=2)
 
         # Simple GRU input: [msg, x, m] — no mask_prop, no ToD-in-GRU
         self.gru = nn.GRUCell(hidden + 2, hidden)
@@ -431,6 +430,13 @@ class DualFlowCell(nn.Module):
         N, T = x_seq.shape
         h = torch.zeros(N, self.hidden, device=x_seq.device)
         preds = []
+
+        # Precompute mixing weights if needed (avoid per-iteration recomputation)
+        if self.include_4path and self.include_path_mixing:
+            mix_w_fn = lambda h_t: torch.softmax(self.mix_w(h_t), dim=1)
+        else:
+            mix_w_fn = None
+
         for t in range(T):
             if self.include_tod and tod_free_seq is not None:
                 msg_in = torch.cat([h, m_seq[:, t:t+1],
@@ -445,7 +451,7 @@ class DualFlowCell(nn.Module):
                 m_corr = self.act(self.msg_corr(msg_in))
 
                 if self.include_path_mixing:
-                    mix_w = torch.softmax(self.mix_w(h), dim=1)
+                    mix_w = mix_w_fn(h)
                     msg = (mix_w[:, 0:1]*m_sym + mix_w[:, 1:2]*m_fwd +
                            mix_w[:, 2:3]*m_bwd + mix_w[:, 3:4]*m_corr)
                 else:
@@ -2819,8 +2825,9 @@ class DualFlowAblation(nn.Module):
         if not self.include_path_mixing:
             return 0.5 * pf + 0.5 * pb
 
+        # Mix forward and backward with learned weights
         fuse_in = torch.stack([pf, pb], dim=-1)
-        w = self.fuse(fuse_in)
+        w = self.fuse(fuse_in)  # Safe: fuse only exists when bidirectional AND path_mixing
         return (w[..., 0:1] * pf.unsqueeze(-1) + w[..., 1:2] * pb.unsqueeze(-1)).squeeze(-1)
 
     def training_step(self, x, m, tod_free=None, tod_jam=None):
