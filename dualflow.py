@@ -2737,7 +2737,239 @@ plot_publication_figures(results_table_sorted, dualflow_pred_for_pub, true_eval_
 print("=" * 90)
 
 # =============================================================================
-# CELL 16 — Multi-Sparsity Robustness Ablation
+# CELL 15 — Component Ablation Study
+#   Tests the importance of each DualFlow component by systematic removal.
+#   Shows which innovations are critical vs optional.
+# =============================================================================
+
+print("\n" + "=" * 90)
+print("  COMPONENT ABLATION STUDY — Isolate Impact of Each Innovation")
+print("=" * 90)
+
+class DualFlowAblation(nn.Module):
+    """DualFlow variant with configurable component disabling for ablation"""
+    def __init__(self, hidden=64, include_tod=True, include_bidirectional=True,
+                 include_4path=True, include_decoupled_loss=True, include_path_mixing=True):
+        super().__init__()
+        self.include_tod = include_tod
+        self.include_bidirectional = include_bidirectional
+        self.include_4path = include_4path
+        self.include_decoupled_loss = include_decoupled_loss
+        self.include_path_mixing = include_path_mixing
+        self.jam_loss_weight = 2.0
+        self.free_loss_weight = 0.8
+
+        self.fwd = DualFlowCell(hidden, include_tod)
+        if include_bidirectional:
+            self.bwd = DualFlowCell(hidden, include_tod)
+
+        if include_path_mixing:
+            self.fuse = nn.Sequential(
+                nn.Linear(2, hidden), nn.ReLU(),
+                nn.Linear(hidden, 2), nn.Softmax(dim=-1)
+            )
+
+    def _run(self, x, m, tod_free=None, tod_jam=None):
+        pf = self.fwd(x, m, tod_free, tod_jam)
+
+        if not self.include_bidirectional:
+            return pf
+
+        pb = self.bwd(x.flip(1), m.flip(1),
+                      tod_free.flip(1) if tod_free is not None else None,
+                      tod_jam.flip(1)  if tod_jam  is not None else None).flip(1)
+
+        if not self.include_path_mixing:
+            return 0.5 * pf + 0.5 * pb
+
+        fuse_in = torch.stack([pf, pb], dim=-1)
+        w = self.fuse(fuse_in)
+        return (w[..., 0:1] * pf.unsqueeze(-1) + w[..., 1:2] * pb.unsqueeze(-1)).squeeze(-1)
+
+    def training_step(self, x, m, tod_free=None, tod_jam=None):
+        p = self._run(x, m, tod_free, tod_jam)
+
+        if not self.include_decoupled_loss:
+            loss = torch.mean(((p - x) * m) ** 2)
+        else:
+            jt = torch.tensor(jam_thresh_strict_np, dtype=torch.float32, device=x.device)
+            jam_flag = (x < jt.unsqueeze(1)).float()
+            free_flag = 1.0 - jam_flag
+            loss_free = torch.mean(((p - x) * m * free_flag) ** 2) * self.free_loss_weight
+            loss_jam = torch.mean(torch.abs(p - x) * m * jam_flag) * self.jam_loss_weight
+            loss = loss_free + loss_jam
+
+        return loss
+
+    def impute(self, x, m, tod_free=None, tod_jam=None):
+        return m * x + (1.0 - m) * self._run(x, m, tod_free, tod_jam)
+
+def train_ablation_variant(variant_name, **ablation_kwargs):
+    """Train a DualFlow ablation variant"""
+    torch.manual_seed(42)
+    np.random.seed(42)
+
+    net = DualFlowAblation(hidden=64, **ablation_kwargs).to(device)
+    opt = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
+    best_vloss, best_wts, patience_ctr = float('inf'), None, 0
+
+    print(f"\n  Training: {variant_name}...")
+    for ep in range(1, 301):
+        net.train()
+        t0 = np.random.randint(0, TRAIN_END - BATCH_TIME)
+        x_full = torch.tensor(speed_np[t0:t0+BATCH_TIME, :], dtype=torch.float32).T.to(device)
+        m_train = (torch.rand(NUM_NODES, 1, device=device) > 0.8).float().expand(-1, BATCH_TIME)
+        slots = (np.arange(t0, t0+BATCH_TIME) % 288).astype(int)
+        tod_free = torch.tensor(tod_free_np[:, slots], dtype=torch.float32).to(device)
+        tod_jam = torch.tensor(tod_jam_np[:, slots], dtype=torch.float32).to(device)
+
+        loss = net.training_step(x_full, m_train, tod_free, tod_jam)
+
+        if torch.isnan(loss) or torch.isinf(loss):
+            return None
+
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+        opt.step()
+
+        if ep % 50 == 0:
+            net.eval()
+            with torch.no_grad():
+                x_v = torch.tensor(speed_np[VAL_START:VAL_END, :], dtype=torch.float32).T.to(device)
+                m_v = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, VAL_END-VAL_START)
+                slots_v = (np.arange(VAL_START, VAL_END) % 288).astype(int)
+                tf_v = torch.tensor(tod_free_np[:, slots_v], dtype=torch.float32).to(device)
+                tj_v = torch.tensor(tod_jam_np[:, slots_v], dtype=torch.float32).to(device)
+                vl = net.training_step(x_v, m_v, tf_v, tj_v).item()
+
+            if vl < best_vloss:
+                best_vloss = vl
+                best_wts = copy.deepcopy(net.state_dict())
+                patience_ctr = 0
+            else:
+                patience_ctr += 1
+
+            if patience_ctr >= 3:
+                break
+
+    if best_wts:
+        net.load_state_dict(best_wts)
+    return net
+
+def eval_ablation_variant(net, variant_name):
+    """Evaluate ablation variant using warm-up window"""
+    if net is None:
+        return {'mae_all': 999.0, 'mae_jam': 999.0, 'f1': 0.0, 'r2': 0.0}
+
+    net.eval()
+    ws = max(0, EVAL_START - WARMUP_STEPS)
+    total = (EVAL_START + _T_eval) - ws
+
+    x_e = torch.tensor(speed_np[ws:EVAL_START+_T_eval, :], dtype=torch.float32).T.to(device)
+    m_e = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, total)
+    si = np.arange(ws, EVAL_START + _T_eval) % 288
+    tf_e = torch.tensor(tod_free_np[:, si], dtype=torch.float32).to(device)
+    tj_e = torch.tensor(tod_jam_np[:, si], dtype=torch.float32).to(device)
+
+    with torch.no_grad():
+        p_full = net.impute(x_e, m_e, tf_e, tj_e).cpu().numpy()
+
+    offset = EVAL_START - ws
+    p_e = p_full[:, offset:]
+
+    pred_kmh = np.zeros((len(blind_idx), _T_eval), dtype=np.float32)
+    for ni, n in enumerate(blind_idx):
+        pred_kmh[ni] = np.clip(p_e[n] * node_stds[n] + node_means[n], 0, 120)
+
+    return eval_pred_np(pred_kmh, true_eval_kmh)
+
+# Run ablation study
+ablation_configs = [
+    ('Full DualFlow', {'include_bidirectional': True, 'include_4path': True,
+                       'include_decoupled_loss': True, 'include_path_mixing': True, 'include_tod': True}),
+    ('w/o Bidirectional', {'include_bidirectional': False, 'include_4path': True,
+                           'include_decoupled_loss': True, 'include_path_mixing': True, 'include_tod': True}),
+    ('w/o 4-Path Graph', {'include_bidirectional': True, 'include_4path': False,
+                          'include_decoupled_loss': True, 'include_path_mixing': True, 'include_tod': True}),
+    ('w/o Decoupled Loss', {'include_bidirectional': True, 'include_4path': True,
+                            'include_decoupled_loss': False, 'include_path_mixing': True, 'include_tod': True}),
+    ('w/o Path Mixing', {'include_bidirectional': True, 'include_4path': True,
+                         'include_decoupled_loss': True, 'include_path_mixing': False, 'include_tod': True}),
+    ('w/o ToD Features', {'include_bidirectional': True, 'include_4path': True,
+                          'include_decoupled_loss': True, 'include_path_mixing': True, 'include_tod': False}),
+]
+
+ablation_results = {}
+for variant_name, config in ablation_configs:
+    net = train_ablation_variant(variant_name, **config)
+    metrics = eval_ablation_variant(net, variant_name)
+    ablation_results[variant_name] = metrics
+    print(f"    ✓ {variant_name:25s} | MAE all: {metrics['mae_all']:.4f} | JAM MAE: {metrics['mae_jam']:.2f} km/h | F1: {metrics['f1']:.3f}")
+
+# Print ablation summary table
+print("\n" + "=" * 100)
+print("  ABLATION STUDY RESULTS — Component Importance Analysis")
+print("=" * 100)
+print(f"{'Variant':<25} {'MAE All':<12} {'MAE Jam':<12} {'F1 Score':<12} {'R² Score':<12}")
+print("-" * 100)
+
+full_mae = ablation_results['Full DualFlow']['mae_all']
+full_jam = ablation_results['Full DualFlow']['mae_jam']
+
+for variant_name in ['Full DualFlow'] + [v[0] for v in ablation_configs[1:]]:
+    if variant_name in ablation_results:
+        r = ablation_results[variant_name]
+        mae_delta = (r['mae_all'] - full_mae) / full_mae * 100
+        jam_delta = (r['mae_jam'] - full_jam) / full_jam * 100
+        marker = " ← BASELINE" if variant_name == 'Full DualFlow' else f" (+{mae_delta:.1f}% overall, +{jam_delta:.1f}% jam)"
+        print(f"{variant_name:<25} {r['mae_all']:<12.4f} {r['mae_jam']:<12.2f} {r['f1']:<12.3f} {r['r2']:<12.3f}{marker}")
+
+print("=" * 100)
+print("\n📊 ABLATION INSIGHTS:")
+for variant_name in [v[0] for v in ablation_configs[1:]]:
+    if variant_name in ablation_results:
+        r = ablation_results[variant_name]
+        mae_delta = (r['mae_all'] - full_mae) / full_mae * 100
+        if mae_delta > 20:
+            print(f"   ⭐⭐⭐ {variant_name:25s} → +{mae_delta:.1f}% error (CRITICAL component)")
+        elif mae_delta > 10:
+            print(f"   ⭐⭐   {variant_name:25s} → +{mae_delta:.1f}% error (IMPORTANT component)")
+        elif mae_delta > 5:
+            print(f"   ⭐     {variant_name:25s} → +{mae_delta:.1f}% error (HELPFUL component)")
+        else:
+            print(f"   ○     {variant_name:25s} → +{mae_delta:.1f}% error (MINOR component)")
+
+# Plot ablation results
+fig_abl, axes_abl = plt.subplots(1, 2, figsize=(14, 6), dpi=150)
+variants = list(ablation_results.keys())
+mae_vals = [ablation_results[v]['mae_all'] for v in variants]
+jam_vals = [ablation_results[v]['mae_jam'] for v in variants]
+colors_abl = ['#d62728' if v == 'Full DualFlow' else '#1f77b4' for v in variants]
+
+axes_abl[0].bar(range(len(variants)), mae_vals, color=colors_abl, edgecolor='black', linewidth=1, alpha=0.8)
+axes_abl[0].set_xticks(range(len(variants)))
+axes_abl[0].set_xticklabels([v.replace('w/o ', '').replace('Full DualFlow', 'Full Model') for v in variants],
+                             rotation=45, ha='right', fontsize=9)
+axes_abl[0].set_ylabel('MAE (normalized)', fontsize=11, fontweight='bold')
+axes_abl[0].set_title('Component Ablation: Overall MAE', fontsize=12, fontweight='bold')
+axes_abl[0].grid(True, alpha=0.3, axis='y')
+
+axes_abl[1].bar(range(len(variants)), jam_vals, color=colors_abl, edgecolor='black', linewidth=1, alpha=0.8)
+axes_abl[1].set_xticks(range(len(variants)))
+axes_abl[1].set_xticklabels([v.replace('w/o ', '').replace('Full DualFlow', 'Full Model') for v in variants],
+                             rotation=45, ha='right', fontsize=9)
+axes_abl[1].set_ylabel('MAE (km/h)', fontsize=11, fontweight='bold')
+axes_abl[1].set_title('Component Ablation: Jam-Period MAE', fontsize=12, fontweight='bold')
+axes_abl[1].grid(True, alpha=0.3, axis='y')
+
+fig_abl.suptitle('DualFlow Component Importance Analysis', fontsize=13, fontweight='bold', y=1.02)
+plt.tight_layout()
+plt.savefig('fig_ablation_components.png', bbox_inches='tight', dpi=150)
+print(f"\n✅ Ablation visualization saved to fig_ablation_components.png\n")
+plt.close()
+
+
 #   Trains and evaluates 5 key models at 40%, 60%, 80%, 90% blind node rates.
 #   Shows that DualFlow retains superiority across all missing rates.
 # =============================================================================
