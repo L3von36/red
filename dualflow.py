@@ -2911,7 +2911,7 @@ for variant_name, config in ablation_configs:
 print("\n" + "=" * 100)
 print("  ABLATION STUDY RESULTS — Component Importance Analysis")
 print("=" * 100)
-print(f"{'Variant':<25} {'MAE All':<12} {'MAE Jam':<12} {'F1 Score':<12} {'R² Score':<12}")
+print(f"{'Variant':<25} {'MAE All':<12} {'MAE Jam':<12} {'F1 Score':<12} {'R² (all)':<12}")
 print("-" * 100)
 
 full_mae = ablation_results['Full DualFlow']['mae_all']
@@ -2923,7 +2923,8 @@ for variant_name in ['Full DualFlow'] + [v[0] for v in ablation_configs[1:]]:
         mae_delta = (r['mae_all'] - full_mae) / full_mae * 100
         jam_delta = (r['mae_jam'] - full_jam) / full_jam * 100
         marker = " ← BASELINE" if variant_name == 'Full DualFlow' else f" (+{mae_delta:.1f}% overall, +{jam_delta:.1f}% jam)"
-        print(f"{variant_name:<25} {r['mae_all']:<12.4f} {r['mae_jam']:<12.2f} {r['f1']:<12.3f} {r['r2']:<12.3f}{marker}")
+        r2_val = r.get('r2_all', 0.0)
+        print(f"{variant_name:<25} {r['mae_all']:<12.4f} {r['mae_jam']:<12.2f} {r['f1']:<12.3f} {r2_val:<12.3f}{marker}")
 
 print("=" * 100)
 print("\n📊 ABLATION INSIGHTS:")
