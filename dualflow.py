@@ -2737,6 +2737,23 @@ plot_publication_figures(results_table_sorted, dualflow_pred_for_pub, true_eval_
 print("=" * 90)
 
 # =============================================================================
+# Helper function for ablation study
+# =============================================================================
+
+def make_blind_setup(sparsity, seed_offset=0):
+    """Consistent blind mask + ground-truth km/h for a given sparsity level."""
+    rng    = np.random.RandomState(SWEEP_SEED_BASE + int(sparsity * 1000) + seed_offset)
+    n_bl   = int(NUM_NODES * sparsity)
+    blind  = rng.choice(NUM_NODES, n_bl, replace=False)
+    obs    = np.setdiff1d(np.arange(NUM_NODES), blind)
+    m_vec  = torch.zeros(NUM_NODES, dtype=torch.float32, device=device)
+    m_vec[obs] = 1.0
+    true_kmh = np.zeros((len(blind), _T_eval), dtype=np.float32)
+    for ni, n in enumerate(blind):
+        true_kmh[ni] = speed_np[EVAL_START:EVAL_START + _T_eval, n] * node_stds[n] + node_means[n]
+    return m_vec, blind, obs, true_kmh
+
+# =============================================================================
 # CELL 15 — Component Ablation Study
 #   Tests the importance of each DualFlow component by systematic removal.
 #   Shows which innovations are critical vs optional.
