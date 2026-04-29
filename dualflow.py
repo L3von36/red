@@ -2884,7 +2884,7 @@ def eval_ablation_variant(net, variant_name):
 
     return eval_pred_np(pred_kmh, true_eval_kmh)
 
-# Run ablation study
+# Run ablation study across multiple sparsity levels
 ablation_configs = [
     ('Full DualFlow', {'include_bidirectional': True, 'include_4path': True,
                        'include_decoupled_loss': True, 'include_path_mixing': True, 'include_tod': True}),
@@ -2900,74 +2900,142 @@ ablation_configs = [
                           'include_decoupled_loss': True, 'include_path_mixing': True, 'include_tod': False}),
 ]
 
-ablation_results = {}
-for variant_name, config in ablation_configs:
-    net = train_ablation_variant(variant_name, **config)
-    metrics = eval_ablation_variant(net, variant_name)
-    ablation_results[variant_name] = metrics
-    print(f"    ✓ {variant_name:25s} | MAE all: {metrics['mae_all']:.4f} | JAM MAE: {metrics['mae_jam']:.2f} km/h | F1: {metrics['f1']:.3f}")
+ABLATION_SPARSITY_LEVELS = [0.40, 0.60, 0.80, 0.90]
+ablation_results_by_sparsity = {sp: {} for sp in ABLATION_SPARSITY_LEVELS}
 
-# Print ablation summary table
 print("\n" + "=" * 100)
-print("  ABLATION STUDY RESULTS — Component Importance Analysis")
+print("  COMPONENT ABLATION STUDY — Testing Across Multiple Sparsity Levels")
+print("  (40%, 60%, 80%, 90% blind nodes)")
 print("=" * 100)
-print(f"{'Variant':<25} {'MAE All':<12} {'MAE Jam':<12} {'F1 Score':<12} {'R² (all)':<12}")
-print("-" * 100)
 
-full_mae = ablation_results['Full DualFlow']['mae_all']
-full_jam = ablation_results['Full DualFlow']['mae_jam']
+# Test each variant at each sparsity level
+for sp in ABLATION_SPARSITY_LEVELS:
+    sp_pct = int(sp * 100)
+    print(f"\n--- Sparsity {sp_pct}% ---")
 
-for variant_name in ['Full DualFlow'] + [v[0] for v in ablation_configs[1:]]:
-    if variant_name in ablation_results:
-        r = ablation_results[variant_name]
-        mae_delta = (r['mae_all'] - full_mae) / full_mae * 100
-        jam_delta = (r['mae_jam'] - full_jam) / full_jam * 100
-        marker = " ← BASELINE" if variant_name == 'Full DualFlow' else f" (+{mae_delta:.1f}% overall, +{jam_delta:.1f}% jam)"
-        r2_val = r.get('r2_all', 0.0)
-        print(f"{variant_name:<25} {r['mae_all']:<12.4f} {r['mae_jam']:<12.2f} {r['f1']:<12.3f} {r2_val:<12.3f}{marker}")
+    m_vec, blind, obs, true_kmh_sp = make_blind_setup(sp, seed_offset=0)
 
-print("=" * 100)
-print("\n📊 ABLATION INSIGHTS:")
-for variant_name in [v[0] for v in ablation_configs[1:]]:
-    if variant_name in ablation_results:
-        r = ablation_results[variant_name]
-        mae_delta = (r['mae_all'] - full_mae) / full_mae * 100
-        if mae_delta > 20:
-            print(f"   ⭐⭐⭐ {variant_name:25s} → +{mae_delta:.1f}% error (CRITICAL component)")
-        elif mae_delta > 10:
-            print(f"   ⭐⭐   {variant_name:25s} → +{mae_delta:.1f}% error (IMPORTANT component)")
-        elif mae_delta > 5:
-            print(f"   ⭐     {variant_name:25s} → +{mae_delta:.1f}% error (HELPFUL component)")
-        else:
-            print(f"   ○     {variant_name:25s} → +{mae_delta:.1f}% error (MINOR component)")
+    for variant_name, config in ablation_configs:
+        torch.manual_seed(42)
+        np.random.seed(42)
 
-# Plot ablation results
-fig_abl, axes_abl = plt.subplots(1, 2, figsize=(14, 6), dpi=150)
-variants = list(ablation_results.keys())
-mae_vals = [ablation_results[v]['mae_all'] for v in variants]
-jam_vals = [ablation_results[v]['mae_jam'] for v in variants]
-colors_abl = ['#d62728' if v == 'Full DualFlow' else '#1f77b4' for v in variants]
+        # Train variant
+        net = DualFlowAblation(hidden=64, **config).to(device)
+        opt = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
+        best_vloss, best_wts, patience_ctr = float('inf'), None, 0
 
-axes_abl[0].bar(range(len(variants)), mae_vals, color=colors_abl, edgecolor='black', linewidth=1, alpha=0.8)
-axes_abl[0].set_xticks(range(len(variants)))
-axes_abl[0].set_xticklabels([v.replace('w/o ', '').replace('Full DualFlow', 'Full Model') for v in variants],
-                             rotation=45, ha='right', fontsize=9)
-axes_abl[0].set_ylabel('MAE (normalized)', fontsize=11, fontweight='bold')
-axes_abl[0].set_title('Component Ablation: Overall MAE', fontsize=12, fontweight='bold')
-axes_abl[0].grid(True, alpha=0.3, axis='y')
+        for ep in range(1, 200):  # Fewer epochs for ablation sweep
+            net.train()
+            t0 = np.random.randint(0, TRAIN_END - BATCH_TIME)
+            x_full = torch.tensor(speed_np[t0:t0+BATCH_TIME, :], dtype=torch.float32).T.to(device)
+            m_train = (torch.rand(NUM_NODES, 1, device=device) > sp).float().expand(-1, BATCH_TIME)
+            slots = (np.arange(t0, t0+BATCH_TIME) % 288).astype(int)
+            tod_free = torch.tensor(tod_free_np[:, slots], dtype=torch.float32).to(device)
+            tod_jam = torch.tensor(tod_jam_np[:, slots], dtype=torch.float32).to(device)
 
-axes_abl[1].bar(range(len(variants)), jam_vals, color=colors_abl, edgecolor='black', linewidth=1, alpha=0.8)
-axes_abl[1].set_xticks(range(len(variants)))
-axes_abl[1].set_xticklabels([v.replace('w/o ', '').replace('Full DualFlow', 'Full Model') for v in variants],
-                             rotation=45, ha='right', fontsize=9)
-axes_abl[1].set_ylabel('MAE (km/h)', fontsize=11, fontweight='bold')
-axes_abl[1].set_title('Component Ablation: Jam-Period MAE', fontsize=12, fontweight='bold')
-axes_abl[1].grid(True, alpha=0.3, axis='y')
+            loss = net.training_step(x_full, m_train, tod_free, tod_jam)
 
-fig_abl.suptitle('DualFlow Component Importance Analysis', fontsize=13, fontweight='bold', y=1.02)
+            if torch.isnan(loss) or torch.isinf(loss):
+                break
+
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+            opt.step()
+
+            if ep % 40 == 0:
+                net.eval()
+                with torch.no_grad():
+                    x_v = torch.tensor(speed_np[VAL_START:VAL_END, :], dtype=torch.float32).T.to(device)
+                    m_v = m_vec.unsqueeze(1).expand(-1, VAL_END-VAL_START)
+                    slots_v = (np.arange(VAL_START, VAL_END) % 288).astype(int)
+                    tf_v = torch.tensor(tod_free_np[:, slots_v], dtype=torch.float32).to(device)
+                    tj_v = torch.tensor(tod_jam_np[:, slots_v], dtype=torch.float32).to(device)
+                    vl = net.training_step(x_v, m_v, tf_v, tj_v).item()
+
+                if vl < best_vloss:
+                    best_vloss = vl
+                    best_wts = copy.deepcopy(net.state_dict())
+                    patience_ctr = 0
+                else:
+                    patience_ctr += 1
+
+                if patience_ctr >= 2:
+                    break
+
+        if best_wts:
+            net.load_state_dict(best_wts)
+
+        # Evaluate
+        net.eval()
+        ws = max(0, EVAL_START - WARMUP_STEPS)
+        total = (EVAL_START + _T_eval) - ws
+
+        x_e = torch.tensor(speed_np[ws:EVAL_START+_T_eval, :], dtype=torch.float32).T.to(device)
+        m_e = m_vec.unsqueeze(1).expand(-1, total)
+        si = np.arange(ws, EVAL_START + _T_eval) % 288
+        tf_e = torch.tensor(tod_free_np[:, si], dtype=torch.float32).to(device)
+        tj_e = torch.tensor(tod_jam_np[:, si], dtype=torch.float32).to(device)
+
+        with torch.no_grad():
+            p_full = net.impute(x_e, m_e, tf_e, tj_e).cpu().numpy()
+
+        offset = EVAL_START - ws
+        p_e = p_full[:, offset:]
+
+        pred_kmh = np.zeros((len(blind), _T_eval), dtype=np.float32)
+        for ni, n in enumerate(blind):
+            pred_kmh[ni] = np.clip(p_e[n] * node_stds[n] + node_means[n], 0, 120)
+
+        metrics = eval_pred_np(pred_kmh, true_kmh_sp)
+        ablation_results_by_sparsity[sp][variant_name] = metrics
+
+        print(f"  {variant_name:25s} MAE: {metrics['mae_all']:.4f} | JAM MAE: {metrics['mae_jam']:.2f}")
+
+# Print comprehensive ablation summary
+print("\n" + "=" * 130)
+print("  ABLATION SUMMARY — Component Importance Across Sparsity Levels")
+print("=" * 130)
+
+for sp in ABLATION_SPARSITY_LEVELS:
+    sp_pct = int(sp * 100)
+    print(f"\n--- Sparsity {sp_pct}% ---")
+    print(f"{'Variant':<25} {'MAE All':<12} {'MAE Jam':<12} {'F1 Score':<12}")
+    print("-" * 61)
+
+    full_mae = ablation_results_by_sparsity[sp]['Full DualFlow']['mae_all']
+    full_jam = ablation_results_by_sparsity[sp]['Full DualFlow']['mae_jam']
+
+    for variant_name in ['Full DualFlow'] + [v[0] for v in ablation_configs[1:]]:
+        if variant_name in ablation_results_by_sparsity[sp]:
+            r = ablation_results_by_sparsity[sp][variant_name]
+            mae_delta = (r['mae_all'] - full_mae) / full_mae * 100
+            jam_delta = (r['mae_jam'] - full_jam) / full_jam * 100
+            marker = " ← BASELINE" if variant_name == 'Full DualFlow' else f" (+{mae_delta:.1f}%)"
+            print(f"{variant_name:<25} {r['mae_all']:<12.4f} {r['mae_jam']:<12.2f} {r['f1']:<12.3f}{marker}")
+
+# Plot ablation across sparsity levels
+fig_abl_sp, axes_abl_sp = plt.subplots(2, 2, figsize=(16, 10), dpi=130)
+axes_flat = axes_abl_sp.flatten()
+
+for ax_idx, sp in enumerate(ABLATION_SPARSITY_LEVELS):
+    ax = axes_flat[ax_idx]
+    variants = list(ablation_results_by_sparsity[sp].keys())
+    mae_vals = [ablation_results_by_sparsity[sp][v]['mae_all'] for v in variants]
+    colors = ['#d62728' if v == 'Full DualFlow' else '#1f77b4' for v in variants]
+
+    ax.bar(range(len(variants)), mae_vals, color=colors, edgecolor='black', linewidth=1, alpha=0.8)
+    ax.set_xticks(range(len(variants)))
+    ax.set_xticklabels([v.replace('w/o ', '').replace('Full DualFlow', 'Full') for v in variants],
+                       rotation=45, ha='right', fontsize=8)
+    ax.set_ylabel('MAE (normalized)', fontsize=10, fontweight='bold')
+    ax.set_title(f'Sparsity {int(sp*100)}%', fontsize=11, fontweight='bold')
+    ax.grid(True, alpha=0.3, axis='y')
+
+fig_abl_sp.suptitle('Component Ablation: Impact Across Sparsity Levels', fontsize=13, fontweight='bold', y=0.995)
 plt.tight_layout()
-plt.savefig('fig_ablation_components.png', bbox_inches='tight', dpi=150)
-print(f"\n✅ Ablation visualization saved to fig_ablation_components.png\n")
+plt.savefig('fig_ablation_sparsity.png', bbox_inches='tight', dpi=150)
+print(f"\n✅ Ablation across sparsity saved to fig_ablation_sparsity.png\n")
 plt.close()
 
 
