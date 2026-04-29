@@ -466,28 +466,6 @@ class DualFlowCell(nn.Module):
             preds.append(self.out(h)[:, 0])
         return torch.stack(preds, dim=1)
 
-def eval_v9(net, name='DualFlow v9'):
-    net.eval()
-    x_e  = torch.tensor(speed_np[EVAL_START:EVAL_START+_T_eval, :], dtype=torch.float32).T.to(device)
-    m_e  = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, _T_eval)
-    si   = np.arange(EVAL_START, EVAL_START + _T_eval) % 288
-    tf_e = torch.tensor(tod_free_np[:, si], dtype=torch.float32).to(device)
-    tj_e = torch.tensor(tod_jam_np[:,  si], dtype=torch.float32).to(device)
-
-    with torch.no_grad():
-        p_e = net.impute(x_e, m_e, tf_e, tj_e).cpu().numpy()
-
-    pred_kmh = np.zeros((len(blind_idx), _T_eval), dtype=np.float32)
-    for ni, n in enumerate(blind_idx):
-        if np.isnan(p_e[n]).any():
-            pred_kmh[ni] = true_eval_kmh[ni]
-        else:
-            pred_kmh[ni] = np.clip(p_e[n] * node_stds[n] + node_means[n], 0, 120)
-
-    results_table.append({'model': name, **eval_pred_np(pred_kmh, true_eval_kmh)})
-    print(f"✅ {name} evaluated.")
-    return pred_kmh
-
 # ═════════════════════════════════════════════════════════════════════════════
 # v9 ABLATION STUDIES: Isolate which innovation hurts jam performance
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1981,44 +1959,6 @@ print("\nTraining DGCRIN...")
 dgcrin_net = train_gnn_baseline(DGCRIN, 'DGCRIN')
 eval_gnn_baseline(dgcrin_net, 'DGCRIN')
 
-# ─── Multi-Path Chebyshev Conv ────────────────────────────────────────────
-class MultiPathChebConv(nn.Module):
-    """4-path Chebyshev graph convolution (sym/fwd/bwd/corr adjacencies)"""
-    def __init__(self, in_dim, out_dim, K=2):
-        super().__init__()
-        self.K = K
-        # 4 separate Chebyshev bases (one per adjacency type)
-        # A_fwd_t, A_bwd_t, A_corr_t are [1, N, N], so squeeze to [N, N]
-        self.mats_sym  = diffusion_cheby(A_t, K=K)                   # symmetric (road graph)
-        self.mats_fwd  = diffusion_cheby(A_fwd_t.squeeze(0), K=K)   # forward
-        self.mats_bwd  = diffusion_cheby(A_bwd_t.squeeze(0), K=K)   # backward
-        self.mats_corr = diffusion_cheby(A_corr_t.squeeze(0), K=K)  # correlation
-
-        # Learnable weights for each K-order Chebyshev term and path
-        self.Ws_sym  = nn.ModuleList([nn.Linear(in_dim, out_dim, bias=(k==0)) for k in range(K)])
-        self.Ws_fwd  = nn.ModuleList([nn.Linear(in_dim, out_dim, bias=(k==0)) for k in range(K)])
-        self.Ws_bwd  = nn.ModuleList([nn.Linear(in_dim, out_dim, bias=(k==0)) for k in range(K)])
-        self.Ws_corr = nn.ModuleList([nn.Linear(in_dim, out_dim, bias=(k==0)) for k in range(K)])
-
-        # Gating for path fusion
-        self.gate = nn.Linear(out_dim * 4, out_dim)
-
-    def forward(self, x):
-        # x: [N, F]
-        out_sym  = sum(self.Ws_sym[k](torch.mm(self.mats_sym[k], x)) for k in range(self.K))
-        out_fwd  = sum(self.Ws_fwd[k](torch.mm(self.mats_fwd[k], x)) for k in range(self.K))
-        out_bwd  = sum(self.Ws_bwd[k](torch.mm(self.mats_bwd[k], x)) for k in range(self.K))
-        out_corr = sum(self.Ws_corr[k](torch.mm(self.mats_corr[k], x)) for k in range(self.K))
-
-        # Gated fusion
-        all_paths = torch.cat([out_sym, out_fwd, out_bwd, out_corr], dim=-1)  # [N, 4*out_dim]
-        gate_weights = torch.sigmoid(self.gate(all_paths))                      # [N, out_dim]
-
-        # Weighted sum
-        out = (out_sym + out_fwd + out_bwd + out_corr) / 4.0 * gate_weights
-
-        return out
-
 # ─── GCASTN ──────────────────────────────────────────────────────────────────
 class GCASTN(nn.Module):
     """
@@ -2847,59 +2787,6 @@ class DualFlowAblation(nn.Module):
 
     def impute(self, x, m, tod_free=None, tod_jam=None):
         return m * x + (1.0 - m) * self._run(x, m, tod_free, tod_jam)
-
-def train_ablation_variant(variant_name, **ablation_kwargs):
-    """Train a DualFlow ablation variant"""
-    torch.manual_seed(42)
-    np.random.seed(42)
-
-    net = DualFlowAblation(hidden=64, **ablation_kwargs).to(device)
-    opt = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
-    best_vloss, best_wts, patience_ctr = float('inf'), None, 0
-
-    print(f"\n  Training: {variant_name}...")
-    for ep in range(1, 301):
-        net.train()
-        t0 = np.random.randint(0, TRAIN_END - BATCH_TIME)
-        x_full = torch.tensor(speed_np[t0:t0+BATCH_TIME, :], dtype=torch.float32).T.to(device)
-        m_train = (torch.rand(NUM_NODES, 1, device=device) > 0.8).float().expand(-1, BATCH_TIME)
-        slots = (np.arange(t0, t0+BATCH_TIME) % 288).astype(int)
-        tod_free = torch.tensor(tod_free_np[:, slots], dtype=torch.float32).to(device)
-        tod_jam = torch.tensor(tod_jam_np[:, slots], dtype=torch.float32).to(device)
-
-        loss = net.training_step(x_full, m_train, tod_free, tod_jam)
-
-        if torch.isnan(loss) or torch.isinf(loss):
-            return None
-
-        opt.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
-        opt.step()
-
-        if ep % 50 == 0:
-            net.eval()
-            with torch.no_grad():
-                x_v = torch.tensor(speed_np[VAL_START:VAL_END, :], dtype=torch.float32).T.to(device)
-                m_v = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, VAL_END-VAL_START)
-                slots_v = (np.arange(VAL_START, VAL_END) % 288).astype(int)
-                tf_v = torch.tensor(tod_free_np[:, slots_v], dtype=torch.float32).to(device)
-                tj_v = torch.tensor(tod_jam_np[:, slots_v], dtype=torch.float32).to(device)
-                vl = net.training_step(x_v, m_v, tf_v, tj_v).item()
-
-            if vl < best_vloss:
-                best_vloss = vl
-                best_wts = copy.deepcopy(net.state_dict())
-                patience_ctr = 0
-            else:
-                patience_ctr += 1
-
-            if patience_ctr >= 3:
-                break
-
-    if best_wts:
-        net.load_state_dict(best_wts)
-    return net
 
 # Run ablation study across multiple sparsity levels
 ablation_configs = [
