@@ -2792,7 +2792,7 @@ class DualFlowAblation(nn.Module):
         if not self.include_decoupled_loss:
             loss = torch.mean(((p - x) * m) ** 2)
         else:
-            jt = torch.tensor(jam_thresh_strict_np, dtype=torch.float32, device=x.device)
+            jt = torch.tensor(jam_thresh_train_np, dtype=torch.float32, device=x.device)
             jam_flag = (x < jt.unsqueeze(1)).float()
             free_flag = 1.0 - jam_flag
             loss_free = torch.mean(((p - x) * m * free_flag) ** 2) * self.free_loss_weight
