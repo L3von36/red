@@ -607,8 +607,8 @@ def eval_dualflow(net, name='DualFlow'):
 # ═════════════════════════════════════════════════════════════════════════════
 
 PRODUCTION_SEED = 61725  # Seed 5 (5 * 12345) — best balanced model
-PRODUCTION_JAM_WEIGHT = 2.0
-PRODUCTION_FREE_WEIGHT = 0.8
+PRODUCTION_JAM_WEIGHT = 2.5
+PRODUCTION_FREE_WEIGHT = 1.0
 
 def train_seed5_production(hidden=64, epochs=600):
     """
@@ -683,8 +683,8 @@ def tune_v9a_multiseed():
     MULTI-SEED LOTTERY: Try balanced weights with different random initializations.
     Optimize for BOTH jam MAE and overall MAE using balanced loss weighting.
     """
-    jam_weight = 2.0
-    free_weight = 0.8
+    jam_weight = 2.5
+    free_weight = 1.0
     num_seeds = 8  # Try 8 different random seeds
     results = []
 
@@ -1348,7 +1348,7 @@ print("=" * 90)
 # ─────────────────────────────────────────────────────────────────────────────
 # PRODUCTION MODEL: Seed 5 — proven best balanced model
 # jam_mae=1.1090, mae_all=0.1925, R^2=0.9932, F1=0.9825
-# Seed 5 = seed 61725 (5 * 12345), jam_weight=2.0, free_weight=0.8
+# Seed 5 = seed 61725 (5 * 12345), jam_weight=2.5, free_weight=1.0
 dualflow_net, v9a_loss_train, v9a_loss_val = train_seed5_production(hidden=64, epochs=600)
 dualflow_pred_kmh = eval_dualflow(dualflow_net, 'DualFlow (Seed 5 Production)')
 
