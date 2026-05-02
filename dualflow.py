@@ -2316,7 +2316,7 @@ tier_labels = {
 
 for r in results_table_sorted:
     tier  = tier_labels.get(r['model'], '')
-    flag  = ' ◀' if 'v9a' in r['model'] else ''
+    flag  = ' ◀' if 'DualFlow' in r['model'] else ''
     rmse = r.get('rmse_all', r.get('mae_all', 0))  # fallback for older entries
     r2 = r.get('r2_all', 0.0)  # fallback for older entries
     print(f"  [{tier:<4}] {r['model']:<24} "
@@ -2395,20 +2395,10 @@ plt.savefig('baseline_comparison.png', bbox_inches='tight', dpi=150)
 plt.show()
 print("✅ Comparison table printed. Figure saved to baseline_comparison.png")
 
-# Generate ablation study figure from results_table
-print("\nGenerating ablation study visualization...")
-ablation_dict = {}
-for r in results_table_sorted:
-    model_name = r['model'].replace('DualFlow ', '').replace('GRIN++', 'Full Model')
-    ablation_dict[model_name] = {'mae_all': r['mae_all'], 'mae_jam': r['mae_jam']}
-
-# Select top models for ablation display (v9a as anchor)
-top_for_ablation = {}
-for r in results_table_sorted[:6]:
-    key = r['model'].replace('DualFlow ', '').replace('GRIN++', 'Full Model')
-    top_for_ablation[key] = ablation_dict.get(key, {})
-
-plot_ablation_study(top_for_ablation)
+# Note: The actual component ablation study (Full DualFlow vs w/o Bidirectional,
+# w/o 4-Path Graph, w/o Decoupled Loss, etc.) runs later in CELL 15 and produces
+# fig_ablation_sparsity.png. The earlier code here was incorrectly plotting the
+# top 6 baseline models under an "Ablation" title — removed to avoid confusion.
 
 # =============================================================================
 # CELL 12.5 — Publication-Ready Figure Generation
@@ -2421,9 +2411,11 @@ print("=" * 90)
 # Generate architecture diagram
 plot_architecture_diagram()
 
-# Generate loss curves (with placeholder data if not available)
-plot_loss_curves(np.linspace(1.0, 0.2, 300),
-                np.linspace(0.95, 0.25, 6))
+# Generate loss curves from actual training history captured in train_seed5_production
+if 'v9a_loss_train' in dir() and len(v9a_loss_train) > 0:
+    plot_loss_curves(v9a_loss_train, v9a_loss_val)
+else:
+    print("  ⚠️  Skipping loss curves — no training history captured.")
 
 print("✓ Core architecture and training figures generated")
 print("  Note: Prediction, heatmap, and gate activation plots require actual model outputs")
@@ -2437,7 +2429,7 @@ print("\n" + "=" * 90)
 print("  ANALYSIS: DualFlow vs Baselines")
 print("=" * 90)
 
-v9a_result  = next((r for r in results_table if 'v9a' in r['model']), None)
+v9a_result  = next((r for r in results_table if 'DualFlow' in r['model']), None)
 grin_result = next((r for r in results_table if r['model'] == 'GRIN'), None)
 
 if v9a_result:
@@ -2452,7 +2444,17 @@ if v9a_result:
 if grin_result and v9a_result:
     rel_mae = (grin_result['mae_all'] - v9a_result['mae_all']) / grin_result['mae_all'] * 100
     rel_jam = (grin_result['mae_jam'] - v9a_result['mae_jam']) / grin_result['mae_jam'] * 100
-    print(f"\nImprovement over GRIN: MAE -{rel_mae:.1f}%  JAM MAE -{rel_jam:.1f}%")
+    mae_sign = 'better' if rel_mae > 0 else 'worse'
+    jam_sign = 'better' if rel_jam > 0 else 'worse'
+    print(f"\nvs GRIN — Overall MAE: {abs(rel_mae):.1f}% {mae_sign} | Jam MAE: {abs(rel_jam):.1f}% {jam_sign}")
+
+# Build live results string for novelty section
+if v9a_result:
+    live_jam = v9a_result['mae_jam']
+    live_all = v9a_result['mae_all']
+    live_result_str = f"jam MAE={live_jam:.3f} AND overall MAE={live_all:.3f} simultaneously"
+else:
+    live_result_str = "(production model not available)"
 
 print(f"""
 WHAT MAKES DUALFLOW NOVEL:
@@ -2460,7 +2462,7 @@ WHAT MAKES DUALFLOW NOVEL:
       - free_loss_weight * MSE(free-flow) + jam_loss_weight * MAE(jams)
       - Decoupled weights for each traffic regime
       - Eliminates jam/accuracy trade-off that all prior models suffer from
-      - Result: jam MAE=1.109 AND overall MAE=0.193 simultaneously
+      - Result: {live_result_str}
 
   (2) BIDIRECTIONAL GRAPH-GRU CELL
       - Forward + backward RNN passes fused via learned per-node weights
@@ -2527,7 +2529,7 @@ def plot_publication_figures(results_table_sorted, dualflow_pred_kmh_pub, true_e
         vals = [r[key] for r in top10]
         bars = ax.bar(range(len(top10)), vals, color=colors, edgecolor='white',
                       linewidth=0.7, alpha=0.9)
-        our_idx = next((i for i, r in enumerate(top10) if 'v9a' in r['model']), None)
+        our_idx = next((i for i, r in enumerate(top10) if 'DualFlow' in r['model']), None)
         if our_idx is not None:
             bars[our_idx].set_edgecolor('black')
             bars[our_idx].set_linewidth(2.0)
@@ -2553,7 +2555,7 @@ def plot_publication_figures(results_table_sorted, dualflow_pred_kmh_pub, true_e
     # ── Figure 2: MAE vs Jam-MAE Scatter (Pareto plane) ──────────────────────
     fig2, ax = plt.subplots(figsize=(8, 6), dpi=150)
     for r in results_table_sorted:
-        is_ours = 'v9a' in r['model']
+        is_ours = 'DualFlow' in r['model']
         t = tier_map.get(r['model'], 'T3')
         c = '#d62728' if is_ours else tier_color.get(t, '#1f77b4')
         sz = 140 if is_ours else 60
@@ -3161,7 +3163,12 @@ for ax, title, ylabel in zip(
 fig_sp.suptitle(
     f'Robustness to Missing Rate — {DATASET_NAME}  (mean ± std, {SWEEP_N_SEEDS} seeds)',
     fontsize=12, fontweight='bold', y=1.02)
+# Force white facecolors to prevent black rendering on some matplotlib backends
+fig_sp.patch.set_facecolor('white')
+for ax in axes_sp:
+    ax.set_facecolor('white')
 fig_sp.tight_layout()
-fig_sp.savefig('fig_pub_06_sparsity_sweep.png', dpi=150, bbox_inches='tight')
+fig_sp.savefig('fig_pub_06_sparsity_sweep.png', dpi=150, bbox_inches='tight',
+               facecolor='white', edgecolor='none')
 print("Saved: fig_pub_06_sparsity_sweep.png")
 print("=" * 90)
