@@ -504,6 +504,7 @@ def train_dualflow(hidden=64, epochs=300, jam_loss_weight=2.5, free_loss_weight=
         net.train()
         t0      = np.random.randint(0, TRAIN_END - BATCH_TIME)
         x_full  = torch.tensor(speed_np[t0:t0+BATCH_TIME, :], dtype=torch.float32).T.to(device)
+        # Training mask rate matches eval SPARSITY so training difficulty == eval difficulty
         m_train = (torch.rand(NUM_NODES, 1, device=device) > SPARSITY).float().expand(-1, BATCH_TIME)
         slots    = (np.arange(t0, t0+BATCH_TIME) % 288).astype(int)
         tod_free = torch.tensor(tod_free_np[:, slots], dtype=torch.float32).to(device)
@@ -597,6 +598,7 @@ def train_dualflow_production(hidden=64, epochs=600):
         net.train()
         t0      = np.random.randint(0, TRAIN_END - BATCH_TIME)
         x_full  = torch.tensor(speed_np[t0:t0+BATCH_TIME, :], dtype=torch.float32).T.to(device)
+        # Training mask rate matches eval SPARSITY so training difficulty == eval difficulty
         m_train = (torch.rand(NUM_NODES, 1, device=device) > SPARSITY).float().expand(-1, BATCH_TIME)
         slots   = (np.arange(t0, t0+BATCH_TIME) % 288).astype(int)
         tod_free = torch.tensor(tod_free_np[:, slots], dtype=torch.float32).to(device)
