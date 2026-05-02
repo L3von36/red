@@ -2738,8 +2738,8 @@ class DualFlowAblation(nn.Module):
         self.include_4path = include_4path
         self.include_decoupled_loss = include_decoupled_loss
         self.include_path_mixing = include_path_mixing
-        self.jam_loss_weight = 2.0
-        self.free_loss_weight = 0.8
+        self.jam_loss_weight = 2.5  # Match production DualFlow
+        self.free_loss_weight = 1.0  # Match production DualFlow
 
         self.fwd = DualFlowCell(hidden, include_tod, include_4path, include_path_mixing)
         if include_bidirectional:
