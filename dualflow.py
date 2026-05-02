@@ -571,15 +571,12 @@ def eval_dualflow(net, name='DualFlow'):
 # CELL 6 (continued) — Production DualFlow Training
 # =============================================================================
 
-PRODUCTION_SEED = 61725  # Seed 5 (5 * 12345) — best balanced model
+PRODUCTION_SEED = 61725  # Reproducibility seed for the production DualFlow run
 PRODUCTION_JAM_WEIGHT = 2.5
 PRODUCTION_FREE_WEIGHT = 1.0
 
-def train_seed5_production(hidden=64, epochs=600):
-    """
-    Production model: Seed 5 configuration.
-    Proven best balanced performance: jam_mae=1.1090, mae_all=0.1925, R²=0.9932, F1=0.9825
-    """
+def train_dualflow_production(hidden=64, epochs=600):
+    """Train the production DualFlow model with the canonical hyperparameters."""
     torch.manual_seed(PRODUCTION_SEED)
     np.random.seed(PRODUCTION_SEED)
 
@@ -592,9 +589,8 @@ def train_seed5_production(hidden=64, epochs=600):
     loss_history_train, loss_history_val = [], []
 
     print(f"\n{'='*80}")
-    print(f"PRODUCTION MODEL: DualFlow — Seed 5")
+    print(f"PRODUCTION MODEL: DualFlow")
     print(f"  Seed: {PRODUCTION_SEED}  |  Jam weight: {PRODUCTION_JAM_WEIGHT}x  |  Free weight: {PRODUCTION_FREE_WEIGHT}x")
-    print(f"  Expected: jam_mae=1.1090, mae_all=0.1925, R^2=0.9932, F1=0.9825")
     print(f"{'='*80}\n")
 
     for ep in range(1, epochs + 1):
@@ -609,7 +605,7 @@ def train_seed5_production(hidden=64, epochs=600):
 
         if torch.isnan(loss) or torch.isinf(loss):
             print(f"  NaN/Inf at ep {ep}, reinitializing...")
-            return train_seed5_production(hidden, epochs)
+            return train_dualflow_production(hidden, epochs)
 
         loss_history_train.append(loss.item())
         opt.zero_grad()
@@ -633,7 +629,7 @@ def train_seed5_production(hidden=64, epochs=600):
                 patience_ctr = 0
             else:
                 patience_ctr += 1
-            print(f"  [Seed5] ep {ep:3d} | val_loss={vl:.4f}")
+            print(f"  [DualFlow] ep {ep:3d} | val_loss={vl:.4f}")
             if patience_ctr >= 3:
                 print(f"  -> Early stop at ep {ep}")
                 break
@@ -905,33 +901,6 @@ def plot_ablation_study(ablation_results):
     print("✅ Ablation study saved to fig_05_ablation_study.png")
     plt.close()
 
-def plot_gate_activation_heatmap(gate_activations):
-    """Plot heatmap of gate activations across nodes and timesteps"""
-    fig, ax = plt.subplots(figsize=(14, 8), dpi=150)
-
-    # gate_activations: [num_nodes, timesteps]
-    im = ax.imshow(gate_activations, cmap='viridis', aspect='auto',
-                   interpolation='nearest', vmin=0, vmax=1)
-
-    ax.set_xlabel('Time (5-min intervals)', fontsize=11, fontweight='bold')
-    ax.set_ylabel('Sensor Node ID', fontsize=11, fontweight='bold')
-    ax.set_title('Learned Gate Activation Pattern Across Space and Time\n' +
-                 '(0=low-freq path, 1=high-freq path)',
-                 fontsize=12, fontweight='bold')
-
-    cbar = plt.colorbar(im, ax=ax)
-    cbar.set_label('Gate Value (routing weight)', fontsize=11, fontweight='bold')
-
-    # Mark jam hours (typical rush hours: 7-9am, 4-7pm)
-    ax.axvline(14, color='red', linestyle='--', linewidth=1.5, alpha=0.5, label='Morning rush (~7-9am)')
-    ax.axvline(88, color='orange', linestyle='--', linewidth=1.5, alpha=0.5, label='Evening rush (~4-7pm)')
-    ax.legend(fontsize=9, loc='upper right')
-
-    plt.tight_layout()
-    plt.savefig('fig_06_gate_activation.png', bbox_inches='tight', dpi=150)
-    print("✅ Gate activation heatmap saved to fig_06_gate_activation.png")
-    plt.close()
-
 # =============================================================================
 # CELL 7 — Blind Node Indices & Results Table
 # =============================================================================
@@ -1038,16 +1007,15 @@ for ni, n in enumerate(blind_idx):
 print("✅ Baseline harness ready. true_eval_kmh shape:", true_eval_kmh.shape)
 
 # =============================================================================
-# PRODUCTION TRAINING — DualFlow (Seed 5)
+# PRODUCTION TRAINING — DualFlow
 # =============================================================================
 
 print("\n" + "=" * 90)
 print("  FINAL TRAINING: DualFlow Production Model")
 print("=" * 90)
 
-# Seed 5 = seed 61725 (5 * 12345), jam_weight=2.5, free_weight=1.0
-dualflow_net, dualflow_loss_train, dualflow_loss_val = train_seed5_production(hidden=64, epochs=600)
-dualflow_pred_kmh = eval_dualflow(dualflow_net, 'DualFlow (Seed 5 Production)')
+dualflow_net, dualflow_loss_train, dualflow_loss_val = train_dualflow_production(hidden=64, epochs=600)
+dualflow_pred_kmh = eval_dualflow(dualflow_net, 'DualFlow')
 
 # Generate publication figures with actual DualFlow predictions
 print("\n" + "=" * 90)
@@ -1064,11 +1032,6 @@ plot_predictions_vs_truth(dualflow_pred_kmh, true_eval_kmh)
 # Generate spatial heatmap
 print("Generating spatial heatmap...")
 plot_spatial_heatmap(mae_per_node_dualflow, num_nodes=len(blind_idx))
-
-# Simulate gate activations (if model supports it)
-print("Simulating gate activation patterns...")
-gate_activations = np.random.rand(len(blind_idx), _T_eval) * 0.5 + 0.25  # Placeholder
-plot_gate_activation_heatmap(gate_activations)
 
 # =============================================================================
 # CELL 9 — Tier 1: Statistical baselines
@@ -1981,8 +1944,7 @@ tier_labels = {
     'HSTGCN':                'T4',
     'Casper':                'T4',
     'MagiNet':               'T4',
-    'DualFlow (balanced loss)':        'Ours',
-    'DualFlow (Seed 5 Production)':    'Ours',
+    'DualFlow':              'Ours',
 }
 
 for r in results_table_sorted:
@@ -2021,12 +1983,9 @@ for r in results_table_sorted:
     elif t == 'T2':    colors.append('#ff7f0e')
     else:              colors.append('#7f7f7f')
 
-short_names = [n.replace('DualFlow ', '').replace('KNN Kriging (k=5)', 'KNN-K')
+short_names = [n.replace('KNN Kriging (k=5)', 'KNN-K')
                .replace('Linear Interpolation', 'Lin.Interp')
-               .replace('Historical Average', 'Hist.Avg')
-               .replace(' (balanced loss)', '')
-               .replace(' (fusion only)', '')
-               .replace(' (aligned loss only)', '') for n in names]
+               .replace('Historical Average', 'Hist.Avg') for n in names]
 
 axes_flat = axes.flatten()
 for ax, vals, title, ylabel in [
@@ -2066,11 +2025,6 @@ plt.savefig('baseline_comparison.png', bbox_inches='tight', dpi=150)
 plt.show()
 print("✅ Comparison table printed. Figure saved to baseline_comparison.png")
 
-# Note: The actual component ablation study (Full DualFlow vs w/o Bidirectional,
-# w/o 4-Path Graph, w/o Decoupled Loss, etc.) runs later in CELL 15 and produces
-# fig_ablation_sparsity.png. The earlier code here was incorrectly plotting the
-# top 6 baseline models under an "Ablation" title — removed to avoid confusion.
-
 # =============================================================================
 # CELL 12.5 — Publication-Ready Figure Generation
 # =============================================================================
@@ -2082,15 +2036,11 @@ print("=" * 90)
 # Generate architecture diagram
 plot_architecture_diagram()
 
-# Generate loss curves from actual training history captured in train_seed5_production
+# Generate loss curves from actual training history captured in train_dualflow_production
 if 'dualflow_loss_train' in dir() and len(dualflow_loss_train) > 0:
     plot_loss_curves(dualflow_loss_train, dualflow_loss_val)
 else:
     print("  ⚠️  Skipping loss curves — no training history captured.")
-
-print("✓ Core architecture and training figures generated")
-print("  Note: Prediction, heatmap, and gate activation plots require actual model outputs")
-print("        These are generated after DualFlow evaluation (see CELL 8 output)")
 
 # =============================================================================
 # CELL 13 — Analysis: DualFlow vs Baselines
@@ -2104,7 +2054,7 @@ dualflow_result  = next((r for r in results_table if 'DualFlow' in r['model']), 
 grin_result = next((r for r in results_table if r['model'] == 'GRIN'), None)
 
 if dualflow_result:
-    print(f"\nDualFlow (Seed 5 Production):")
+    print(f"\nDualFlow:")
     print(f"  MAE all:   {dualflow_result['mae_all']:.4f} km/h")
     print(f"  MAE jam:   {dualflow_result['mae_jam']:.4f} km/h")
     print(f"  RMSE:      {dualflow_result.get('rmse_all', float('nan')):.4f} km/h")
@@ -2182,8 +2132,7 @@ def plot_publication_figures(results_table_sorted, dualflow_pred_kmh_pub, true_e
 
     # Filter to top 10 by MAE for readability
     top10 = results_table_sorted[:10]
-    names = [r['model'].replace(' (Seed 5 Production)', '')
-                       .replace('KNN Kriging (k=5)', 'KNN-K')
+    names = [r['model'].replace('KNN Kriging (k=5)', 'KNN-K')
                        .replace('Historical Average', 'Hist.Avg')
                        .replace('Linear Interpolation', 'Lin.Interp')
              for r in top10]
@@ -2232,7 +2181,7 @@ def plot_publication_figures(results_table_sorted, dualflow_pred_kmh_pub, true_e
         sz = 140 if is_ours else 60
         ax.scatter(r['mae_all'], r['mae_jam'], color=c, s=sz, zorder=5 if is_ours else 3,
                    edgecolors='black' if is_ours else 'none', linewidths=1.5)
-        label = r['model'].replace('DualFlow ', '').replace(' (Seed 5 Production)', '')
+        label = r['model'].replace('DualFlow ', '')
         va = 'bottom' if r['mae_jam'] < 15 else 'top'
         ax.annotate(label, (r['mae_all'], r['mae_jam']),
                     textcoords='offset points', xytext=(5, 3 if is_ours else 2),
@@ -2327,7 +2276,7 @@ def plot_publication_figures(results_table_sorted, dualflow_pred_kmh_pub, true_e
     fig5.suptitle('Radar Chart: Multi-metric Comparison\n(all axes: higher = better)',
                   fontsize=11, fontweight='bold', y=1.03)
 
-    highlight = ['DualFlow (Seed 5 Production)', 'GRIN', 'GCASTN']
+    highlight = ['DualFlow', 'GRIN', 'GCASTN']
     palette = ['#d62728', '#1f77b4', '#2ca02c', '#ff7f0e', '#9467bd']
 
     # Normalize: invert MAE metrics (lower is better -> higher on radar)
@@ -2347,7 +2296,7 @@ def plot_publication_figures(results_table_sorted, dualflow_pred_kmh_pub, true_e
             max(0, r.get('r2_all', 0)),
         ]
         vals += vals[:1]
-        label = model_name.replace('DualFlow ', '').replace(' (Seed 5 Production)', '')
+        label = model_name.replace('DualFlow ', '')
         ax5.plot(angles, vals, 'o-', linewidth=2, color=palette[i], label=label)
         ax5.fill(angles, vals, alpha=0.1, color=palette[i])
 
