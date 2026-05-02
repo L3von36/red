@@ -91,7 +91,7 @@ DualFlow's low variance (σ ≤ 0.012) vs baselines (σ ≤ 0.142) proves robust
 3. **Adaptive graph blending**: Per-node learned weights combine multiple graph topologies
 4. **Multi-seed evaluation**: Systematic 3-seed validation exposes single-seed luck and proves stability
 
-### Architecture Advantages over GRIN++
+### Architecture Highlights
 - **Bidirectional message passing**: RNN runs forward and backward, gathering context from all neighbors
 - **Learned path bias**: Per-node default preferences for each of 4 graph paths
 - **Context-dependent residuals**: Higher skip connections when more nodes are missing
@@ -144,7 +144,7 @@ The codebase includes 4 tiers of baselines:
 
 - **Tier 1 (Statistical)**: Mean, KNN, linear regression
 - **Tier 2 (RNN/Temporal)**: LSTM, GRU, Temporal CNN
-- **Tier 3 (GNN Imputation)**: GRIN, GRIN++, STGCN, ASTGCN
+- **Tier 3 (GNN Imputation)**: GRIN, STGCN, ASTGCN
 - **Tier 4 (Recent 2024-2025)**: ImputeFormer, HSTGCN, Casper, MagiNet
 
 All baselines are trained and evaluated under identical conditions (same seeds, train/val/test splits, blind masks) for fair comparison.

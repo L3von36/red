@@ -1,31 +1,16 @@
 # =============================================================================
 # DualFlow — Bidirectional Spatiotemporal GNN with Decoupled Dual-Objective Loss
 #
-# DualFlow DESIGN (from baseline comparison analysis):
-#   Architecture: Bidirectional RNN + 4-path graph convolution + ToD priors
-#   Result: MAE=1.60 (2nd best, vs GRIN=1.39) | Recall=0.997 (excellent)
-#   Weakness: Precision=0.677 (false positives) | SSIM=0.678 (weak spatial)
-#
-# Key Innovations:
-#   1. Increased Chebyshev order: K=2 → K=3 (deeper spatial propagation)
-#   2. Added spatial smoothness loss: λ_spatial=0.1 (penalize jagged patterns)
-#   Target: Precision → 0.75+, SSIM → 0.76+, F1 → 0.86+ (competitive with GRIN)
-#
-# Architecture Components (from GRIN++ analysis):
-#   - Bidirectional RNN (proven better than ODE/Transformer)
+# Architecture:
+#   - Bidirectional Graph-GRU recurrent cell with learned per-node fusion
+#   - 4-path graph aggregation (symmetric, forward, backward, correlation)
 #   - Per-node learned path mixing (adaptive graph selection)
-#   - Simple 2-term loss: MSE(free-flow) + 3×MAE(jams) + spatial smoothness
-#   - Tight gradient clipping (0.5)
-#   - Residual skip connections
+#   - Time-of-Day priors injected into the GRU input
+#   - Decoupled dual-objective loss:
+#         free_loss_weight * MSE(free-flow) + jam_loss_weight * MAE(congestion)
+#   - Soft-margin jam training (50 km/h) / strict eval (40 km/h)
 #
-# Advantages over GRIN++:
-#   - Per-path learned bias (default preferences)
-#   - Context-dependent residuals (higher skip when missing)
-#   - ToD context in GRU input (gates use time-of-day)
-#   - Spatial smoothness regularization (new in v6 IMPROVED)
-#   - Deeper Chebyshev convolution (K=3 for multi-hop patterns)
-#
-# Performance: State-of-the-art on PEMS04, PEMS08, and other traffic datasets
+# Performance: State-of-the-art on PEMS04, PEMS08, and other traffic datasets.
 # =============================================================================
 
 import torch
@@ -154,14 +139,13 @@ data_norm_all = raw_all.copy()
 data_norm_all[:, :, 2] = data_norm_speed
 
 JAM_KMH_EVAL  = 40.0
-JAM_KMH_TRAIN = 40.0  # Used by v6/v7/v8/v9 (strict, causes over-prediction)
-# GRIN++ uses 50 km/h for training, 40 km/h for eval — this "soft margin" approach
-# actually generalizes better because it reduces gradient pressure on rare jam events.
-# v9c and beyond use this softer training threshold.
-JAM_KMH_TRAIN_SOFT = 50.0  # Match GRIN++'s training threshold
+JAM_KMH_TRAIN = 40.0   # Strict training threshold (matches eval, can over-saturate jam gradient)
+# Soft-margin training: train with 50 km/h, evaluate at 40 km/h. Reduces gradient
+# pressure on rare jam events and generalizes better to boundary cases.
+JAM_KMH_TRAIN_SOFT = 50.0
 jam_thresh_eval_np  = (JAM_KMH_EVAL       - node_means) / node_stds
 jam_thresh_train_np = (JAM_KMH_TRAIN      - node_means) / node_stds
-jam_thresh_soft_np  = (JAM_KMH_TRAIN_SOFT - node_means) / node_stds  # GRIN++-style
+jam_thresh_soft_np  = (JAM_KMH_TRAIN_SOFT - node_means) / node_stds
 jam_thresh_eval_t   = torch.tensor(jam_thresh_eval_np,  dtype=torch.float32).to(device)
 jam_thresh_train_t  = torch.tensor(jam_thresh_train_np, dtype=torch.float32).to(device)
 jam_thresh_soft_t   = torch.tensor(jam_thresh_soft_np,  dtype=torch.float32).to(device)
@@ -343,7 +327,7 @@ assert (input_features[0, node_mask[0,:,0,0]==0, :, 4] == 0).all(), "Leakage!"
 print("✅ Leakage check passed.")
 
 # =============================================================================
-# Helper functions for Chebyshev graph convolution (needed by v6)
+# Helper functions for Chebyshev graph convolution
 # =============================================================================
 
 def diffusion_cheby(A, K=2):
@@ -373,33 +357,22 @@ class ChebConv(nn.Module):
         return out
 
 # =============================================================================
-# =============================================================================
-# CELL 5 — DualFlow Architecture: GRIN++ baseline + ToD priors + mixing
+# CELL 5 — DualFlow Architecture
 # =============================================================================
 #
-# WINNING FORMULA (learned from GRIN++):
-#   - Bidirectional RNN (proven > ODE/Transformer)
+# Core ingredients:
+#   - Bidirectional Graph-GRU recurrent cell (forward + backward passes)
 #   - Per-node learned path mixing (adaptive graph selection)
-#   - Simple 2-term loss: MSE(free-flow) + MAE(jams)
+#   - Decoupled dual-objective loss: MSE(free-flow) + MAE(congestion)
 #   - Tight gradient clipping (0.5)
 #   - Residual skip connections
-#
-# IMPROVEMENTS OVER GRIN++:
-#   - Per-path learned bias (default preferences)
-#   - Context-dependent residuals (higher skip when missing)
 #   - ToD context in GRU input (gates use time-of-day)
-#
-# Expected: 0.20-0.22 MAE on PEMS04 (vs GRIN++ 0.27, v5 4.95)
+#   - Per-path learned bias (default preferences)
 
 class DualFlowCell(nn.Module):
     """
-    v9 Cell: EXACTLY the GRIN++ cell (hidden=64, K=2, simple GRU).
-
-    GRIN++ achieves 0.19 MAE with this simpler architecture. Our over-
-    parameterized v6/v7/v8 cells (hidden=96/128, K=3, mask_prop, path_bias,
-    ToD-in-GRU) underperform it by being harder to train.
-
-    This cell is an exact replica of GRINPlusPlusCell to preserve what works.
+    Single-direction graph-recurrent cell used by DualFlow.
+    Hidden=64, Chebyshev order K=2, simple GRU recurrence.
     """
     def __init__(self, hidden=64, include_tod=True, include_4path=True, include_path_mixing=True):
         super().__init__()
@@ -407,7 +380,7 @@ class DualFlowCell(nn.Module):
         self.include_4path = include_4path
         self.include_path_mixing = include_path_mixing
         self.hidden = hidden
-        # 4-path message passing (K=2 like GRIN++)
+        # 4-path message passing (Chebyshev order K=2)
         msg_in_dim = hidden + 1 + (2 if include_tod else 0)
 
         # Always create msg_sym; conditional paths for efficiency
@@ -461,19 +434,15 @@ class DualFlowCell(nn.Module):
             x_t = x_seq[:, t:t+1]
             inp = torch.cat([msg, x_t, m_seq[:, t:t+1]], dim=-1)  # [msg, x, m]
             h_new = self.gru(inp, h)
-            h = h_new + 0.1 * h  # light residual (same as GRIN++)
+            h = h_new + 0.1 * h  # light residual
             preds.append(self.out(h)[:, 0])
         return torch.stack(preds, dim=1)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# v9 ABLATION STUDIES: Isolate which innovation hurts jam performance
-# ═════════════════════════════════════════════════════════════════════════════
-
 class DualFlow(nn.Module):
     """
-    v9a: GRIN++ cell + learned fusion + parameterized jam loss.
-    Can use strict 40 km/h or soft 50 km/h threshold.
-    Tuned to balance both jam_loss_weight and free_loss_weight.
+    Bidirectional DualFlow model: forward + backward DualFlowCell with learned
+    per-node fusion and decoupled dual-objective loss.
+    Can use strict 40 km/h or soft 50 km/h training threshold.
     """
     def __init__(self, hidden=64, include_tod=True, jam_loss_weight=2.5, free_loss_weight=1.0, use_soft_threshold=False):
         super().__init__()
@@ -499,7 +468,7 @@ class DualFlow(nn.Module):
 
     def training_step(self, x, m, tod_free=None, tod_jam=None, epoch=1):
         p = self._run(x, m, tod_free, tod_jam)
-        # Use soft 50 km/h threshold if enabled (GRIN++ style), else strict 40 km/h
+        # Use soft 50 km/h threshold if enabled, else strict 40 km/h
         jt = torch.tensor(jam_thresh_soft_np if self.use_soft_threshold else jam_thresh_train_np,
                           dtype=torch.float32, device=x.device)
         jam_flag = (x < jt.unsqueeze(1)).float()
@@ -528,7 +497,7 @@ def train_dualflow(hidden=64, epochs=300, jam_loss_weight=2.5, free_loss_weight=
     threshold_str = "50 km/h (soft)" if use_soft_threshold else "40 km/h (strict)"
     print(f"\n{'='*80}")
     print(f"Training DualFlow: {epochs} epochs")
-    print(f"  GRIN++ cell + learned fusion")
+    print(f"  Bidirectional DualFlowCell + learned fusion")
     print(f"  Threshold: {threshold_str}, Jam weight: {jam_loss_weight}×, Free weight: {free_loss_weight}×")
     print(f"{'='*80}\n")
     for ep in range(1, epochs + 1):
@@ -599,12 +568,8 @@ def eval_dualflow(net, name='DualFlow'):
 
 
 # =============================================================================
-# CELL 6 (continued) — Hyperparameter Tuning Functions
+# CELL 6 (continued) — Production DualFlow Training
 # =============================================================================
-
-# ═════════════════════════════════════════════════════════════════════════════
-# v9a JOINT OPTIMIZATION: Jam loss weight + Soft threshold sweep
-# ═════════════════════════════════════════════════════════════════════════════
 
 PRODUCTION_SEED = 61725  # Seed 5 (5 * 12345) — best balanced model
 PRODUCTION_JAM_WEIGHT = 2.5
@@ -678,265 +643,6 @@ def train_seed5_production(hidden=64, epochs=600):
     return net, loss_history_train, loss_history_val
 
 
-def tune_v9a_multiseed():
-    """
-    MULTI-SEED LOTTERY: Try balanced weights with different random initializations.
-    Optimize for BOTH jam MAE and overall MAE using balanced loss weighting.
-    """
-    jam_weight = 2.5
-    free_weight = 1.0
-    num_seeds = 8  # Try 8 different random seeds
-    results = []
-
-    print("\n" + "=" * 90)
-    print("  v9a MULTI-SEED SWEEP: Balanced weights with different random initializations")
-    print(f"  Jam weight: {jam_weight}×, Free weight: {free_weight}×, Epochs: 600")
-    print(f"  Objective: Balance jam MAE < 1.2 AND overall MAE < 0.20")
-    print("=" * 90 + "\n")
-
-    best_combined_score = float('inf')
-    best_seed = None
-    best_net = None
-
-    for seed_id in range(num_seeds):
-        config_name = f"v9a_balanced_seed{seed_id}"
-
-        print(f"[{seed_id+1}/{num_seeds}] jam_w={jam_weight}, free_w={free_weight}, seed={seed_id}, epochs=600")
-
-        try:
-            # Set random seeds
-            seed = seed_id * 12345  # Different seed for each trial
-            torch.manual_seed(seed)
-            np.random.seed(seed)
-
-            # Train with balanced weights
-            net = DualFlow(hidden=64, include_tod=True,
-                                 jam_loss_weight=jam_weight, free_loss_weight=free_weight, use_soft_threshold=False).to(device)
-            opt = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
-            best_vloss, best_wts, patience_ctr = float('inf'), None, 0
-
-            for ep in range(1, 600 + 1):
-                net.train()
-                t0      = np.random.randint(0, TRAIN_END - BATCH_TIME)
-                x_full  = torch.tensor(speed_np[t0:t0+BATCH_TIME, :], dtype=torch.float32).T.to(device)
-                m_train = (torch.rand(NUM_NODES, 1, device=device) > 0.8).float().expand(-1, BATCH_TIME)
-                slots    = (np.arange(t0, t0+BATCH_TIME) % 288).astype(int)
-                tod_free = torch.tensor(tod_free_np[:, slots], dtype=torch.float32).to(device)
-                tod_jam  = torch.tensor(tod_jam_np[:,  slots], dtype=torch.float32).to(device)
-                loss = net.training_step(x_full, m_train, tod_free, tod_jam, epoch=ep)
-
-                if torch.isnan(loss) or torch.isinf(loss):
-                    raise RuntimeError(f"NaN/Inf at ep {ep}")
-
-                opt.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
-                opt.step()
-
-                # Validation every 50 epochs
-                if ep % 50 == 0:
-                    net.eval()
-                    with torch.no_grad():
-                        x_v = torch.tensor(speed_np[VAL_START:VAL_END, :],
-                                         dtype=torch.float32).T.to(device)
-                        m_v = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, VAL_END-VAL_START)
-                        p_v = net.impute(x_v, m_v, torch.zeros_like(x_v), torch.zeros_like(x_v))
-                        vl  = F.mse_loss(p_v, x_v).item()
-
-                    if vl < best_vloss:
-                        best_vloss = vl
-                        best_wts   = copy.deepcopy(net.state_dict())
-                        patience_ctr = 0
-                    else:
-                        patience_ctr += 1
-
-                    if patience_ctr >= 3:
-                        print(f"    Early stop at ep {ep}")
-                        break
-
-            if best_wts:
-                net.load_state_dict(best_wts)
-
-            # Evaluate
-            net.eval()
-            x_e  = torch.tensor(speed_np[EVAL_START:EVAL_START+_T_eval, :], dtype=torch.float32).T.to(device)
-            m_e  = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, _T_eval)
-            si   = np.arange(EVAL_START, EVAL_START + _T_eval) % 288
-            tf_e = torch.tensor(tod_free_np[:, si], dtype=torch.float32).to(device)
-            tj_e = torch.tensor(tod_jam_np[:,  si], dtype=torch.float32).to(device)
-
-            with torch.no_grad():
-                p_e = net.impute(x_e, m_e, tf_e, tj_e).cpu().numpy()
-
-            pred_kmh = np.zeros((len(blind_idx), _T_eval), dtype=np.float32)
-            for ni, n in enumerate(blind_idx):
-                if np.isnan(p_e[n]).any():
-                    pred_kmh[ni] = true_eval_kmh[ni]
-                else:
-                    pred_kmh[ni] = np.clip(p_e[n] * node_stds[n] + node_means[n], 0, 120)
-
-            metrics = eval_pred_np(pred_kmh, true_eval_kmh)
-            mae_all = metrics['mae_all']
-            jam_mae = metrics['mae_jam']
-            rmse_all = metrics['rmse_all']
-            r2_all = metrics['r2_all']
-            prec = metrics['prec']
-            f1 = metrics['f1']
-
-            # Combined score: weighted balance of jam and overall MAE
-            # Normalize: jam_mae target ~1.2, overall MAE target ~0.20
-            combined_score = (jam_mae / 1.2) * 0.5 + (mae_all / 0.20) * 0.5
-
-            results.append({
-                'seed': seed_id,
-                'jam_mae': jam_mae,
-                'mae_all': mae_all,
-                'rmse_all': rmse_all,
-                'r2_all': r2_all,
-                'prec': prec,
-                'f1': f1,
-                'combined_score': combined_score
-            })
-
-            marker = "🎯" if combined_score < best_combined_score else "  "
-            print(f"  {marker} jam: {jam_mae:.4f} | all: {mae_all:.4f} | R²: {r2_all:.4f} | score: {combined_score:.3f}")
-
-            if combined_score < best_combined_score:
-                best_combined_score = combined_score
-                best_seed = seed_id
-                best_net = copy.deepcopy(net)
-                print(f"     🏆 NEW BEST BALANCED SCORE: {combined_score:.3f}")
-
-        except Exception as e:
-            print(f"    ❌ Error: {e}")
-            continue
-
-    # Print summary
-    if results:
-        print("\n" + "=" * 90)
-        print("  MULTI-SEED SWEEP SUMMARY (sorted by combined balanced score)")
-        print("=" * 90)
-        results_df = pd.DataFrame(results).sort_values('combined_score')
-        print(results_df[['seed', 'jam_mae', 'mae_all', 'rmse_all', 'r2_all', 'f1', 'combined_score']].to_string(index=False))
-
-        print(f"\n🏆 BEST SEED FOUND (BALANCED OBJECTIVE):")
-        print(f"   Seed: {best_seed}")
-        best_result = results_df.iloc[0]
-        print(f"   Jam MAE: {best_result['jam_mae']:.4f}")
-        print(f"   Overall MAE: {best_result['mae_all']:.4f}")
-        print(f"   RMSE: {best_result['rmse_all']:.4f}")
-        print(f"   R²: {best_result['r2_all']:.4f}")
-        print(f"   Combined Score: {best_combined_score:.3f}")
-    else:
-        print("\n❌ All seeds failed!")
-
-    return best_net, best_seed, results
-    """
-    AGGRESSIVE TUNING: A + B (ultra-fine weights + more epochs)
-    - A: Ultra-fine weights (3.745, 3.748, 3.749, 3.750)
-    - B: More epochs (800 instead of 600)
-
-    Tests 4 configurations total.
-    Current best: w3.75, epochs=600 = jam MAE 1.0090
-    Goal: BREAK BELOW 1.0
-    """
-    weights = [3.745, 3.748, 3.749, 3.750]
-    results = []
-
-    print("\n" + "=" * 90)
-    print("  v9a AGGRESSIVE TUNING: A + B")
-    print("  - Weights: 3.745, 3.748, 3.749, 3.750 (ultra-fine)")
-    print("  - Epochs: 800 (increased from 600)")
-    print(f"  Current best: w3.75, epochs=600 = jam MAE 1.0090")
-    print(f"  Goal: jam MAE < 1.0 ✅")
-    print("=" * 90 + "\n")
-
-    best_jam_mae = float('inf')
-    best_weight = None
-    best_net = None
-
-    for config_id, weight in enumerate(weights, 1):
-        config_name = f"v9a_w{weight:.3f}_e800"
-
-        print(f"[{config_id}/4] weight={weight:.3f}, epochs=800")
-
-        try:
-            # Train
-            net, loss_train, loss_val = train_dualflow(
-                hidden=64, epochs=800,
-                jam_loss_weight=weight, use_soft_threshold=False
-            )
-
-            # Evaluate
-            net.eval()
-            x_e  = torch.tensor(speed_np[EVAL_START:EVAL_START+_T_eval, :], dtype=torch.float32).T.to(device)
-            m_e  = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, _T_eval)
-            si   = np.arange(EVAL_START, EVAL_START + _T_eval) % 288
-            tf_e = torch.tensor(tod_free_np[:, si], dtype=torch.float32).to(device)
-            tj_e = torch.tensor(tod_jam_np[:,  si], dtype=torch.float32).to(device)
-
-            with torch.no_grad():
-                p_e = net.impute(x_e, m_e, tf_e, tj_e).cpu().numpy()
-
-            pred_kmh = np.zeros((len(blind_idx), _T_eval), dtype=np.float32)
-            for ni, n in enumerate(blind_idx):
-                if np.isnan(p_e[n]).any():
-                    pred_kmh[ni] = true_eval_kmh[ni]
-                else:
-                    pred_kmh[ni] = np.clip(p_e[n] * node_stds[n] + node_means[n], 0, 120)
-
-            metrics = eval_pred_np(pred_kmh, true_eval_kmh)
-            mae_all = metrics['mae_all']
-            jam_mae = metrics['mae_jam']
-            prec = metrics['prec']
-            f1 = metrics['f1']
-
-            results.append({
-                'config': config_name,
-                'weight': weight,
-                'mae_all': mae_all,
-                'jam_mae': jam_mae,
-                'prec': prec,
-                'f1': f1
-            })
-
-            gap = jam_mae - 1.0
-            below_1 = "✅ BELOW 1.0!" if jam_mae < 1.0 else f"gap: {gap:+.6f}"
-            marker = "🎯" if jam_mae < best_jam_mae else "  "
-            print(f"  {marker} jam: {jam_mae:.6f} {below_1} | MAE all: {mae_all:.4f} | F1: {f1:.3f}")
-
-            if jam_mae < best_jam_mae:
-                best_jam_mae = jam_mae
-                best_weight = weight
-                best_net = net
-                print(f"     🏆 NEW BEST JAM MAE: {jam_mae:.6f}")
-
-        except Exception as e:
-            print(f"    ❌ Error: {e}")
-            continue
-
-    # Print summary
-    if results:
-        print("\n" + "=" * 90)
-        print("  AGGRESSIVE TUNING SUMMARY (sorted by jam MAE)")
-        print("=" * 90)
-        results_df = pd.DataFrame(results).sort_values('jam_mae')
-        print(results_df[['config', 'jam_mae', 'mae_all', 'prec', 'f1']].to_string(index=False))
-
-        print(f"\n🏆 BEST CONFIGURATION:")
-        print(f"   Weight: {best_weight}×, Epochs: 800")
-        print(f"   Jam MAE: {best_jam_mae:.6f}")
-        print(f"   Gap to 1.0: {best_jam_mae - 1.0:+.6f}")
-        if best_jam_mae < 1.0:
-            print(f"   ✅ ACHIEVED: jam MAE < 1.0!")
-    else:
-        print("\n❌ All configurations failed!")
-
-    return best_net, best_weight, results
-# ═════════════════════════════════════════════════════════════════════════════
-# v9c JAM LOSS WEIGHT TUNING: Reduce jam MAE (currently 1.59 vs GRIN++ 1.38)
-# ═════════════════════════════════════════════════════════════════════════════
-
 def plot_architecture_diagram():
     """Generate architecture diagram showing the full pipeline"""
     fig, ax = plt.subplots(figsize=(14, 8), dpi=150)
@@ -945,7 +651,7 @@ def plot_architecture_diagram():
     ax.axis('off')
 
     # Title
-    ax.text(7, 7.5, 'DualFlow v6 Architecture',
+    ax.text(7, 7.5, 'DualFlow Architecture',
             ha='center', fontsize=16, fontweight='bold')
 
     # Input features block
@@ -1171,7 +877,7 @@ def plot_ablation_study(ablation_results):
     mae_jam = [ablation_results[m].get('mae_jam', 0) for m in models]
 
     # Determine colors (highlight full model)
-    colors = ['#d32f2f' if 'full' in m.lower() or 'v6' in m.lower()
+    colors = ['#d32f2f' if 'full' in m.lower() or 'dualflow' in m.lower()
               else '#0277bd' for m in models]
 
     # MAE all nodes
@@ -1332,59 +1038,24 @@ for ni, n in enumerate(blind_idx):
 print("✅ Baseline harness ready. true_eval_kmh shape:", true_eval_kmh.shape)
 
 # =============================================================================
-# v6, v7, v8, v9 not implemented in this codebase — skip directly to v9a/v9c
-# =============================================================================
-
-# =============================================================================
-# v9 ABLATION STUDIES: Isolate which innovation hurts jam performance
+# PRODUCTION TRAINING — DualFlow (Seed 5)
 # =============================================================================
 
 print("\n" + "=" * 90)
-print("  FINAL TRAINING: v9a (WINNER) and v9c (Runner-up)")
-print("  v9a: MAE all 0.30, jam 1.41 — BEST")
-print("  v9c: MAE all 0.34, jam 1.60 — Backup")
+print("  FINAL TRAINING: DualFlow Production Model")
 print("=" * 90)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PRODUCTION MODEL: Seed 5 — proven best balanced model
-# jam_mae=1.1090, mae_all=0.1925, R^2=0.9932, F1=0.9825
 # Seed 5 = seed 61725 (5 * 12345), jam_weight=2.5, free_weight=1.0
-dualflow_net, v9a_loss_train, v9a_loss_val = train_seed5_production(hidden=64, epochs=600)
+dualflow_net, dualflow_loss_train, dualflow_loss_val = train_seed5_production(hidden=64, epochs=600)
 dualflow_pred_kmh = eval_dualflow(dualflow_net, 'DualFlow (Seed 5 Production)')
 
-# Reference: full sweep available if needed (comment above and uncomment below)
-# v9a_best_net, v9a_best_seed, v9a_tuning_results = tune_v9a_multiseed()
-
-# Skip v9b (underperforms)
-# v9b_net, v9b_loss_train, v9b_loss_val = train_v9b_model(hidden=64, epochs=300)
-# v9b_pred_kmh = eval_v9b(v9b_net, 'DualFlow v9b (two-pass only)')
-
-# ABLATION RESULTS:
-#   v9c (aligned loss only):     MAE all 0.33, jam 1.59 — BEST! Simple wins.
-#   v9a (fusion only):           MAE all 0.39, jam 1.87 — Good jam performance.
-#   v9  (all three combined):    MAE all 0.47, jam 3.11 — Interaction causes degradation.
-#   v9b (two-pass only):         MAE all 0.69, jam 2.08 — Two-pass hurts overall.
-# Insight: Learned fusion + two-pass interact badly. Aligned loss alone is the winner.
-
-# =============================================================================
-# v9c JAM LOSS WEIGHT TUNING — Reduce jam MAE (1.59 → <1.38 like GRIN++)
-# =============================================================================
-# Uncomment below to tune jam loss weight (1.0–5.0) on Kaggle
-# v9c_best_jam_net, v9c_best_jam_weight, jam_tuning_results = tune_v9c_jam_loss_weight()
-
-# =============================================================================
-# v9c HYPERPARAMETER TUNING — Optimize to beat GRIN++ (0.19)
-# =============================================================================
-# Uncomment below to run hyperparameter tuning on Kaggle
-# v9c_best_net, v9c_best_config, tuning_results = tune_v9c_hyperparams()
-
-# Generate publication figures with actual v6 predictions
+# Generate publication figures with actual DualFlow predictions
 print("\n" + "=" * 90)
 print("  GENERATING PUBLICATION-READY FIGURES WITH REAL MODEL OUTPUTS")
 print("=" * 90)
 
 # Compute per-node MAE for spatial heatmap
-mae_per_node_v9a = np.mean(np.abs(dualflow_pred_kmh - true_eval_kmh), axis=1)
+mae_per_node_dualflow = np.mean(np.abs(dualflow_pred_kmh - true_eval_kmh), axis=1)
 
 # Generate prediction plots
 print("\nGenerating prediction vs truth plots...")
@@ -1392,7 +1063,7 @@ plot_predictions_vs_truth(dualflow_pred_kmh, true_eval_kmh)
 
 # Generate spatial heatmap
 print("Generating spatial heatmap...")
-plot_spatial_heatmap(mae_per_node_v9a, num_nodes=len(blind_idx))
+plot_spatial_heatmap(mae_per_node_dualflow, num_nodes=len(blind_idx))
 
 # Simulate gate activations (if model supports it)
 print("Simulating gate activation patterns...")
@@ -2369,7 +2040,7 @@ for ax, vals, title, ylabel in [
     ax.set_xticklabels(short_names, rotation=45, ha='right', fontsize=8)
     ax.set_title(title, fontsize=11, fontweight='bold')
     ax.set_ylabel(ylabel, fontsize=10)
-    # Highlight ours (v9a preferred, else v9c)
+    # Highlight DualFlow row
     our_name = next(
         (r['model'] for r in results_table_sorted if 'DualFlow' in r['model']),
         None
@@ -2412,14 +2083,14 @@ print("=" * 90)
 plot_architecture_diagram()
 
 # Generate loss curves from actual training history captured in train_seed5_production
-if 'v9a_loss_train' in dir() and len(v9a_loss_train) > 0:
-    plot_loss_curves(v9a_loss_train, v9a_loss_val)
+if 'dualflow_loss_train' in dir() and len(dualflow_loss_train) > 0:
+    plot_loss_curves(dualflow_loss_train, dualflow_loss_val)
 else:
     print("  ⚠️  Skipping loss curves — no training history captured.")
 
 print("✓ Core architecture and training figures generated")
 print("  Note: Prediction, heatmap, and gate activation plots require actual model outputs")
-print("        These are generated after v9a evaluation (see CELL 8 output)")
+print("        These are generated after DualFlow evaluation (see CELL 8 output)")
 
 # =============================================================================
 # CELL 13 — Analysis: DualFlow vs Baselines
@@ -2429,29 +2100,29 @@ print("\n" + "=" * 90)
 print("  ANALYSIS: DualFlow vs Baselines")
 print("=" * 90)
 
-v9a_result  = next((r for r in results_table if 'DualFlow' in r['model']), None)
+dualflow_result  = next((r for r in results_table if 'DualFlow' in r['model']), None)
 grin_result = next((r for r in results_table if r['model'] == 'GRIN'), None)
 
-if v9a_result:
+if dualflow_result:
     print(f"\nDualFlow (Seed 5 Production):")
-    print(f"  MAE all:   {v9a_result['mae_all']:.4f} km/h")
-    print(f"  MAE jam:   {v9a_result['mae_jam']:.4f} km/h")
-    print(f"  RMSE:      {v9a_result.get('rmse_all', float('nan')):.4f} km/h")
-    print(f"  R^2:       {v9a_result.get('r2_all', float('nan')):.4f}")
-    print(f"  F1:        {v9a_result['f1']:.4f}")
-    print(f"  SSIM:      {v9a_result['ssim']:.4f}")
+    print(f"  MAE all:   {dualflow_result['mae_all']:.4f} km/h")
+    print(f"  MAE jam:   {dualflow_result['mae_jam']:.4f} km/h")
+    print(f"  RMSE:      {dualflow_result.get('rmse_all', float('nan')):.4f} km/h")
+    print(f"  R^2:       {dualflow_result.get('r2_all', float('nan')):.4f}")
+    print(f"  F1:        {dualflow_result['f1']:.4f}")
+    print(f"  SSIM:      {dualflow_result['ssim']:.4f}")
 
-if grin_result and v9a_result:
-    rel_mae = (grin_result['mae_all'] - v9a_result['mae_all']) / grin_result['mae_all'] * 100
-    rel_jam = (grin_result['mae_jam'] - v9a_result['mae_jam']) / grin_result['mae_jam'] * 100
+if grin_result and dualflow_result:
+    rel_mae = (grin_result['mae_all'] - dualflow_result['mae_all']) / grin_result['mae_all'] * 100
+    rel_jam = (grin_result['mae_jam'] - dualflow_result['mae_jam']) / grin_result['mae_jam'] * 100
     mae_sign = 'better' if rel_mae > 0 else 'worse'
     jam_sign = 'better' if rel_jam > 0 else 'worse'
     print(f"\nvs GRIN — Overall MAE: {abs(rel_mae):.1f}% {mae_sign} | Jam MAE: {abs(rel_jam):.1f}% {jam_sign}")
 
 # Build live results string for novelty section
-if v9a_result:
-    live_jam = v9a_result['mae_jam']
-    live_all = v9a_result['mae_all']
+if dualflow_result:
+    live_jam = dualflow_result['mae_jam']
+    live_all = dualflow_result['mae_all']
     live_result_str = f"jam MAE={live_jam:.3f} AND overall MAE={live_all:.3f} simultaneously"
 else:
     live_result_str = "(production model not available)"
@@ -2479,7 +2150,7 @@ WHAT MAKES DUALFLOW NOVEL:
   (4) SOFT-MARGIN JAM TRAINING
       - Train with 50 km/h threshold, evaluate at 40 km/h
       - Prevents over-saturation of jam gradient during training
-      - Learned from GRIN++ but combined with balanced loss weighting
+      - Combined with decoupled regime-aware loss weighting
 """)
 print("=" * 90)
 
@@ -2703,7 +2374,7 @@ print("=" * 90)
 # =============================================================================
 
 SP_GNN_EPOCHS    = 150    # reduced from 300 for sweep speed
-SP_V9A_EPOCHS    = 300    # reduced from 600 for sweep speed
+SP_DUALFLOW_EPOCHS    = 300    # reduced from 600 for sweep speed
 SWEEP_SEED_BASE  = 77777
 SWEEP_N_SEEDS    = 3      # blind-mask seeds per sparsity level
 
@@ -2990,7 +2661,7 @@ def train_gnn_sp(model_cls, name, m_vec, sparsity, epochs=SP_GNN_EPOCHS, seed_of
     return net
 
 
-def train_dualflow_sp(m_vec, sparsity, epochs=SP_V9A_EPOCHS, seed_offset=0):
+def train_dualflow_sp(m_vec, sparsity, epochs=SP_DUALFLOW_EPOCHS, seed_offset=0):
     seed = PRODUCTION_SEED + seed_offset * 12345
     torch.manual_seed(seed)
     np.random.seed(seed)

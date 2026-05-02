@@ -52,40 +52,36 @@ total_loss = loss_free + loss_jam
    - No regime awareness
    - Single-metric optimization
 
-2. **GRIN++** (Xie et al., 2022+): Enhanced GRIN with attention
-   - Still uses single MAE
-   - No decoupling by traffic state
-
-3. **STGCN** (Yu et al., 2018): GCN + Conv, single MSE loss
+2. **STGCN** (Yu et al., 2018): GCN + Conv, single MSE loss
    - Uniform optimization across conditions
 
-4. **Casper** (Tuli et al., 2024): Causal GCN + prompt decoder
+3. **Casper** (Tuli et al., 2024): Causal GCN + prompt decoder
    - Single loss per reconstruction
    - No regime-aware weighting
 
-5. **ImputeFormer** (Nie et al., 2024, KDD): Low-rank + spatial attention
+4. **ImputeFormer** (Nie et al., 2024, KDD): Low-rank + spatial attention
    - Single masked imputation loss
    - No traffic-condition coupling
 
-6. **HSTGCN** (2024): Hierarchical node pooling + GCN
+5. **HSTGCN** (2024): Hierarchical node pooling + GCN
    - Single reconstruction loss
    - Regime-agnostic
 
-7. **MagiNet** (2025, ACM TKDD): Mask-aware GCN paths
+6. **MagiNet** (2025, ACM TKDD): Mask-aware GCN paths
    - Per-node mask awareness
    - NOT regime-aware; mask-aware ≠ traffic-regime aware
 
 ### Unique Aspects of DualFlow
 
-| Feature | GRIN | GRIN++ | Casper | ImputeFormer | HSTGCN | MagiNet | DualFlow |
-|---|---|---|---|---|---|---|---|
-| **Dual-objective loss** | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ |
-| **Regime-aware weighting** | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ |
-| **Separate MSE+MAE** | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ |
-| **4-path graph blending** | ✗ | ~1 | ✗ | ✗ | ✗ | ✗ | ✓ |
-| **Per-node learned mixing** | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ |
-| Bidirectional RNN | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ |
-| Multi-seed evaluation | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ |
+| Feature | GRIN | Casper | ImputeFormer | HSTGCN | MagiNet | DualFlow |
+|---|---|---|---|---|---|---|
+| **Dual-objective loss** | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ |
+| **Regime-aware weighting** | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ |
+| **Separate MSE+MAE** | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ |
+| **4-path graph blending** | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ |
+| **Per-node learned mixing** | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ |
+| Bidirectional RNN | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ |
+| Multi-seed evaluation | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ |
 
 ### Quantifiable Improvement
 
