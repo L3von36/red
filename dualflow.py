@@ -386,7 +386,9 @@ def train_dualflow_production(hidden=64, epochs=600):
                 patience_ctr = 0
             else:
                 patience_ctr += 1
-            print(f"  [DualFlow] ep {ep:3d} | val_loss={vl:.4f}")
+            mae_v = torch.mean(torch.abs(p_v - x_v) * m_v).item()
+            rmse_v = torch.sqrt(torch.mean(((p_v - x_v) * m_v) ** 2)).item()
+            print(f"  [DualFlow] ep {ep:3d} | loss={vl:.4f} | MAE={mae_v:.4f} | RMSE={rmse_v:.4f}")
             if patience_ctr >= 3:
                 print(f"  -> Early stop at ep {ep}")
                 break
