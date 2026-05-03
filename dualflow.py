@@ -313,8 +313,16 @@ class DualFlow(nn.Module):
         jam_flag = (x < jt.unsqueeze(1)).float()
         free_flag = 1.0 - jam_flag
         loss_free = torch.mean(((p - x) * m * free_flag) ** 2) * self.free_loss_weight
-        loss_jam = torch.mean(torch.abs(p - x) * m * jam_flag) * self.jam_loss_weight
-        return loss_free + loss_jam
+
+        delta = 2.0
+        diff_jam = torch.abs((p - x) * m * jam_flag)
+        huber_jam = torch.where(diff_jam < delta,
+                                0.5 * diff_jam ** 2,
+                                delta * (diff_jam - 0.5 * delta))
+        loss_jam = torch.mean(huber_jam) * self.jam_loss_weight
+
+        rmse_reg = torch.mean(((p - x) * m) ** 2) * 0.1
+        return loss_free + loss_jam + rmse_reg
 
     def impute(self, x, m, tod_free=None, tod_jam=None):
         return m * x + (1.0 - m) * self._run(x, m, tod_free, tod_jam)
