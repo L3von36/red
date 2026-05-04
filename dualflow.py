@@ -312,19 +312,19 @@ class DualFlow(nn.Module):
                           dtype=torch.float32, device=x.device)
         jam_flag = (x < jt.unsqueeze(1)).float()
         free_flag = 1.0 - jam_flag
-        # Supervise blind nodes (1-m): we have ground truth during training.
-        # Training task = imputation, matching eval setting.
-        blind = 1.0 - m
-        loss_free = torch.mean(((p - x) * blind * free_flag) ** 2) * self.free_loss_weight
+        # Supervise ALL positions (both observed and blind). Input is already masked
+        # so the model must learn imputation from neighbors+temporal context at blind
+        # nodes, while keeping observed-node predictions consistent with truth.
+        loss_free = torch.mean(((p - x) * free_flag) ** 2) * self.free_loss_weight
 
         delta = 2.0
-        diff_jam = torch.abs((p - x) * blind * jam_flag)
+        diff_jam = torch.abs((p - x) * jam_flag)
         huber_jam = torch.where(diff_jam < delta,
                                 0.5 * diff_jam ** 2,
                                 delta * (diff_jam - 0.5 * delta))
         loss_jam = torch.mean(huber_jam) * self.jam_loss_weight
 
-        rmse_reg = torch.mean(((p - x) * blind) ** 2) * 0.1
+        rmse_reg = torch.mean((p - x) ** 2) * 0.1
         return loss_free + loss_jam + rmse_reg
 
     def impute(self, x, m, tod_free=None, tod_jam=None):
