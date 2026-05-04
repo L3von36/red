@@ -446,6 +446,110 @@ def eval_pred_np(pred_kmh_bl, true_kmh_bl):
 
 print("✅ Evaluation functions defined")
 
+# ════════════════════════════════════════════════════════════════════════════
+# ENSEMBLE: Learned blending of DualFlow + Historical Average
+# ════════════════════════════════════════════════════════════════════════════
+
+class DualFlowEnsemble(nn.Module):
+    """Learn per-node blend weights: pred = α_n * dualflow + (1-α_n) * ha"""
+    def __init__(self, num_nodes):
+        super().__init__()
+        # Per-node blend weight (logits, will be sigmoid'd to [0,1])
+        self.logit_alpha = nn.Parameter(torch.zeros(num_nodes))
+
+    def forward(self, dualflow_pred, ha_pred):
+        """
+        Blend predictions from DualFlow and Historical Average.
+        Args:
+            dualflow_pred: [N, T] tensor in normalized space
+            ha_pred: [N, T] tensor in normalized space
+        Returns:
+            blended: [N, T] tensor
+        """
+        alpha = torch.sigmoid(self.logit_alpha).view(-1, 1)  # [N, 1]
+        return alpha * dualflow_pred + (1 - alpha) * ha_pred
+
+def train_ensemble_weights(dualflow_net, ha_preds_norm, val_start, val_end,
+                          val_nodes_mask, true_vals_norm, epochs=100):
+    """
+    Learn blend weights on validation set using DualFlow + HA predictions.
+
+    Args:
+        dualflow_net: trained DualFlow model
+        ha_preds_norm: [N, T_train] Historical Average predictions (normalized)
+        val_start, val_end: validation time window
+        val_nodes_mask: [N] boolean, True for observed nodes
+        true_vals_norm: [N, T_train] ground truth (normalized)
+        epochs: training epochs for blend weights
+    Returns:
+        ensemble: trained DualFlowEnsemble model
+    """
+    ensemble = DualFlowEnsemble(NUM_NODES).to(device)
+    opt = torch.optim.Adam(ensemble.parameters(), lr=1e-2)
+
+    x_v = torch.tensor(speed_np[val_start:val_end, :], dtype=torch.float32).T.to(device)
+    ha_v = torch.tensor(ha_preds_norm[:, val_start:val_end], dtype=torch.float32).to(device)
+    m_v = val_nodes_mask.unsqueeze(1).expand(-1, val_end - val_start)
+
+    best_loss = float('inf')
+    for ep in range(1, epochs + 1):
+        ensemble.train()
+        dualflow_net.eval()
+        with torch.no_grad():
+            # Get DualFlow predictions on validation
+            slots_v = torch.arange(val_start, val_end, device=device) % 288
+            tf_v = torch.tensor(tod_free_np[:, slots_v.cpu().numpy()], dtype=torch.float32).to(device)
+            tj_v = torch.tensor(tod_jam_np[:, slots_v.cpu().numpy()], dtype=torch.float32).to(device)
+            df_v = dualflow_net._run(x_v, m_v, tf_v, tj_v)
+
+        # Blend
+        blended = ensemble(df_v, ha_v)
+
+        # Loss on observed nodes
+        loss = F.mse_loss(blended[m_v == 1], x_v[m_v == 1])
+
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+
+        if loss.item() < best_loss:
+            best_loss = loss.item()
+            if ep % 20 == 0:
+                print(f"  [Ensemble] ep {ep:3d} | val_loss={best_loss:.4f} | "
+                      f"α_mean={torch.sigmoid(ensemble.logit_alpha).mean():.3f}")
+
+    return ensemble
+
+def compute_historical_average(speed_data, train_end, eval_start, eval_len):
+    """
+    Compute Historical Average baseline: for each node and time-of-day,
+    use the mean speed from the training period.
+
+    Args:
+        speed_data: [T, N] speed matrix (normalized)
+        train_end: end of training period
+        eval_start: start of eval period
+        eval_len: length of eval period
+    Returns:
+        ha_eval_norm: [N, eval_len] Historical Average predictions (normalized)
+    """
+    # For each node, compute mean speed by time-of-day (288 steps per day)
+    ha_by_tod = np.zeros((NUM_NODES, 288), dtype=np.float32)
+    for n in range(NUM_NODES):
+        for s in range(288):
+            mask = np.arange(0, train_end) % 288 == s
+            ha_by_tod[n, s] = speed_data[mask, n].mean()
+
+    # Apply to eval period
+    ha_eval_norm = np.zeros((NUM_NODES, eval_len), dtype=np.float32)
+    for t in range(eval_len):
+        tod_idx = (eval_start + t) % 288
+        ha_eval_norm[:, t] = ha_by_tod[:, tod_idx]
+
+    return ha_eval_norm
+
+print("✅ Ensemble blending model defined")
+
 _T_eval = (EVAL_LEN // BATCH_TIME) * BATCH_TIME
 true_eval_kmh = np.zeros((len(blind_idx), _T_eval), dtype=np.float32)
 for ni, n in enumerate(blind_idx):
@@ -485,6 +589,53 @@ print(f"   RMSE: {metrics['rmse_all']:.4f} km/h")
 print(f"   R²: {metrics['r2_all']:.4f}")
 print(f"   Jam F1: {metrics['f1']:.4f}")
 print(f"   SSIM: {metrics['ssim']:.4f}")
+
+# ════════════════════════════════════════════════════════════════════════════
+# ENSEMBLE: Train blend weights on validation set
+# ════════════════════════════════════════════════════════════════════════════
+print("\n" + "="*90)
+print("  ENSEMBLE: Learning blend weights (DualFlow + Historical Average)")
+print("="*90)
+
+# Compute Historical Average on training data
+ha_preds_norm = compute_historical_average(speed_np, TRAIN_END, EVAL_START, EVAL_LEN)
+
+# Train ensemble blend weights on validation set
+val_nodes_mask = torch.tensor(node_mask[0,:,0,0]==1, dtype=torch.float32)
+ensemble = train_ensemble_weights(
+    dualflow_net, ha_preds_norm, VAL_START, VAL_END,
+    val_nodes_mask, speed_np, epochs=100
+)
+
+# Evaluate ensemble on test set
+dualflow_net.eval()
+ensemble.eval()
+with torch.no_grad():
+    # DualFlow predictions on test
+    p_full_df = dualflow_net.impute(x_e, m_e, tf_e, tj_e).cpu().numpy()
+    p_df_test = p_full_df[:, offset:]
+
+    # Historical Average predictions on test
+    ha_test_norm = ha_preds_norm[:, WARMUP_STEPS:WARMUP_STEPS+_T_eval]
+
+    # Blend
+    p_df_t = torch.tensor(p_df_test, dtype=torch.float32).to(device)
+    ha_test_t = torch.tensor(ha_test_norm, dtype=torch.float32).to(device)
+    p_blended = ensemble(p_df_t, ha_test_t).cpu().numpy()
+
+# Convert to km/h
+pred_kmh_ens = np.zeros((len(blind_idx), _T_eval), dtype=np.float32)
+for ni, n in enumerate(blind_idx):
+    pred_kmh_ens[ni] = np.clip(p_blended[n] * node_stds[n] + node_means[n], 0, 120)
+
+metrics_ens = eval_pred_np(pred_kmh_ens, true_eval_kmh)
+print(f"\n✅ DualFlow+HA Ensemble Results:")
+print(f"   Overall MAE: {metrics_ens['mae_all']:.4f} km/h  (vs DualFlow {metrics['mae_all']:.4f})")
+print(f"   Jam MAE: {metrics_ens['mae_jam']:.4f} km/h  (vs DualFlow {metrics['mae_jam']:.4f})")
+print(f"   RMSE: {metrics_ens['rmse_all']:.4f} km/h  (vs DualFlow {metrics['rmse_all']:.4f})")
+print(f"   R²: {metrics_ens['r2_all']:.4f}  (vs DualFlow {metrics['r2_all']:.4f})")
+print(f"   Jam F1: {metrics_ens['f1']:.4f}  (vs DualFlow {metrics['f1']:.4f})")
+print(f"   SSIM: {metrics_ens['ssim']:.4f}  (vs DualFlow {metrics['ssim']:.4f})")
 
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5), dpi=100)
 
