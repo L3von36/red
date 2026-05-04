@@ -308,6 +308,9 @@ class DualFlow(nn.Module):
 
     def training_step(self, x, m, tod_free=None, tod_jam=None):
         p = self._run(x, m, tod_free, tod_jam)
+        # Clip predictions to [-5, 5] in normalized space to prevent unbounded gradients
+        p = torch.clamp(p, -5.0, 5.0)
+
         jt = torch.tensor(jam_thresh_soft_np if self.use_soft_threshold else jam_thresh_eval_np,
                           dtype=torch.float32, device=x.device)
         jam_flag = (x < jt.unsqueeze(1)).float()
@@ -333,7 +336,7 @@ class DualFlow(nn.Module):
 print("✅ DualFlow model architecture defined")
 
 PRODUCTION_SEED = 86415
-PRODUCTION_JAM_WEIGHT = 2.5
+PRODUCTION_JAM_WEIGHT = 1.0  # Reduced from 2.5 to stabilize training (less prone to gradient spikes)
 PRODUCTION_FREE_WEIGHT = 1.0
 
 def train_dualflow_production(hidden=64, epochs=600):
