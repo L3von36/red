@@ -276,7 +276,7 @@ class DualFlowCell(nn.Module):
             else:
                 msg = self.act(self.msg_sym(msg_in))
 
-            x_t = x_seq[:, t:t+1]
+            x_t = x_seq[:, t:t+1] * m_seq[:, t:t+1]
             inp = torch.cat([msg, x_t, m_seq[:, t:t+1]], dim=-1)
             h_new = self.gru(inp, h)
             h = h_new + 0.1 * h
