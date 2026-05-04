@@ -242,12 +242,15 @@ class DualFlowCell(nn.Module):
 
         self.gru = nn.GRUCell(hidden + 2, hidden)
         self.out = nn.Linear(hidden, 1)
+        # SOLUTION 2: Explicit jam head (binary classifier on hidden state)
+        self.jam_head = nn.Linear(hidden, 1)
         self.act = nn.Tanh()
 
     def forward(self, x_seq, m_seq, tod_free_seq=None, tod_jam_seq=None):
         N, T = x_seq.shape
         h = torch.zeros(N, self.hidden, device=x_seq.device)
         preds = []
+        jam_preds = []
 
         if self.include_4path and self.include_path_mixing:
             mix_w_fn = lambda h_t: torch.softmax(self.mix_w(h_t), dim=1)
@@ -281,15 +284,21 @@ class DualFlowCell(nn.Module):
             h_new = self.gru(inp, h)
             h = h_new + 0.1 * h
             preds.append(self.out(h)[:, 0])
-        return torch.stack(preds, dim=1)
+            jam_preds.append(self.jam_head(h)[:, 0])
+        return torch.stack(preds, dim=1), torch.stack(jam_preds, dim=1)
 
 class DualFlow(nn.Module):
-    def __init__(self, hidden=64, include_tod=True, jam_loss_weight=2.5, free_loss_weight=1.0, use_soft_threshold=False):
+    def __init__(self, hidden=64, include_tod=True, jam_loss_weight=2.5, free_loss_weight=1.0,
+                 use_soft_threshold=False, jam_bce_weight=0.5, anchor_diffusion=True):
         super().__init__()
         self.include_tod = include_tod
         self.jam_loss_weight = jam_loss_weight
         self.free_loss_weight = free_loss_weight
         self.use_soft_threshold = use_soft_threshold
+        # SOLUTION 2: weight for jam BCE auxiliary loss
+        self.jam_bce_weight = jam_bce_weight
+        # SOLUTION 3: anchor-diffusion (IGNNK-style) at inference
+        self.anchor_diffusion = anchor_diffusion
         self.fwd = DualFlowCell(hidden, include_tod)
         self.bwd = DualFlowCell(hidden, include_tod)
         self.fuse = nn.Sequential(
@@ -297,47 +306,86 @@ class DualFlow(nn.Module):
             nn.Linear(hidden, 2), nn.Softmax(dim=-1)
         )
 
-    def _run(self, x, m, tod_free=None, tod_jam=None):
-        pf = self.fwd(x, m, tod_free, tod_jam)
-        pb = self.bwd(x.flip(1), m.flip(1),
-                      tod_free.flip(1) if tod_free is not None else None,
-                      tod_jam.flip(1) if tod_jam is not None else None).flip(1)
+    def _run_full(self, x, m, tod_free=None, tod_jam=None):
+        # Returns (speed_pred, jam_logit) — both bidirectionally fused
+        pf, jf = self.fwd(x, m, tod_free, tod_jam)
+        pb_rev, jb_rev = self.bwd(x.flip(1), m.flip(1),
+                                   tod_free.flip(1) if tod_free is not None else None,
+                                   tod_jam.flip(1) if tod_jam is not None else None)
+        pb = pb_rev.flip(1)
+        jb = jb_rev.flip(1)
         fuse_in = torch.stack([pf, pb], dim=-1)
         w = self.fuse(fuse_in)
-        return (w[..., 0:1] * pf.unsqueeze(-1) + w[..., 1:2] * pb.unsqueeze(-1)).squeeze(-1)
+        speed = (w[..., 0:1] * pf.unsqueeze(-1) + w[..., 1:2] * pb.unsqueeze(-1)).squeeze(-1)
+        # Reuse same fusion weights for jam logits (saves params, ties direction quality)
+        jam_logit = (w[..., 0:1] * jf.unsqueeze(-1) + w[..., 1:2] * jb.unsqueeze(-1)).squeeze(-1)
+        return speed, jam_logit
 
-    def training_step(self, x, m, tod_free=None, tod_jam=None):
-        p = self._run(x, m, tod_free, tod_jam)
-        # Clip predictions to [-5, 5] in normalized space to prevent unbounded gradients
+    def _run(self, x, m, tod_free=None, tod_jam=None):
+        speed, _ = self._run_full(x, m, tod_free, tod_jam)
+        return speed
+
+    def training_step(self, x, m, tod_free=None, tod_jam=None, m_blind_train=None):
+        p, jam_logit = self._run_full(x, m, tod_free, tod_jam)
         p = torch.clamp(p, -5.0, 5.0)
 
         jt = torch.tensor(jam_thresh_soft_np if self.use_soft_threshold else jam_thresh_eval_np,
                           dtype=torch.float32, device=x.device)
         jam_flag = (x < jt.unsqueeze(1)).float()
         free_flag = 1.0 - jam_flag
-        # Supervise ALL positions (both observed and blind). Input is already masked
-        # so the model must learn imputation from neighbors+temporal context at blind
-        # nodes, while keeping observed-node predictions consistent with truth.
-        loss_free = torch.mean(((p - x) * free_flag) ** 2) * self.free_loss_weight
 
+        # SOLUTION 1: Supervise on imputation targets (blind nodes), not observations
+        if m_blind_train is not None:
+            supervision_mask = m_blind_train
+        else:
+            supervision_mask = torch.ones_like(m)
+        sup_count = supervision_mask.sum().clamp(min=1.0)
+
+        # Free-flow squared error on blind positions
+        loss_free = ((p - x) * supervision_mask * free_flag) ** 2
+        loss_free = loss_free.sum() / sup_count * self.free_loss_weight
+
+        # Huber on jam positions
         delta = 2.0
-        diff_jam = torch.abs((p - x) * jam_flag)
+        diff_jam = torch.abs((p - x) * supervision_mask * jam_flag)
         huber_jam = torch.where(diff_jam < delta,
                                 0.5 * diff_jam ** 2,
                                 delta * (diff_jam - 0.5 * delta))
-        loss_jam = torch.mean(huber_jam) * self.jam_loss_weight
+        loss_jam = huber_jam.sum() / sup_count * self.jam_loss_weight
 
-        rmse_reg = torch.mean((p - x) ** 2) * 0.1
-        return loss_free + loss_jam + rmse_reg
+        # RMSE regularization
+        rmse_reg = (((p - x) * supervision_mask) ** 2).sum() / sup_count * 0.1
 
-    def impute(self, x, m, tod_free=None, tod_jam=None):
-        return m * x + (1.0 - m) * self._run(x, m, tod_free, tod_jam)
+        # SOLUTION 2: Auxiliary jam BCE loss on blind positions
+        # Forces the network to explicitly classify jam vs free, which is a coarser
+        # but more reliable signal than regressing speeds at high sparsity
+        bce_per = F.binary_cross_entropy_with_logits(jam_logit, jam_flag, reduction='none')
+        loss_bce = (bce_per * supervision_mask).sum() / sup_count * self.jam_bce_weight
+
+        return loss_free + loss_jam + rmse_reg + loss_bce
+
+    def impute(self, x, m, tod_free=None, tod_jam=None, diffusion_steps=3, alpha=0.3):
+        p_init = self._run(x, m, tod_free, tod_jam)
+        p_init = torch.clamp(p_init, -5.0, 5.0)
+        if not self.anchor_diffusion:
+            return m * x + (1.0 - m) * p_init
+
+        # SOLUTION 3: Anchor-diffusion (IGNNK-style kriging refinement)
+        # Iteratively smooth blind-node predictions over the symmetric graph,
+        # keeping observed nodes pinned to ground truth (anchors).
+        p = m * x + (1.0 - m) * p_init
+        for _ in range(diffusion_steps):
+            p_smooth = A_t @ p  # weighted neighborhood average using symmetric adj
+            p_new = (1.0 - alpha) * p + alpha * p_smooth
+            p = m * x + (1.0 - m) * p_new
+        return p
 
 print("✅ DualFlow model architecture defined")
 
 PRODUCTION_SEED = 86415
 PRODUCTION_JAM_WEIGHT = 1.0  # Reduced from 2.5 to stabilize training (less prone to gradient spikes)
 PRODUCTION_FREE_WEIGHT = 1.0
+PRODUCTION_JAM_BCE_WEIGHT = 0.5  # Solution 2: auxiliary BCE on jam classification
 
 def train_dualflow_production(hidden=64, epochs=600):
     torch.manual_seed(PRODUCTION_SEED)
@@ -346,25 +394,33 @@ def train_dualflow_production(hidden=64, epochs=600):
     net = DualFlow(hidden=hidden, include_tod=True,
                    jam_loss_weight=PRODUCTION_JAM_WEIGHT,
                    free_loss_weight=PRODUCTION_FREE_WEIGHT,
-                   use_soft_threshold=False).to(device)
+                   use_soft_threshold=False,
+                   jam_bce_weight=PRODUCTION_JAM_BCE_WEIGHT,
+                   anchor_diffusion=True).to(device)
     opt = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
     best_vloss, best_wts, patience_ctr = float('inf'), None, 0
     loss_history_train, loss_history_val = [], []
 
     print(f"\n{'='*80}")
-    print(f"PRODUCTION MODEL: DualFlow")
-    print(f"  Seed: {PRODUCTION_SEED}  |  Jam weight: {PRODUCTION_JAM_WEIGHT}x  |  Free weight: {PRODUCTION_FREE_WEIGHT}x")
+    print(f"PRODUCTION MODEL: DualFlow (S1+S2+S3)")
+    print(f"  Seed: {PRODUCTION_SEED}  |  Jam: {PRODUCTION_JAM_WEIGHT}x  |  Free: {PRODUCTION_FREE_WEIGHT}x  |  JamBCE: {PRODUCTION_JAM_BCE_WEIGHT}x")
+    print(f"  S1: blind-node supervision  |  S2: jam head  |  S3: anchor diffusion")
     print(f"{'='*80}\n")
 
     for ep in range(1, epochs + 1):
         net.train()
         t0 = np.random.randint(0, TRAIN_END - BATCH_TIME)
         x_full = torch.tensor(speed_np[t0:t0+BATCH_TIME, :], dtype=torch.float32).T.to(device)
+        # SOLUTION 1 (SPIN/ImputeFormer-style): Mask input AND supervise on the masked positions
+        # m_train = 1 means observed (input visible), 0 means blind (input zeroed)
         m_train = (torch.rand(NUM_NODES, 1, device=device) > SPARSITY).float().expand(-1, BATCH_TIME)
+        # m_blind_train = 1 - m_train: supervise only on blind positions (imputation targets)
+        # This forces the model to predict from spatial neighbors instead of copying input
+        m_blind_train = 1.0 - m_train
         slots = (np.arange(t0, t0+BATCH_TIME) % 288).astype(int)
         tod_free = torch.tensor(tod_free_np[:, slots], dtype=torch.float32).to(device)
         tod_jam = torch.tensor(tod_jam_np[:, slots], dtype=torch.float32).to(device)
-        loss = net.training_step(x_full, m_train, tod_free, tod_jam)
+        loss = net.training_step(x_full, m_train, tod_free, tod_jam, m_blind_train=m_blind_train)
 
         if torch.isnan(loss) or torch.isinf(loss):
             print(f"  ⚠️  NaN/Inf at ep {ep}, restarting...")
@@ -380,11 +436,20 @@ def train_dualflow_production(hidden=64, epochs=600):
             net.eval()
             with torch.no_grad():
                 x_v = torch.tensor(speed_np[VAL_START:VAL_END, :], dtype=torch.float32).T.to(device)
-                m_v = (node_mask[0,:,0,0]==1).float().unsqueeze(1).expand(-1, VAL_END-VAL_START)
+                # Use SPARSITY-rate blind mask so val matches test conditions
+                m_v_obs = (torch.rand(NUM_NODES, 1, device=device) > SPARSITY).float().expand(-1, VAL_END-VAL_START)
+                m_v_blind = 1.0 - m_v_obs
                 slots_v = (np.arange(VAL_START, VAL_END) % 288).astype(int)
                 tf_v = torch.tensor(tod_free_np[:, slots_v], dtype=torch.float32).to(device)
                 tj_v = torch.tensor(tod_jam_np[:, slots_v], dtype=torch.float32).to(device)
-                vl = net.training_step(x_v, m_v, tf_v, tj_v).item()
+                # Loss on blind positions
+                vl = net.training_step(x_v, m_v_obs, tf_v, tj_v, m_blind_train=m_v_blind).item()
+                # Honest blind-node MAE/RMSE in normalized space
+                p_v = net._run(x_v, m_v_obs, tf_v, tj_v)
+                p_v = torch.clamp(p_v, -5.0, 5.0)
+                blind_count = m_v_blind.sum().clamp(min=1.0)
+                mae_v = (torch.abs(p_v - x_v) * m_v_blind).sum().item() / blind_count.item()
+                rmse_v = torch.sqrt(((p_v - x_v) ** 2 * m_v_blind).sum() / blind_count).item()
             loss_history_val.append(vl)
             if vl < best_vloss:
                 best_vloss = vl
@@ -392,9 +457,7 @@ def train_dualflow_production(hidden=64, epochs=600):
                 patience_ctr = 0
             else:
                 patience_ctr += 1
-            mae_v = torch.mean(torch.abs(p_v - x_v) * m_v).item()
-            rmse_v = torch.sqrt(torch.mean(((p_v - x_v) * m_v) ** 2)).item()
-            print(f"  [DualFlow] ep {ep:3d} | loss={vl:.4f} | MAE={mae_v:.4f} | RMSE={rmse_v:.4f}")
+            print(f"  [DualFlow] ep {ep:3d} | loss={vl:.4f} | BlindMAE={mae_v:.4f} | BlindRMSE={rmse_v:.4f}")
             if patience_ctr >= 3:
                 print(f"  -> Early stop at ep {ep}")
                 break
