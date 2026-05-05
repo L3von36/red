@@ -465,7 +465,7 @@ def train_dualflow_production(hidden=64, epochs=600):
                 mae_v = (torch.abs(p_v - x_v) * m_v_blind).sum().item() / blind_count.item()
                 rmse_v = torch.sqrt(((p_v - x_v) ** 2 * m_v_blind).sum() / blind_count).item()
                 # R² on blind nodes only (not observed, which are pinned to truth by impute)
-                jt = torch.tensor(jam_thresh_eval_np, dtype=torch.float32, device=x.device)
+                jt = torch.tensor(jam_thresh_eval_np, dtype=torch.float32, device=x_v.device)
                 jam_flag = (x_v < jt.unsqueeze(1)).float()
                 ss_res = ((p_v - x_v) ** 2 * m_v_blind).sum()
                 ss_tot = ((x_v - (x_v * m_v_blind).sum() / blind_count) ** 2 * m_v_blind).sum() + 1e-8
@@ -482,9 +482,6 @@ def train_dualflow_production(hidden=64, epochs=600):
                 patience_ctr += 1
             print(f"  [DualFlow] ep {ep:3d} | loss={vl:.4f} | BlindMAE={mae_v:.4f} | BlindJamMAE={mae_jam_v:.4f} | R²={r2_v:.4f} | jam_w={net.jam_loss_weight:.2f}")
             if patience_ctr >= 2:
-                print(f"  -> Early stop at ep {ep}")
-                break
-            if patience_ctr >= 3:
                 print(f"  -> Early stop at ep {ep}")
                 break
 
