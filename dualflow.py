@@ -402,13 +402,26 @@ def train_dualflow_production(hidden=64, epochs=600):
     loss_history_train, loss_history_val = [], []
 
     print(f"\n{'='*80}")
-    print(f"PRODUCTION MODEL: DualFlow (S1+S2+S3) — Jam-focused variant")
-    print(f"  Seed: {PRODUCTION_SEED}  |  Jam: {PRODUCTION_JAM_WEIGHT}x  |  Free: {PRODUCTION_FREE_WEIGHT}x  |  JamBCE: {PRODUCTION_JAM_BCE_WEIGHT}x")
-    print(f"  S1: blind-node supervision  |  S2: jam head (higher weight)  |  S3: anchor diffusion")
+    print(f"PRODUCTION MODEL: DualFlow (S1+S2+S3) — Warmup variant")
+    print(f"  Seed: {PRODUCTION_SEED}  |  Jam: 1.0→{PRODUCTION_JAM_WEIGHT}x (warmup ep 100-200)  |  Free: {PRODUCTION_FREE_WEIGHT}x  |  JamBCE: 0.5→{PRODUCTION_JAM_BCE_WEIGHT}x")
+    print(f"  S1: blind-node supervision  |  S2: jam head (warmed up)  |  S3: anchor diffusion")
     print(f"  Early stop: patience=2 (stricter) | Honest R² on blind nodes only")
     print(f"{'='*80}\n")
 
     for ep in range(1, epochs + 1):
+        # SOLUTION 2 WARMUP: ramp jam weights from 1.0 (start) to target (PRODUCTION_*) over warmup window
+        # Lets free-flow loss stabilize the model first, then increases jam pressure gradually
+        warmup_start_ep = 100
+        warmup_end_ep = 200
+        if ep < warmup_start_ep:
+            ramp = 0.0  # use base weight 1.0
+        elif ep < warmup_end_ep:
+            ramp = (ep - warmup_start_ep) / (warmup_end_ep - warmup_start_ep)
+        else:
+            ramp = 1.0
+        net.jam_loss_weight = 1.0 + ramp * (PRODUCTION_JAM_WEIGHT - 1.0)
+        net.jam_bce_weight = 0.5 + ramp * (PRODUCTION_JAM_BCE_WEIGHT - 0.5)
+
         net.train()
         t0 = np.random.randint(0, TRAIN_END - BATCH_TIME)
         x_full = torch.tensor(speed_np[t0:t0+BATCH_TIME, :], dtype=torch.float32).T.to(device)
@@ -467,7 +480,7 @@ def train_dualflow_production(hidden=64, epochs=600):
                 patience_ctr = 0
             else:
                 patience_ctr += 1
-            print(f"  [DualFlow] ep {ep:3d} | loss={vl:.4f} | BlindMAE={mae_v:.4f} | BlindJamMAE={mae_jam_v:.4f} | R²={r2_v:.4f}")
+            print(f"  [DualFlow] ep {ep:3d} | loss={vl:.4f} | BlindMAE={mae_v:.4f} | BlindJamMAE={mae_jam_v:.4f} | R²={r2_v:.4f} | jam_w={net.jam_loss_weight:.2f}")
             if patience_ctr >= 2:
                 print(f"  -> Early stop at ep {ep}")
                 break
