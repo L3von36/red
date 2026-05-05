@@ -383,9 +383,9 @@ class DualFlow(nn.Module):
 print("✅ DualFlow model architecture defined")
 
 PRODUCTION_SEED = 86415
-PRODUCTION_JAM_WEIGHT = 1.0  # Reduced from 2.5 to stabilize training (less prone to gradient spikes)
+PRODUCTION_JAM_WEIGHT = 2.0  # Increased to penalize jam errors harder; S2 jam head helps at high sparsity
 PRODUCTION_FREE_WEIGHT = 1.0
-PRODUCTION_JAM_BCE_WEIGHT = 0.5  # Solution 2: auxiliary BCE on jam classification
+PRODUCTION_JAM_BCE_WEIGHT = 1.0  # Increased from 0.5: jam events rare, need higher weight to balance
 
 def train_dualflow_production(hidden=64, epochs=600):
     torch.manual_seed(PRODUCTION_SEED)
@@ -402,9 +402,10 @@ def train_dualflow_production(hidden=64, epochs=600):
     loss_history_train, loss_history_val = [], []
 
     print(f"\n{'='*80}")
-    print(f"PRODUCTION MODEL: DualFlow (S1+S2+S3)")
+    print(f"PRODUCTION MODEL: DualFlow (S1+S2+S3) — Jam-focused variant")
     print(f"  Seed: {PRODUCTION_SEED}  |  Jam: {PRODUCTION_JAM_WEIGHT}x  |  Free: {PRODUCTION_FREE_WEIGHT}x  |  JamBCE: {PRODUCTION_JAM_BCE_WEIGHT}x")
-    print(f"  S1: blind-node supervision  |  S2: jam head  |  S3: anchor diffusion")
+    print(f"  S1: blind-node supervision  |  S2: jam head (higher weight)  |  S3: anchor diffusion")
+    print(f"  Early stop: patience=2 (stricter) | Honest R² on blind nodes only")
     print(f"{'='*80}\n")
 
     for ep in range(1, epochs + 1):
@@ -450,6 +451,15 @@ def train_dualflow_production(hidden=64, epochs=600):
                 blind_count = m_v_blind.sum().clamp(min=1.0)
                 mae_v = (torch.abs(p_v - x_v) * m_v_blind).sum().item() / blind_count.item()
                 rmse_v = torch.sqrt(((p_v - x_v) ** 2 * m_v_blind).sum() / blind_count).item()
+                # R² on blind nodes only (not observed, which are pinned to truth by impute)
+                jt = torch.tensor(jam_thresh_eval_np, dtype=torch.float32, device=x.device)
+                jam_flag = (x_v < jt.unsqueeze(1)).float()
+                ss_res = ((p_v - x_v) ** 2 * m_v_blind).sum()
+                ss_tot = ((x_v - (x_v * m_v_blind).sum() / blind_count) ** 2 * m_v_blind).sum() + 1e-8
+                r2_v = (1.0 - ss_res / ss_tot).item()
+                # Jam MAE on blind nodes
+                jam_count = (jam_flag * m_v_blind).sum().clamp(min=1.0)
+                mae_jam_v = (torch.abs(p_v - x_v) * jam_flag * m_v_blind).sum().item() / jam_count.item() if jam_count > 0 else 0.0
             loss_history_val.append(vl)
             if vl < best_vloss:
                 best_vloss = vl
@@ -457,7 +467,10 @@ def train_dualflow_production(hidden=64, epochs=600):
                 patience_ctr = 0
             else:
                 patience_ctr += 1
-            print(f"  [DualFlow] ep {ep:3d} | loss={vl:.4f} | BlindMAE={mae_v:.4f} | BlindRMSE={rmse_v:.4f}")
+            print(f"  [DualFlow] ep {ep:3d} | loss={vl:.4f} | BlindMAE={mae_v:.4f} | BlindJamMAE={mae_jam_v:.4f} | R²={r2_v:.4f}")
+            if patience_ctr >= 2:
+                print(f"  -> Early stop at ep {ep}")
+                break
             if patience_ctr >= 3:
                 print(f"  -> Early stop at ep {ep}")
                 break
