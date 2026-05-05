@@ -398,7 +398,7 @@ def train_dualflow_production(hidden=64, epochs=600):
                    jam_bce_weight=PRODUCTION_JAM_BCE_WEIGHT,
                    anchor_diffusion=True).to(device)
     opt = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
-    best_vloss, best_wts, patience_ctr = float('inf'), None, 0
+    best_blind_mae, best_wts, patience_ctr, best_ep = float('inf'), None, 0, 0
     loss_history_train, loss_history_val = [], []
 
     print(f"\n{'='*80}")
@@ -474,15 +474,16 @@ def train_dualflow_production(hidden=64, epochs=600):
                 jam_count = (jam_flag * m_v_blind).sum().clamp(min=1.0)
                 mae_jam_v = (torch.abs(p_v - x_v) * jam_flag * m_v_blind).sum().item() / jam_count.item() if jam_count > 0 else 0.0
             loss_history_val.append(vl)
-            if vl < best_vloss:
-                best_vloss = vl
+            if mae_v < best_blind_mae:
+                best_blind_mae = mae_v
                 best_wts = copy.deepcopy(net.state_dict())
                 patience_ctr = 0
+                best_ep = ep
             else:
                 patience_ctr += 1
-            print(f"  [DualFlow] ep {ep:3d} | loss={vl:.4f} | BlindMAE={mae_v:.4f} | BlindJamMAE={mae_jam_v:.4f} | R²={r2_v:.4f} | jam_w={net.jam_loss_weight:.2f}")
+            print(f"  [DualFlow] ep {ep:3d} | loss={vl:.4f} | BlindMAE={mae_v:.4f} | BlindJamMAE={mae_jam_v:.4f} | R²={r2_v:.4f} | jam_w={net.jam_loss_weight:.2f}{' *' if mae_v == best_blind_mae else ''}")
             if patience_ctr >= 2:
-                print(f"  -> Early stop at ep {ep}")
+                print(f"  -> Early stop at ep {ep} (best BlindMAE={best_blind_mae:.4f} at ep {best_ep})")
                 break
 
     if best_wts:
