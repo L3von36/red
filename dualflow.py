@@ -380,31 +380,294 @@ class DualFlow(nn.Module):
             p = m * x + (1.0 - m) * p_new
         return p
 
+
+# PHASE 1: Transformer Enhancement
+# ============================================================================
+# Add temporal self-attention on top of GRU hidden states to learn:
+# - Which timepoints are informative (especially at extreme sparsity)
+# - Long-range temporal dependencies (peak hours, seasonal patterns)
+# - Dynamic weighting of spatial vs temporal signals
+# ============================================================================
+
+class DualFlowCellWithHidden(nn.Module):
+    """DualFlowCell variant that also returns hidden states for transformer refinement"""
+    def __init__(self, hidden=64, include_tod=True, include_4path=True, include_path_mixing=True):
+        super().__init__()
+        self.include_tod = include_tod
+        self.include_4path = include_4path
+        self.include_path_mixing = include_path_mixing
+        self.hidden = hidden
+
+        msg_in_dim = hidden + 1 + (2 if include_tod else 0)
+        self.msg_sym = ChebConv(msg_in_dim, hidden, K=2)
+
+        if include_4path:
+            self.msg_fwd = ChebConv(msg_in_dim, hidden, K=2)
+            self.msg_bwd = ChebConv(msg_in_dim, hidden, K=2)
+            self.msg_corr = ChebConv(msg_in_dim, hidden, K=2)
+            if include_path_mixing:
+                self.mix_w = nn.Linear(hidden, 4)
+
+        self.gru = nn.GRUCell(hidden + 2, hidden)
+        self.out = nn.Linear(hidden, 1)
+        self.jam_head = nn.Linear(hidden, 1)
+        self.act = nn.Tanh()
+
+    def forward(self, x_seq, m_seq, tod_free_seq=None, tod_jam_seq=None, return_hidden=False):
+        """Forward pass optionally returning hidden states [N, T, hidden]"""
+        N, T = x_seq.shape
+        h = torch.zeros(N, self.hidden, device=x_seq.device)
+        preds = []
+        jam_preds = []
+        hiddens = [] if return_hidden else None
+
+        if self.include_4path and self.include_path_mixing:
+            mix_w_fn = lambda h_t: torch.softmax(self.mix_w(h_t), dim=1)
+        else:
+            mix_w_fn = None
+
+        for t in range(T):
+            if self.include_tod and tod_free_seq is not None:
+                msg_in = torch.cat([h, m_seq[:, t:t+1],
+                                    tod_free_seq[:, t:t+1], tod_jam_seq[:, t:t+1]], dim=-1)
+            else:
+                msg_in = torch.cat([h, m_seq[:, t:t+1]], dim=-1)
+
+            if self.include_4path:
+                m_sym = self.act(self.msg_sym(msg_in))
+                m_fwd = self.act(self.msg_fwd(msg_in))
+                m_bwd = self.act(self.msg_bwd(msg_in))
+                m_corr = self.act(self.msg_corr(msg_in))
+
+                if self.include_path_mixing:
+                    mix_w = mix_w_fn(h)
+                    msg = (mix_w[:, 0:1]*m_sym + mix_w[:, 1:2]*m_fwd +
+                           mix_w[:, 2:3]*m_bwd + mix_w[:, 3:4]*m_corr)
+                else:
+                    msg = 0.25 * (m_sym + m_fwd + m_bwd + m_corr)
+            else:
+                msg = self.act(self.msg_sym(msg_in))
+
+            x_t = x_seq[:, t:t+1] * m_seq[:, t:t+1]
+            inp = torch.cat([msg, x_t, m_seq[:, t:t+1]], dim=-1)
+            h_new = self.gru(inp, h)
+            h = h_new + 0.1 * h
+            preds.append(self.out(h)[:, 0])
+            jam_preds.append(self.jam_head(h)[:, 0])
+            if return_hidden:
+                hiddens.append(h.clone())
+
+        pred_out = torch.stack(preds, dim=1)  # [N, T]
+        jam_out = torch.stack(jam_preds, dim=1)  # [N, T]
+        if return_hidden:
+            hidden_out = torch.stack(hiddens, dim=1)  # [N, T, hidden]
+            return pred_out, jam_out, hidden_out
+        return pred_out, jam_out
+
+
+class TransformerEnhancer(nn.Module):
+    """Temporal self-attention to refine GRU predictions at extreme sparsity"""
+    def __init__(self, hidden=64, num_layers=3, num_heads=4, ff_dim=256, dropout=0.1):
+        super().__init__()
+        self.hidden = hidden
+        self.num_layers = num_layers
+
+        # Positional encoding for temporal information
+        self.pos_encoder = nn.Embedding(512, hidden)  # supports up to 512 timesteps
+
+        # Transformer encoder: learns temporal dependencies
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden,
+            nhead=num_heads,
+            dim_feedforward=ff_dim,
+            dropout=dropout,
+            batch_first=True,
+            activation='relu'
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # Output projection: hidden states → refined predictions
+        self.out_proj = nn.Linear(hidden, 1)
+
+    def forward(self, hidden_states, mask=None):
+        """
+        Args:
+            hidden_states: [N, T, hidden] from DualFlowCell
+            mask: [N, T] optional observation mask (1=observed, 0=blind)
+        Returns:
+            refined_preds: [N, T] refined predictions
+        """
+        N, T, H = hidden_states.shape
+
+        # Add positional encoding
+        positions = torch.arange(T, device=hidden_states.device).unsqueeze(0).expand(N, -1)
+        pos_enc = self.pos_encoder(positions)  # [N, T, hidden]
+        hidden_with_pos = hidden_states + pos_enc
+
+        # Apply transformer (learns to suppress noise from blind nodes)
+        refined = self.transformer(hidden_with_pos)  # [N, T, hidden]
+
+        # Project to predictions
+        refined_preds = self.out_proj(refined).squeeze(-1)  # [N, T]
+
+        return refined_preds
+
+
+class DualFlowTransformer(nn.Module):
+    """DualFlow + TransformerEnhancer for Phase 1 improvement"""
+    def __init__(self, hidden=64, include_tod=True, jam_loss_weight=2.5, free_loss_weight=1.0,
+                 use_soft_threshold=False, jam_bce_weight=0.5, anchor_diffusion=True,
+                 use_transformer=True, num_transformer_layers=3):
+        super().__init__()
+        self.include_tod = include_tod
+        self.jam_loss_weight = jam_loss_weight
+        self.free_loss_weight = free_loss_weight
+        self.use_soft_threshold = use_soft_threshold
+        self.jam_bce_weight = jam_bce_weight
+        self.anchor_diffusion = anchor_diffusion
+        self.use_transformer = use_transformer
+
+        # Bidirectional GRU cells with hidden state output
+        self.fwd = DualFlowCellWithHidden(hidden, include_tod)
+        self.bwd = DualFlowCellWithHidden(hidden, include_tod)
+
+        # Fusion layer (same as original DualFlow)
+        self.fuse = nn.Sequential(
+            nn.Linear(2, hidden), nn.ReLU(),
+            nn.Linear(hidden, 2), nn.Softmax(dim=-1)
+        )
+
+        # Transformer enhancers (Phase 1)
+        if use_transformer:
+            self.trans_fwd = TransformerEnhancer(hidden, num_layers=num_transformer_layers)
+            self.trans_bwd = TransformerEnhancer(hidden, num_layers=num_transformer_layers)
+            self.trans_jam = TransformerEnhancer(hidden, num_layers=num_transformer_layers)
+
+    def _run_full(self, x, m, tod_free=None, tod_jam=None):
+        """Forward pass with optional transformer refinement"""
+        # Get GRU outputs and hidden states
+        pf, jf, h_fwd = self.fwd(x, m, tod_free, tod_jam, return_hidden=True)
+        pb_rev, jb_rev, h_bwd_rev = self.bwd(x.flip(1), m.flip(1),
+                                              tod_free.flip(1) if tod_free is not None else None,
+                                              tod_jam.flip(1) if tod_jam is not None else None,
+                                              return_hidden=True)
+        pb = pb_rev.flip(1)
+        jb = jb_rev.flip(1)
+        h_bwd = h_bwd_rev.flip(1)  # [N, T, hidden]
+
+        # Fuse bidirectional predictions
+        fuse_in = torch.stack([pf, pb], dim=-1)
+        w = self.fuse(fuse_in)
+        speed = (w[..., 0:1] * pf.unsqueeze(-1) + w[..., 1:2] * pb.unsqueeze(-1)).squeeze(-1)
+        jam_logit = (w[..., 0:1] * jf.unsqueeze(-1) + w[..., 1:2] * jb.unsqueeze(-1)).squeeze(-1)
+
+        # Apply transformer refinement (Phase 1)
+        if self.use_transformer:
+            # Fuse hidden states
+            h_fused = torch.cat([
+                (h_fwd.unsqueeze(-1) * w[:, :, 0:1] + h_bwd.unsqueeze(-1) * w[:, :, 1:2]).squeeze(-1)
+            ], dim=-1)  # [N, T, hidden]
+
+            # Refine with transformers
+            speed_refined = self.trans_fwd(h_fused, m)
+            jam_refined = self.trans_jam(h_fused, m)
+
+            # Blend GRU and transformer predictions (start with light transformer weight)
+            alpha = 0.3  # Transformer weight (can be learned later)
+            speed = (1.0 - alpha) * speed + alpha * speed_refined
+            jam_logit = (1.0 - alpha) * jam_logit + alpha * jam_refined
+
+        return speed, jam_logit
+
+    def _run(self, x, m, tod_free=None, tod_jam=None):
+        speed, _ = self._run_full(x, m, tod_free, tod_jam)
+        return speed
+
+    def training_step(self, x, m, tod_free=None, tod_jam=None, m_blind_train=None):
+        """Identical to DualFlow training_step"""
+        p, jam_logit = self._run_full(x, m, tod_free, tod_jam)
+        p = torch.clamp(p, -5.0, 5.0)
+
+        jt = torch.tensor(jam_thresh_soft_np if self.use_soft_threshold else jam_thresh_eval_np,
+                          dtype=torch.float32, device=x.device)
+        jam_flag = (x < jt.unsqueeze(1)).float()
+        free_flag = 1.0 - jam_flag
+
+        # SOLUTION 1: Supervise on imputation targets (blind nodes), not observations
+        if m_blind_train is not None:
+            supervision_mask = m_blind_train
+        else:
+            supervision_mask = torch.ones_like(m)
+        sup_count = supervision_mask.sum().clamp(min=1.0)
+
+        # Free-flow squared error on blind positions
+        loss_free = ((p - x) * supervision_mask * free_flag) ** 2
+        loss_free = loss_free.sum() / sup_count * self.free_loss_weight
+
+        # Huber on jam positions
+        delta = 2.0
+        diff_jam = torch.abs((p - x) * supervision_mask * jam_flag)
+        huber_jam = torch.where(diff_jam < delta,
+                                0.5 * diff_jam ** 2,
+                                delta * (diff_jam - 0.5 * delta))
+        loss_jam = huber_jam.sum() / sup_count * self.jam_loss_weight
+
+        # RMSE regularization
+        rmse_reg = (((p - x) * supervision_mask) ** 2).sum() / sup_count * 0.1
+
+        # SOLUTION 2: Auxiliary jam BCE loss on blind positions
+        bce_per = F.binary_cross_entropy_with_logits(jam_logit, jam_flag, reduction='none')
+        loss_bce = (bce_per * supervision_mask).sum() / sup_count * self.jam_bce_weight
+
+        return loss_free + loss_jam + rmse_reg + loss_bce
+
+    def impute(self, x, m, tod_free=None, tod_jam=None, diffusion_steps=3, alpha=0.3):
+        """Identical to DualFlow impute"""
+        p_init = self._run(x, m, tod_free, tod_jam)
+        p_init = torch.clamp(p_init, -5.0, 5.0)
+        if not self.anchor_diffusion:
+            return m * x + (1.0 - m) * p_init
+
+        p = m * x + (1.0 - m) * p_init
+        for _ in range(diffusion_steps):
+            p_smooth = A_t @ p
+            p_new = (1.0 - alpha) * p + alpha * p_smooth
+            p = m * x + (1.0 - m) * p_new
+        return p
+
+
 print("✅ DualFlow model architecture defined")
+print("✅ DualFlowTransformer (Phase 1: Temporal Attention) available")
 
 PRODUCTION_SEED = 86415
 PRODUCTION_JAM_WEIGHT = 2.0  # Increased to penalize jam errors harder; S2 jam head helps at high sparsity
 PRODUCTION_FREE_WEIGHT = 1.0
 PRODUCTION_JAM_BCE_WEIGHT = 1.0  # Increased from 0.5: jam events rare, need higher weight to balance
 
-def train_dualflow_production(hidden=64, epochs=600):
+def train_dualflow_production(hidden=64, epochs=600, use_transformer=True):
     torch.manual_seed(PRODUCTION_SEED)
     np.random.seed(PRODUCTION_SEED)
 
-    net = DualFlow(hidden=hidden, include_tod=True,
-                   jam_loss_weight=PRODUCTION_JAM_WEIGHT,
-                   free_loss_weight=PRODUCTION_FREE_WEIGHT,
-                   use_soft_threshold=False,
-                   jam_bce_weight=PRODUCTION_JAM_BCE_WEIGHT,
-                   anchor_diffusion=True).to(device)
+    # PHASE 1: Use DualFlowTransformer with temporal attention
+    net_class = DualFlowTransformer if use_transformer else DualFlow
+    net = net_class(hidden=hidden, include_tod=True,
+                    jam_loss_weight=PRODUCTION_JAM_WEIGHT,
+                    free_loss_weight=PRODUCTION_FREE_WEIGHT,
+                    use_soft_threshold=False,
+                    jam_bce_weight=PRODUCTION_JAM_BCE_WEIGHT,
+                    anchor_diffusion=True,
+                    use_transformer=use_transformer).to(device)
     opt = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
     best_blind_mae, best_wts, patience_ctr, best_ep = float('inf'), None, 0, 0
     loss_history_train, loss_history_val = [], []
 
+    model_name = "DualFlowTransformer (Phase 1)" if use_transformer else "DualFlow (Baseline)"
     print(f"\n{'='*80}")
-    print(f"PRODUCTION MODEL: DualFlow (S1+S2+S3) — Warmup variant")
+    print(f"PRODUCTION MODEL: {model_name} — Warmup variant")
     print(f"  Seed: {PRODUCTION_SEED}  |  Jam: 1.0→{PRODUCTION_JAM_WEIGHT}x (warmup ep 100-200)  |  Free: {PRODUCTION_FREE_WEIGHT}x  |  JamBCE: 0.5→{PRODUCTION_JAM_BCE_WEIGHT}x")
     print(f"  S1: blind-node supervision  |  S2: jam head (warmed up)  |  S3: anchor diffusion")
+    if use_transformer:
+        print(f"  PHASE 1: Temporal Transformer (3 layers, 4 heads) on top of GRU")
     print(f"  Early stop: patience=2 (stricter) | Honest R² on blind nodes only")
     print(f"{'='*80}\n")
 
@@ -492,7 +755,7 @@ def train_dualflow_production(hidden=64, epochs=600):
 
 print("✅ Training function defined")
 
-dualflow_net, dualflow_loss_train, dualflow_loss_val = train_dualflow_production(hidden=64, epochs=600)
+dualflow_net, dualflow_loss_train, dualflow_loss_val = train_dualflow_production(hidden=64, epochs=600, use_transformer=True)
 print("\n✅ Training complete!")
 
 def jam_prec_recall(pred_kmh, true_kmh, threshold=JAM_KMH_EVAL):
