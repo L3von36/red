@@ -563,10 +563,8 @@ class DualFlowTransformer(nn.Module):
 
         # Apply transformer refinement (Phase 1)
         if self.use_transformer:
-            # Fuse hidden states
-            h_fused = torch.cat([
-                (h_fwd.unsqueeze(-1) * w[:, :, 0:1] + h_bwd.unsqueeze(-1) * w[:, :, 1:2]).squeeze(-1)
-            ], dim=-1)  # [N, T, hidden]
+            # Fuse hidden states with bidirectional weights
+            h_fused = h_fwd * w[:, :, 0:1] + h_bwd * w[:, :, 1:2]  # [N, T, hidden]
 
             # Refine with transformers
             speed_refined = self.trans_fwd(h_fused, m)
