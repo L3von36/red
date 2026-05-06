@@ -658,7 +658,7 @@ def train_dualflow_production(hidden=64, epochs=600, use_transformer=True):
                     anchor_diffusion=True,
                     use_transformer=use_transformer).to(device)
     opt = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
-    best_blind_mae, best_wts, patience_ctr, best_ep = float('inf'), None, 0, 0
+    best_blind_mae, best_wts, best_ep = float('inf'), None, 0
     loss_history_train, loss_history_val = [], []
 
     model_name = "DualFlowTransformer (Phase 1)" if use_transformer else "DualFlow (Baseline)"
@@ -668,7 +668,8 @@ def train_dualflow_production(hidden=64, epochs=600, use_transformer=True):
     print(f"  S1: blind-node supervision  |  S2: jam head (warmed up)  |  S3: anchor diffusion")
     if use_transformer:
         print(f"  PHASE 1: Temporal Transformer (3 layers, 4 heads) on top of GRU")
-    print(f"  Early stop: patience=2 (stricter) | Honest R² on blind nodes only")
+    print(f"  Training: Full {epochs} epochs (no early stopping) | Best checkpoint saved")
+    print(f"  Honest R² on blind nodes only")
     print(f"{'='*80}\n")
 
     for ep in range(1, epochs + 1):
@@ -740,14 +741,11 @@ def train_dualflow_production(hidden=64, epochs=600, use_transformer=True):
             if mae_v < best_blind_mae:
                 best_blind_mae = mae_v
                 best_wts = copy.deepcopy(net.state_dict())
-                patience_ctr = 0
                 best_ep = ep
+                marker = " ← BEST"
             else:
-                patience_ctr += 1
-            print(f"  [DualFlow] ep {ep:3d} | loss={vl:.4f} | BlindMAE={mae_v:.4f} | BlindJamMAE={mae_jam_v:.4f} | R²={r2_v:.4f} | jam_w={net.jam_loss_weight:.2f}{' *' if mae_v == best_blind_mae else ''}")
-            if patience_ctr >= 2:
-                print(f"  -> Early stop at ep {ep} (best BlindMAE={best_blind_mae:.4f} at ep {best_ep})")
-                break
+                marker = ""
+            print(f"  [DualFlow] ep {ep:3d} | loss={vl:.4f} | BlindMAE={mae_v:.4f} | BlindJamMAE={mae_jam_v:.4f} | R²={r2_v:.4f} | jam_w={net.jam_loss_weight:.2f}{marker}")
 
     if best_wts:
         net.load_state_dict(best_wts)
