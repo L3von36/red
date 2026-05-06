@@ -472,9 +472,6 @@ class TransformerEnhancer(nn.Module):
         self.hidden = hidden
         self.num_layers = num_layers
 
-        # Positional encoding for temporal information
-        self.pos_encoder = nn.Embedding(512, hidden)  # supports up to 512 timesteps
-
         # Transformer encoder: learns temporal dependencies
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden,
@@ -489,6 +486,21 @@ class TransformerEnhancer(nn.Module):
         # Output projection: hidden states → refined predictions
         self.out_proj = nn.Linear(hidden, 1)
 
+    def _get_sinusoidal_pos_enc(self, T, device):
+        """Generate sinusoidal positional encodings (supports any sequence length)"""
+        positions = torch.arange(T, dtype=torch.float32, device=device).unsqueeze(1)
+        dim_indices = torch.arange(0, self.hidden, 2, dtype=torch.float32, device=device)
+        div_term = 10000.0 ** (dim_indices / self.hidden)
+
+        pos_enc = torch.zeros(T, self.hidden, device=device)
+        pos_enc[:, 0::2] = torch.sin(positions / div_term)
+        if self.hidden % 2 == 1:
+            pos_enc[:, 1::2] = torch.cos(positions / div_term[:-1])
+        else:
+            pos_enc[:, 1::2] = torch.cos(positions / div_term)
+
+        return pos_enc.unsqueeze(0)  # [1, T, hidden]
+
     def forward(self, hidden_states, mask=None):
         """
         Args:
@@ -499,9 +511,8 @@ class TransformerEnhancer(nn.Module):
         """
         N, T, H = hidden_states.shape
 
-        # Add positional encoding
-        positions = torch.arange(T, device=hidden_states.device).unsqueeze(0).expand(N, -1)
-        pos_enc = self.pos_encoder(positions)  # [N, T, hidden]
+        # Add sinusoidal positional encoding (supports any T)
+        pos_enc = self._get_sinusoidal_pos_enc(T, hidden_states.device)  # [1, T, hidden]
         hidden_with_pos = hidden_states + pos_enc
 
         # Apply transformer (learns to suppress noise from blind nodes)

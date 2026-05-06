@@ -50,6 +50,11 @@ This checks:
 - Reduce `PRODUCTION_JAM_WEIGHT` (currently 2.0)
 - Check if gradient clipping is working (line 710)
 
+### Error 6: `RuntimeError: index out of bounds` during evaluation
+**Cause**: Positional embedding size (512) too small for evaluation window (~528 timesteps)
+**Status**: ✅ FIXED - Now uses sinusoidal positional encoding (no fixed size limit)
+**Solution**: Switched from nn.Embedding(512, hidden) to sinusoidal PE (line 490-515)
+
 ## Built-in Safety Checks
 
 The code now includes:
