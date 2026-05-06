@@ -648,6 +648,160 @@ class DualFlowTransformer(nn.Module):
 print("✅ DualFlow model architecture defined")
 print("✅ DualFlowTransformer (Phase 1: Temporal Attention) available")
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE 2: Adaptive Neighborhoods + MoE Expert Gating
+# ─────────────────────────────────────────────────────────────────────────────
+# Two targeted improvements over Phase 1:
+#
+# (A) Observability-Conditioned Neighborhoods
+#     At 80% sparsity most GNN neighbors are blind, so spatial message-passing
+#     amplifies noise.  Instead of learning path-mixing weights from hidden
+#     state alone (Phase 1), we also condition on how many neighbours are
+#     actually observed at each step.  The gate learns: "if most neighbours
+#     are blind, down-weight spatial paths and lean on temporal recurrence."
+#
+# (B) MoE Expert Gating
+#     Phase 1 blends GRU and Transformer with a fixed scalar (alpha=0.3).
+#     Here a small gating network predicts alpha per node per timestep,
+#     conditioned on the fused hidden state and local observability.
+#     Blind nodes surrounded by blind neighbours automatically receive a
+#     higher Transformer weight (temporal patterns), while observed nodes
+#     with observed neighbours can rely more on GNN spatial propagation.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ObservabilityGate(nn.Module):
+    """Observability-conditioned path mixing for adaptive neighborhood selection."""
+    def __init__(self, hidden, num_paths=4):
+        super().__init__()
+        # Input: [hidden_state ‖ neighbor_observability_ratio]  → path weights
+        self.gate = nn.Linear(hidden + 1, num_paths)
+
+    def forward(self, h, neighbor_obs):
+        """h: [N, hidden]  |  neighbor_obs: [N, 1] in [0,1]  →  [N, num_paths]"""
+        return torch.softmax(self.gate(torch.cat([h, neighbor_obs], dim=-1)), dim=-1)
+
+
+class ExpertGatingNetwork(nn.Module):
+    """Per-node per-timestep MoE gate: dynamic GRU ↔ Transformer blend weight."""
+    def __init__(self, hidden):
+        super().__init__()
+        # Input: [fused_hidden ‖ obs_flag ‖ neighbor_obs_ratio]
+        self.gate = nn.Sequential(
+            nn.Linear(hidden + 2, hidden // 4),
+            nn.ReLU(),
+            nn.Linear(hidden // 4, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, h_fused, obs_mask, neighbor_obs):
+        """
+        h_fused:     [N, T, hidden]
+        obs_mask:    [N, T, 1]  — 1 = observed, 0 = blind
+        neighbor_obs:[N, T, 1]  — fraction of observed neighbours
+        →  alpha:    [N, T, 1]  in [0, 1]; 0 = trust GRU, 1 = trust Transformer
+        """
+        return self.gate(torch.cat([h_fused, obs_mask, neighbor_obs], dim=-1))
+
+
+class DualFlowCellPhase2(DualFlowCellWithHidden):
+    """DualFlowCell with observability-conditioned adaptive neighborhood selection."""
+    def __init__(self, hidden=64, include_tod=True):
+        super().__init__(hidden=hidden, include_tod=include_tod,
+                         include_4path=True, include_path_mixing=True)
+        # Replace the static mix_w linear (from Phase 1 / DualFlowCell) with
+        # an observability gate that also takes neighbour observability as input
+        self.obs_gate = ObservabilityGate(hidden, num_paths=4)
+
+    def forward(self, x_seq, m_seq, tod_free_seq=None, tod_jam_seq=None, return_hidden=False):
+        N, T = x_seq.shape
+        h = torch.zeros(N, self.hidden, device=x_seq.device)
+        preds, jam_preds, hiddens = [], [], []
+
+        for t in range(T):
+            if self.include_tod and tod_free_seq is not None:
+                msg_in = torch.cat([h, m_seq[:, t:t+1],
+                                    tod_free_seq[:, t:t+1], tod_jam_seq[:, t:t+1]], dim=-1)
+            else:
+                msg_in = torch.cat([h, m_seq[:, t:t+1]], dim=-1)
+
+            m_sym  = self.act(self.msg_sym(msg_in))
+            m_fwd_ = self.act(self.msg_fwd(msg_in))
+            m_bwd_ = self.act(self.msg_bwd(msg_in))
+            m_corr = self.act(self.msg_corr(msg_in))
+
+            # Observability-conditioned path mixing (Phase 2 key addition)
+            neighbor_obs = (A_t @ m_seq[:, t]).unsqueeze(-1)   # [N, 1]
+            mix_w = self.obs_gate(h, neighbor_obs)              # [N, 4]
+            msg = (mix_w[:, 0:1]*m_sym  + mix_w[:, 1:2]*m_fwd_ +
+                   mix_w[:, 2:3]*m_bwd_ + mix_w[:, 3:4]*m_corr)
+
+            x_t = x_seq[:, t:t+1] * m_seq[:, t:t+1]
+            inp = torch.cat([msg, x_t, m_seq[:, t:t+1]], dim=-1)
+            h_new = self.gru(inp, h)
+            h = h_new + 0.1 * h
+
+            preds.append(self.out(h)[:, 0])
+            jam_preds.append(self.jam_head(h)[:, 0])
+            if return_hidden:
+                hiddens.append(h)
+
+        speed     = torch.stack(preds, dim=1)
+        jam_logit = torch.stack(jam_preds, dim=1)
+        if return_hidden:
+            return speed, jam_logit, torch.stack(hiddens, dim=1)
+        return speed, jam_logit
+
+
+class DualFlowPhase2(DualFlowTransformer):
+    """Phase 2: Adaptive Neighborhoods + MoE Expert Gating."""
+    def __init__(self, hidden=64, include_tod=True, jam_loss_weight=2.5, free_loss_weight=1.0,
+                 use_soft_threshold=False, jam_bce_weight=0.5, anchor_diffusion=True,
+                 num_transformer_layers=3):
+        super().__init__(hidden=hidden, include_tod=include_tod,
+                         jam_loss_weight=jam_loss_weight, free_loss_weight=free_loss_weight,
+                         use_soft_threshold=use_soft_threshold, jam_bce_weight=jam_bce_weight,
+                         anchor_diffusion=anchor_diffusion, use_transformer=True,
+                         num_transformer_layers=num_transformer_layers)
+        # Swap in Phase 2 cells (observability-conditioned)
+        self.fwd = DualFlowCellPhase2(hidden, include_tod)
+        self.bwd = DualFlowCellPhase2(hidden, include_tod)
+        # MoE gate replaces fixed alpha
+        self.expert_gate = ExpertGatingNetwork(hidden)
+
+    def _run_full(self, x, m, tod_free=None, tod_jam=None):
+        """Forward pass with adaptive neighborhoods and dynamic MoE gating."""
+        pf, jf, h_fwd = self.fwd(x, m, tod_free, tod_jam, return_hidden=True)
+        pb_rev, jb_rev, h_bwd_rev = self.bwd(
+            x.flip(1), m.flip(1),
+            tod_free.flip(1) if tod_free is not None else None,
+            tod_jam.flip(1)  if tod_jam  is not None else None,
+            return_hidden=True)
+        pb    = pb_rev.flip(1)
+        jb    = jb_rev.flip(1)
+        h_bwd = h_bwd_rev.flip(1)
+
+        fuse_in    = torch.stack([pf, pb], dim=-1)
+        w          = self.fuse(fuse_in)
+        speed_gru  = (w[..., 0:1]*pf.unsqueeze(-1) + w[..., 1:2]*pb.unsqueeze(-1)).squeeze(-1)
+        jam_gru    = (w[..., 0:1]*jf.unsqueeze(-1) + w[..., 1:2]*jb.unsqueeze(-1)).squeeze(-1)
+
+        h_fused    = h_fwd * w[:, :, 0:1] + h_bwd * w[:, :, 1:2]
+
+        speed_trans = self.trans_fwd(h_fused, m)
+        jam_trans   = self.trans_jam(h_fused, m)
+
+        # Dynamic alpha per node per timestep (MoE gating — Phase 2 key addition)
+        obs_mask    = m.unsqueeze(-1)                      # [N, T, 1]
+        neighbor_obs = torch.mm(A_t, m).unsqueeze(-1)     # [N, T, 1]
+        alpha       = self.expert_gate(h_fused, obs_mask, neighbor_obs)  # [N, T, 1]
+
+        speed     = ((1.0 - alpha)*speed_gru.unsqueeze(-1) + alpha*speed_trans.unsqueeze(-1)).squeeze(-1)
+        jam_logit = ((1.0 - alpha)*jam_gru.unsqueeze(-1)   + alpha*jam_trans.unsqueeze(-1)).squeeze(-1)
+        return speed, jam_logit
+
+
+print("✅ DualFlowPhase2 (Adaptive Neighborhoods + MoE Gating) available")
+
 PRODUCTION_SEED = 86415
 PRODUCTION_JAM_WEIGHT = 2.0  # Increased to penalize jam errors harder; S2 jam head helps at high sparsity
 PRODUCTION_FREE_WEIGHT = 1.0
@@ -760,7 +914,105 @@ def train_dualflow_production(hidden=64, epochs=600, use_transformer=True):
         net.load_state_dict(best_wts)
     return net, loss_history_train, loss_history_val
 
-print("✅ Training function defined")
+def train_phase2(hidden=64, epochs=600):
+    """Train DualFlowPhase2: Adaptive Neighborhoods + MoE Expert Gating."""
+    torch.manual_seed(PRODUCTION_SEED)
+    np.random.seed(PRODUCTION_SEED)
+
+    net = DualFlowPhase2(hidden=hidden, include_tod=True,
+                         jam_loss_weight=PRODUCTION_JAM_WEIGHT,
+                         free_loss_weight=PRODUCTION_FREE_WEIGHT,
+                         use_soft_threshold=False,
+                         jam_bce_weight=PRODUCTION_JAM_BCE_WEIGHT,
+                         anchor_diffusion=True,
+                         num_transformer_layers=3).to(device)
+
+    opt       = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-5)
+    best_blind_mae, best_wts, best_ep = float('inf'), None, 0
+    loss_history_train, loss_history_val = [], []
+
+    print(f"\n{'='*80}")
+    print(f"PHASE 2: DualFlowPhase2 — Adaptive Neighborhoods + MoE Gating")
+    print(f"  Seed: {PRODUCTION_SEED}  |  Jam: 1.0→{PRODUCTION_JAM_WEIGHT}x (warmup ep 100-200)  |  Free: {PRODUCTION_FREE_WEIGHT}x")
+    print(f"  ObservabilityGate: conditions GNN path-mixing on neighbour observability")
+    print(f"  ExpertGatingNetwork: dynamic per-node alpha (GRU↔Transformer blend)")
+    print(f"  Transformer: 3 layers, 4 heads | CosineAnnealingLR | Full {epochs} epochs")
+    print(f"{'='*80}\n")
+
+    for ep in range(1, epochs + 1):
+        warmup_start_ep, warmup_end_ep = 100, 200
+        if ep < warmup_start_ep:
+            ramp = 0.0
+        elif ep < warmup_end_ep:
+            ramp = (ep - warmup_start_ep) / (warmup_end_ep - warmup_start_ep)
+        else:
+            ramp = 1.0
+        net.jam_loss_weight = 1.0 + ramp * (PRODUCTION_JAM_WEIGHT - 1.0)
+        net.jam_bce_weight  = 0.5 + ramp * (PRODUCTION_JAM_BCE_WEIGHT - 0.5)
+
+        net.train()
+        t0          = np.random.randint(0, TRAIN_END - BATCH_TIME)
+        x_full      = torch.tensor(speed_np[t0:t0+BATCH_TIME, :], dtype=torch.float32).T.to(device)
+        m_train     = (torch.rand(NUM_NODES, 1, device=device) > SPARSITY).float().expand(-1, BATCH_TIME)
+        m_blind_train = 1.0 - m_train
+        slots       = (np.arange(t0, t0+BATCH_TIME) % 288).astype(int)
+        tod_free    = torch.tensor(tod_free_np[:, slots], dtype=torch.float32).to(device)
+        tod_jam     = torch.tensor(tod_jam_np[:, slots], dtype=torch.float32).to(device)
+        loss        = net.training_step(x_full, m_train, tod_free, tod_jam, m_blind_train=m_blind_train)
+
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"  ⚠️  NaN/Inf at ep {ep}, restarting...")
+            return train_phase2(hidden, epochs)
+
+        loss_history_train.append(loss.item())
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
+        opt.step()
+        scheduler.step()
+
+        if ep % 50 == 0:
+            net.eval()
+            with torch.no_grad():
+                x_v       = torch.tensor(speed_np[VAL_START:VAL_END, :], dtype=torch.float32).T.to(device)
+                m_v_obs   = (torch.rand(NUM_NODES, 1, device=device) > SPARSITY).float().expand(-1, VAL_END-VAL_START)
+                m_v_blind = 1.0 - m_v_obs
+                slots_v   = (np.arange(VAL_START, VAL_END) % 288).astype(int)
+                tf_v      = torch.tensor(tod_free_np[:, slots_v], dtype=torch.float32).to(device)
+                tj_v      = torch.tensor(tod_jam_np[:, slots_v], dtype=torch.float32).to(device)
+                vl        = net.training_step(x_v, m_v_obs, tf_v, tj_v, m_blind_train=m_v_blind).item()
+                p_v       = net._run(x_v, m_v_obs, tf_v, tj_v)
+                p_v       = torch.clamp(p_v, -5.0, 5.0)
+                blind_count = m_v_blind.sum().clamp(min=1.0)
+                mae_v     = (torch.abs(p_v - x_v) * m_v_blind).sum().item() / blind_count.item()
+                jt        = torch.tensor(jam_thresh_eval_np, dtype=torch.float32, device=x_v.device)
+                jam_flag  = (x_v < jt.unsqueeze(1)).float()
+                ss_res    = ((p_v - x_v) ** 2 * m_v_blind).sum()
+                ss_tot    = ((x_v - (x_v * m_v_blind).sum() / blind_count) ** 2 * m_v_blind).sum() + 1e-8
+                r2_v      = (1.0 - ss_res / ss_tot).item()
+                jam_count = (jam_flag * m_v_blind).sum().clamp(min=1.0)
+                mae_jam_v = (torch.abs(p_v - x_v) * jam_flag * m_v_blind).sum().item() / jam_count.item()
+                lr_cur    = scheduler.get_last_lr()[0]
+
+            loss_history_val.append(vl)
+            if mae_v < best_blind_mae:
+                best_blind_mae = mae_v
+                best_wts       = copy.deepcopy(net.state_dict())
+                best_ep        = ep
+                marker         = " ← BEST"
+            else:
+                marker = ""
+            print(f"  [Phase2] ep {ep:3d} | loss={vl:.4f} | BlindMAE={mae_v:.4f} | BlindJamMAE={mae_jam_v:.4f} | R²={r2_v:.4f} | jam_w={net.jam_loss_weight:.2f} | lr={lr_cur:.1e}{marker}")
+
+    if best_wts is not None:
+        net.load_state_dict(best_wts)
+        print(f"\n✅ Best checkpoint restored (ep {best_ep}: BlindMAE={best_blind_mae:.4f})")
+    print("✅ Phase 2 training complete")
+    return net, loss_history_train, loss_history_val
+
+
+print("✅ Training functions defined (Phase 1: train_dualflow_production | Phase 2: train_phase2)")
 
 dualflow_net, dualflow_loss_train, dualflow_loss_val = train_dualflow_production(hidden=64, epochs=600, use_transformer=True)
 print("\n✅ Training complete!")
