@@ -880,14 +880,15 @@ def train_dualflow_production(hidden=64, epochs=600):
                 p_v       = net._run(x_v, m_v_obs, tf_v, tj_v)
                 p_v       = torch.clamp(p_v, -5.0, 5.0)
                 blind_count = m_v_blind.sum().clamp(min=1.0)
-                mae_v     = (torch.abs(p_v - x_v) * m_v_blind).sum().item() / blind_count.item()
+                std_t     = torch.tensor(node_stds, dtype=torch.float32, device=x_v.device).unsqueeze(1)
+                mae_v     = (torch.abs(p_v - x_v) * m_v_blind * std_t).sum().item() / blind_count.item()
                 jt        = torch.tensor(jam_thresh_eval_np, dtype=torch.float32, device=x_v.device)
                 jam_flag  = (x_v < jt.unsqueeze(1)).float()
                 ss_res    = ((p_v - x_v) ** 2 * m_v_blind).sum()
                 ss_tot    = ((x_v - (x_v * m_v_blind).sum() / blind_count) ** 2 * m_v_blind).sum() + 1e-8
                 r2_v      = (1.0 - ss_res / ss_tot).item()
                 jam_count = (jam_flag * m_v_blind).sum().clamp(min=1.0)
-                mae_jam_v = (torch.abs(p_v - x_v) * jam_flag * m_v_blind).sum().item() / jam_count.item() if jam_count > 0 else 0.0
+                mae_jam_v = (torch.abs(p_v - x_v) * jam_flag * m_v_blind * std_t).sum().item() / jam_count.item() if jam_count > 0 else 0.0
                 lr_cur    = scheduler.get_last_lr()[0]
             loss_history_val.append(vl)
             if mae_v < best_blind_mae:
@@ -897,11 +898,11 @@ def train_dualflow_production(hidden=64, epochs=600):
                 marker         = " ← BEST"
             else:
                 marker = ""
-            print(f"  [DualFlow] ep {ep:3d} | loss={vl:.4f} | BlindMAE={mae_v:.4f} | BlindJamMAE={mae_jam_v:.4f} | R²={r2_v:.4f} | jam_w={net.jam_loss_weight:.2f} | lr={lr_cur:.1e}{marker}")
+            print(f"  [DualFlow] ep {ep:3d} | loss={vl:.4f} | BlindMAE={mae_v:.3f}km/h | BlindJamMAE={mae_jam_v:.3f}km/h | R²={r2_v:.4f} | jam_w={net.jam_loss_weight:.2f} | lr={lr_cur:.1e}{marker}")
 
     if best_wts:
         net.load_state_dict(best_wts)
-        print(f"\n✅ Best checkpoint restored (ep {best_ep}: BlindMAE={best_blind_mae:.4f})")
+        print(f"\n✅ Best checkpoint restored (ep {best_ep}: BlindMAE={best_blind_mae:.3f}km/h)")
     return net, loss_history_train, loss_history_val
 
 
