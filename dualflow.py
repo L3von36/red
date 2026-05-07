@@ -807,114 +807,7 @@ PRODUCTION_JAM_WEIGHT = 2.0  # Increased to penalize jam errors harder; S2 jam h
 PRODUCTION_FREE_WEIGHT = 1.0
 PRODUCTION_JAM_BCE_WEIGHT = 1.0  # Increased from 0.5: jam events rare, need higher weight to balance
 
-def train_dualflow_production(hidden=64, epochs=600, use_transformer=True):
-    torch.manual_seed(PRODUCTION_SEED)
-    np.random.seed(PRODUCTION_SEED)
-
-    # PHASE 1: Use DualFlowTransformer with temporal attention
-    net_class = DualFlowTransformer if use_transformer else DualFlow
-    net = net_class(hidden=hidden, include_tod=True,
-                    jam_loss_weight=PRODUCTION_JAM_WEIGHT,
-                    free_loss_weight=PRODUCTION_FREE_WEIGHT,
-                    use_soft_threshold=False,
-                    jam_bce_weight=PRODUCTION_JAM_BCE_WEIGHT,
-                    anchor_diffusion=True,
-                    use_transformer=use_transformer).to(device)
-    opt = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-4)
-    best_blind_mae, best_wts, best_ep = float('inf'), None, 0
-    loss_history_train, loss_history_val = [], []
-
-    model_name = "DualFlowTransformer (Phase 1)" if use_transformer else "DualFlow (Baseline)"
-    print(f"\n{'='*80}")
-    print(f"PRODUCTION MODEL: {model_name} — Warmup variant")
-    print(f"  Seed: {PRODUCTION_SEED}  |  Jam: 1.0→{PRODUCTION_JAM_WEIGHT}x (warmup ep 100-200)  |  Free: {PRODUCTION_FREE_WEIGHT}x  |  JamBCE: 0.5→{PRODUCTION_JAM_BCE_WEIGHT}x")
-    print(f"  S1: blind-node supervision  |  S2: jam head (warmed up)  |  S3: anchor diffusion")
-    if use_transformer:
-        print(f"  PHASE 1: Temporal Transformer (3 layers, 4 heads) on top of GRU")
-    print(f"  Training: Full {epochs} epochs (no early stopping) | Best checkpoint saved")
-    print(f"  Honest R² on blind nodes only")
-    print(f"{'='*80}\n")
-
-    for ep in range(1, epochs + 1):
-        # SOLUTION 2 WARMUP: ramp jam weights from 1.0 (start) to target (PRODUCTION_*) over warmup window
-        # Lets free-flow loss stabilize the model first, then increases jam pressure gradually
-        warmup_start_ep = 100
-        warmup_end_ep = 200
-        if ep < warmup_start_ep:
-            ramp = 0.0  # use base weight 1.0
-        elif ep < warmup_end_ep:
-            ramp = (ep - warmup_start_ep) / (warmup_end_ep - warmup_start_ep)
-        else:
-            ramp = 1.0
-        net.jam_loss_weight = 1.0 + ramp * (PRODUCTION_JAM_WEIGHT - 1.0)
-        net.jam_bce_weight = 0.5 + ramp * (PRODUCTION_JAM_BCE_WEIGHT - 0.5)
-
-        net.train()
-        t0 = np.random.randint(0, TRAIN_END - BATCH_TIME)
-        x_full = torch.tensor(speed_np[t0:t0+BATCH_TIME, :], dtype=torch.float32).T.to(device)
-        # SOLUTION 1 (SPIN/ImputeFormer-style): Mask input AND supervise on the masked positions
-        # m_train = 1 means observed (input visible), 0 means blind (input zeroed)
-        m_train = (torch.rand(NUM_NODES, 1, device=device) > SPARSITY).float().expand(-1, BATCH_TIME)
-        # m_blind_train = 1 - m_train: supervise only on blind positions (imputation targets)
-        # This forces the model to predict from spatial neighbors instead of copying input
-        m_blind_train = 1.0 - m_train
-        slots = (np.arange(t0, t0+BATCH_TIME) % 288).astype(int)
-        tod_free = torch.tensor(tod_free_np[:, slots], dtype=torch.float32).to(device)
-        tod_jam = torch.tensor(tod_jam_np[:, slots], dtype=torch.float32).to(device)
-        loss = net.training_step(x_full, m_train, tod_free, tod_jam, m_blind_train=m_blind_train)
-
-        if torch.isnan(loss) or torch.isinf(loss):
-            print(f"  ⚠️  NaN/Inf at ep {ep}, restarting...")
-            return train_dualflow_production(hidden, epochs)
-
-        loss_history_train.append(loss.item())
-        opt.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
-        opt.step()
-
-        if ep % 50 == 0:
-            net.eval()
-            with torch.no_grad():
-                x_v = torch.tensor(speed_np[VAL_START:VAL_END, :], dtype=torch.float32).T.to(device)
-                # Use SPARSITY-rate blind mask so val matches test conditions
-                m_v_obs = (torch.rand(NUM_NODES, 1, device=device) > SPARSITY).float().expand(-1, VAL_END-VAL_START)
-                m_v_blind = 1.0 - m_v_obs
-                slots_v = (np.arange(VAL_START, VAL_END) % 288).astype(int)
-                tf_v = torch.tensor(tod_free_np[:, slots_v], dtype=torch.float32).to(device)
-                tj_v = torch.tensor(tod_jam_np[:, slots_v], dtype=torch.float32).to(device)
-                # Loss on blind positions
-                vl = net.training_step(x_v, m_v_obs, tf_v, tj_v, m_blind_train=m_v_blind).item()
-                # Honest blind-node MAE/RMSE in normalized space
-                p_v = net._run(x_v, m_v_obs, tf_v, tj_v)
-                p_v = torch.clamp(p_v, -5.0, 5.0)
-                blind_count = m_v_blind.sum().clamp(min=1.0)
-                mae_v = (torch.abs(p_v - x_v) * m_v_blind).sum().item() / blind_count.item()
-                rmse_v = torch.sqrt(((p_v - x_v) ** 2 * m_v_blind).sum() / blind_count).item()
-                # R² on blind nodes only (not observed, which are pinned to truth by impute)
-                jt = torch.tensor(jam_thresh_eval_np, dtype=torch.float32, device=x_v.device)
-                jam_flag = (x_v < jt.unsqueeze(1)).float()
-                ss_res = ((p_v - x_v) ** 2 * m_v_blind).sum()
-                ss_tot = ((x_v - (x_v * m_v_blind).sum() / blind_count) ** 2 * m_v_blind).sum() + 1e-8
-                r2_v = (1.0 - ss_res / ss_tot).item()
-                # Jam MAE on blind nodes
-                jam_count = (jam_flag * m_v_blind).sum().clamp(min=1.0)
-                mae_jam_v = (torch.abs(p_v - x_v) * jam_flag * m_v_blind).sum().item() / jam_count.item() if jam_count > 0 else 0.0
-            loss_history_val.append(vl)
-            if mae_v < best_blind_mae:
-                best_blind_mae = mae_v
-                best_wts = copy.deepcopy(net.state_dict())
-                best_ep = ep
-                marker = " ← BEST"
-            else:
-                marker = ""
-            print(f"  [DualFlow] ep {ep:3d} | loss={vl:.4f} | BlindMAE={mae_v:.4f} | BlindJamMAE={mae_jam_v:.4f} | R²={r2_v:.4f} | jam_w={net.jam_loss_weight:.2f}{marker}")
-
-    if best_wts:
-        net.load_state_dict(best_wts)
-    return net, loss_history_train, loss_history_val
-
-def train_phase2(hidden=64, epochs=600):
+def train_dualflow_production(hidden=64, epochs=600):
     """Train DualFlowPhase2: Adaptive Neighborhoods + MoE Expert Gating."""
     torch.manual_seed(PRODUCTION_SEED)
     np.random.seed(PRODUCTION_SEED)
@@ -933,11 +826,13 @@ def train_phase2(hidden=64, epochs=600):
     loss_history_train, loss_history_val = [], []
 
     print(f"\n{'='*80}")
-    print(f"PHASE 2: DualFlowPhase2 — Adaptive Neighborhoods + MoE Gating")
-    print(f"  Seed: {PRODUCTION_SEED}  |  Jam: 1.0→{PRODUCTION_JAM_WEIGHT}x (warmup ep 100-200)  |  Free: {PRODUCTION_FREE_WEIGHT}x")
-    print(f"  ObservabilityGate: conditions GNN path-mixing on neighbour observability")
-    print(f"  ExpertGatingNetwork: dynamic per-node alpha (GRU↔Transformer blend)")
+    print(f"PRODUCTION MODEL: DualFlowPhase2 — Adaptive Neighborhoods + MoE Gating")
+    print(f"  Seed: {PRODUCTION_SEED}  |  Jam: 1.0→{PRODUCTION_JAM_WEIGHT}x (warmup ep 100-200)  |  Free: {PRODUCTION_FREE_WEIGHT}x  |  JamBCE: 0.5→{PRODUCTION_JAM_BCE_WEIGHT}x")
+    print(f"  S1: blind-node supervision  |  S2: jam head (warmed up)  |  S3: anchor diffusion")
+    print(f"  ObservabilityGate: adaptive GNN path-mixing conditioned on neighbour observability")
+    print(f"  ExpertGatingNetwork: dynamic per-node GRU↔Transformer blend (replaces fixed alpha)")
     print(f"  Transformer: 3 layers, 4 heads | CosineAnnealingLR | Full {epochs} epochs")
+    print(f"  Best checkpoint auto-saved | Honest R² on blind nodes only")
     print(f"{'='*80}\n")
 
     for ep in range(1, epochs + 1):
@@ -952,18 +847,18 @@ def train_phase2(hidden=64, epochs=600):
         net.jam_bce_weight  = 0.5 + ramp * (PRODUCTION_JAM_BCE_WEIGHT - 0.5)
 
         net.train()
-        t0          = np.random.randint(0, TRAIN_END - BATCH_TIME)
-        x_full      = torch.tensor(speed_np[t0:t0+BATCH_TIME, :], dtype=torch.float32).T.to(device)
-        m_train     = (torch.rand(NUM_NODES, 1, device=device) > SPARSITY).float().expand(-1, BATCH_TIME)
+        t0            = np.random.randint(0, TRAIN_END - BATCH_TIME)
+        x_full        = torch.tensor(speed_np[t0:t0+BATCH_TIME, :], dtype=torch.float32).T.to(device)
+        m_train       = (torch.rand(NUM_NODES, 1, device=device) > SPARSITY).float().expand(-1, BATCH_TIME)
         m_blind_train = 1.0 - m_train
-        slots       = (np.arange(t0, t0+BATCH_TIME) % 288).astype(int)
-        tod_free    = torch.tensor(tod_free_np[:, slots], dtype=torch.float32).to(device)
-        tod_jam     = torch.tensor(tod_jam_np[:, slots], dtype=torch.float32).to(device)
-        loss        = net.training_step(x_full, m_train, tod_free, tod_jam, m_blind_train=m_blind_train)
+        slots         = (np.arange(t0, t0+BATCH_TIME) % 288).astype(int)
+        tod_free      = torch.tensor(tod_free_np[:, slots], dtype=torch.float32).to(device)
+        tod_jam       = torch.tensor(tod_jam_np[:, slots], dtype=torch.float32).to(device)
+        loss          = net.training_step(x_full, m_train, tod_free, tod_jam, m_blind_train=m_blind_train)
 
         if torch.isnan(loss) or torch.isinf(loss):
             print(f"  ⚠️  NaN/Inf at ep {ep}, restarting...")
-            return train_phase2(hidden, epochs)
+            return train_dualflow_production(hidden, epochs)
 
         loss_history_train.append(loss.item())
         opt.zero_grad()
@@ -992,9 +887,8 @@ def train_phase2(hidden=64, epochs=600):
                 ss_tot    = ((x_v - (x_v * m_v_blind).sum() / blind_count) ** 2 * m_v_blind).sum() + 1e-8
                 r2_v      = (1.0 - ss_res / ss_tot).item()
                 jam_count = (jam_flag * m_v_blind).sum().clamp(min=1.0)
-                mae_jam_v = (torch.abs(p_v - x_v) * jam_flag * m_v_blind).sum().item() / jam_count.item()
+                mae_jam_v = (torch.abs(p_v - x_v) * jam_flag * m_v_blind).sum().item() / jam_count.item() if jam_count > 0 else 0.0
                 lr_cur    = scheduler.get_last_lr()[0]
-
             loss_history_val.append(vl)
             if mae_v < best_blind_mae:
                 best_blind_mae = mae_v
@@ -1003,17 +897,19 @@ def train_phase2(hidden=64, epochs=600):
                 marker         = " ← BEST"
             else:
                 marker = ""
-            print(f"  [Phase2] ep {ep:3d} | loss={vl:.4f} | BlindMAE={mae_v:.4f} | BlindJamMAE={mae_jam_v:.4f} | R²={r2_v:.4f} | jam_w={net.jam_loss_weight:.2f} | lr={lr_cur:.1e}{marker}")
+            print(f"  [DualFlow] ep {ep:3d} | loss={vl:.4f} | BlindMAE={mae_v:.4f} | BlindJamMAE={mae_jam_v:.4f} | R²={r2_v:.4f} | jam_w={net.jam_loss_weight:.2f} | lr={lr_cur:.1e}{marker}")
 
-    if best_wts is not None:
+    if best_wts:
         net.load_state_dict(best_wts)
         print(f"\n✅ Best checkpoint restored (ep {best_ep}: BlindMAE={best_blind_mae:.4f})")
-    print("✅ Phase 2 training complete")
     return net, loss_history_train, loss_history_val
 
 
 
-print("✅ Training functions defined (Phase 1: train_dualflow_production | Phase 2: train_phase2)")
+print("✅ Training function defined (DualFlowPhase2 — Adaptive Neighborhoods + MoE Gating)")
+
+dualflow_net, dualflow_loss_train, dualflow_loss_val = train_dualflow_production(hidden=64, epochs=600)
+print("\n✅ Training complete!")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # HYBRID: Jam-Aware Ensemble (Phase 1 speed + Phase 2 jam detection)
