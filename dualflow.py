@@ -18,6 +18,7 @@ import os
 import copy
 import urllib.request
 import warnings
+import time
 from sklearn.metrics import f1_score, precision_score, recall_score
 from skimage.metrics import structural_similarity as ssim
 
@@ -47,6 +48,22 @@ DATASETS = {
     },
 }
 
+def _download_with_retry(url, fn, max_retries=3, timeout=30):
+    for attempt in range(max_retries):
+        try:
+            urllib.request.urlretrieve(url, fn, timeout=timeout)
+            return True
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                print(f"  ⚠ Attempt {attempt + 1} failed: {e}")
+                print(f"  ⏳ Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                print(f"  ❌ Download failed after {max_retries} attempts: {e}")
+                raise
+    return False
+
 DATASET_NAME = 'PEMS04'
 ds_cfg = DATASETS[DATASET_NAME]
 print(f"✅ Using dataset: {DATASET_NAME}")
@@ -60,12 +77,8 @@ fn_csv = f"{DATASET_NAME}.csv"
 for fn, url in [(fn_npz, url_npz), (fn_csv, url_csv)]:
     if not os.path.exists(fn):
         print(f"Downloading {fn}...")
-        try:
-            urllib.request.urlretrieve(url, fn)
-            print(f"  ✅ Downloaded {fn}")
-        except Exception as e:
-            print(f"  ❌ Download failed: {e}")
-            raise
+        _download_with_retry(url, fn)
+        print(f"  ✅ Downloaded {fn}")
     else:
         print(f"  ✅ {fn} already exists")
 
